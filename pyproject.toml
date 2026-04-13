@@ -1,0 +1,81 @@
+[project]
+name = "openhound"
+dynamic = ["version"]
+description = "OpenGraph collector framework for BloodHound"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "alive-progress>=3.3.0",
+    "dlt==1.22.2",
+    "duckdb==1.5.0",
+    "griffe>=1.15.0",
+    "griffe-fieldz>=0.5.0",
+    "mkdocstrings[python]>=1.0.0",
+    "psutil>=7.2.1",
+    "pydantic==2.12.5",
+    "tqdm>=4.67.1",
+    "typer>=0.19.2",
+    "cookiecutter>=2.6.0",
+    "pydantic-extra-types>=2.11.0",
+    "jinja2>=3.1.6",
+]
+
+[project.optional-dependencies]
+all = [
+    "openhound-jamf==0.1.0",
+    "openhound-github==0.1.0",
+    "openhound-okta==0.1.0",
+]
+jamf = [
+    "openhound-jamf==0.1.0",
+]
+github = [
+    "openhound-github==0.1.0"
+]
+
+okta = [
+    "openhound-okta==0.0.5",
+]
+
+[project.scripts]
+openhound = "openhound.main:app"
+
+[build-system]
+requires = ['hatchling', 'hatch-vcs']
+build-backend = 'hatchling.build'
+
+[tool.marimo.runtime]
+dotenv = [".env"]
+
+[tool.ruff]
+exclude = ["src/openhound/cookiecutter-templates/*"]
+
+[tool.mypy]
+exclude = ["src/openhound/cookiecutter-templates/*"]
+disable_error_code = ["import-untyped"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+local_scheme = "no-local-version"
+
+[dependency-groups]
+dev = [
+    "openhound-faker==0.0.7.dev0",
+    "ipython>=9.12.0",
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.1",
+    "marimo>=0.23.0",
+    "altair>=6.0.0",
+    "fastapi>=0.129.0",
+    "zensical>=0.0.23",
+    "ruff>=0.15.4",
+    "mypy>=1.19.1",
+    "types-pyyaml>=6.0.12.20250915",
+    "types-requests>=2.33.0.20260408",
+    "httpx>=0.28.1",
+]

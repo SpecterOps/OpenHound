@@ -1,0 +1,17 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+        exclude: mkdocs.yml
+      - id: check-json
+      - id: end-of-file-fixer
+        exclude: ^scripts/templates/
+      - id: trailing-whitespace
+        exclude: ^scripts/templates/
+      - id: check-added-large-files
+  - repo: https://github.com/psf/black
+    rev: 25.12.0
+    hooks:
+      - id: black
+        exclude: ^openfetch/cookiecutter-templates/

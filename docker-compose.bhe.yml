@@ -1,0 +1,58 @@
+x-scheduler: &scheduler
+  image: specterops/openhound:${IMAGE_VERSION:-0.1.0-enterprise}
+  restart: unless-stopped
+  init: true
+  volumes:
+    - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+
+  # These environment variables can also be set inside the ~/.dlt/config.toml file
+  # and act as an example. Configuring openhound can be done using environment variables,
+  # configuration files or a combination of both.
+  environment: &env
+    LOG_LEVEL: INFO
+    EXTRACT__WORKERS: 8
+    LOG_CONTAINER: true
+
+services:
+  scheduler-jamf:
+    <<: *scheduler
+    environment:
+      <<: *env
+      DESTINATION__BLOODHOUNDENTERPRISE__COLLECTOR_NAME: jamf
+    secrets:
+      - source: secrets_jamf
+        target: /app/.dlt/secrets.toml
+
+  scheduler-github:
+    <<: *scheduler
+    environment:
+      <<: *env
+      DESTINATION__BLOODHOUNDENTERPRISE__COLLECTOR_NAME: github
+    secrets:
+      - source: secrets_github
+        target: /app/.dlt/secrets.toml
+      - source: key_github
+        target: /app/.dlt/github.pem
+
+  scheduler-okta:
+    <<: *scheduler
+    environment:
+      <<: *env
+      DESTINATION__BLOODHOUNDENTERPRISE__COLLECTOR_NAME: okta
+    secrets:
+      - source: secrets_okta
+        target: /app/.dlt/secrets.toml
+      - source: key_okta
+        target: /app/.dlt/okta.json
+
+secrets:
+  secrets_jamf:
+    file: ${HOME}/.dlt/secrets_jamf.toml
+  secrets_github:
+    file: ${HOME}/.dlt/secrets_github.toml
+  key_github:
+    file: ${HOME}/.dlt/github.pem
+  secrets_okta:
+    file: ${HOME}/.dlt/secrets_okta.toml
+  key_okta:
+    file: ${HOME}/.dlt/okta.json
