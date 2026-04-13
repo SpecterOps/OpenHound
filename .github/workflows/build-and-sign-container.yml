@@ -20,8 +20,8 @@ jobs:
           - target: cli
             suffix: ""
             publish_latest: true
-          - target: scheduler
-            suffix: "-scheduler"
+          - target: enterprise
+            suffix: "-enterprise"
             publish_latest: false
     env:
       DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
@@ -112,7 +112,7 @@ jobs:
       matrix:
         include:
           - target: cli
-          - target: scheduler
+          - target: enterprise
     permissions:
       contents: read
       id-token: write
@@ -159,7 +159,7 @@ jobs:
       matrix:
         include:
           - target: cli
-          - target: scheduler
+          - target: enterprise
     env:
       DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
       DOCKER_REPOSITORY: ${{ vars.DOCKER_REPOSITORY }}

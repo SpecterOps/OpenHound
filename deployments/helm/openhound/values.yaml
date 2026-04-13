@@ -1,7 +1,7 @@
 image:
   repository: docker.io/specterops/openhound
   pullPolicy: IfNotPresent
-  tag: "latest-scheduler"
+  tag: "latest-enterprise"
 
 imagePullSecrets: [ ]
 nameOverride: ""
