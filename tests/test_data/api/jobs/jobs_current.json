@@ -1,0 +1,19 @@
+{
+  "data": {
+    "id": 120,
+    "client_id": "test-client-id",
+    "client_name": "test-client",
+    "event_id": 2,
+    "execution_time": "2026-02-20T09:00:00Z",
+    "status": 1,
+    "status_message": "Running",
+    "session_collection": true,
+    "local_group_collection": true,
+    "ad_structure_collection": true,
+    "cert_services_collection": true,
+    "ca_registry_collection": true,
+    "dc_registry_collection": true,
+    "all_trusted_domains": true,
+    "domain_controller": "dc.example.com"
+  }
+}

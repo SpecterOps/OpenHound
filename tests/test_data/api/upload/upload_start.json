@@ -1,0 +1,20 @@
+{
+  "data": {
+    "id": 33,
+    "created_at": "2026-02-24T18:11:06.251Z",
+    "updated_at": "2026-02-24T18:11:06.251Z",
+    "deleted_at": {
+      "Time": "2026-02-24T18:11:06.251Z",
+      "Valid": true
+    },
+    "user_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "user_email_address": "user@example.com",
+    "status": -1,
+    "status_message": "string",
+    "start_time": "2026-02-24T18:11:06.251Z",
+    "end_time": "2026-02-24T18:11:06.251Z",
+    "last_ingest": "2026-02-24T18:11:06.251Z",
+    "total_files": 0,
+    "failed_files": 0
+  }
+}

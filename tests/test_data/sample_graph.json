@@ -1,0 +1,111 @@
+{
+  "graph": {
+    "nodes": [
+      {
+        "id": "d66b9bae-a41c-51b1-b167-7933dca4f649",
+        "kinds": [
+          "DummyComputer"
+        ],
+        "properties": {
+          "name": "laptop-53.williams.com",
+          "displayname": "laptop-53.williams.com",
+          "last_seen": "2026-02-10T02:35:29.974903",
+          "tenant": "abc",
+          "hostname": "laptop-53.williams.com",
+          "ip_address": "100.9.223.34",
+          "mac_address": "a0:e6:de:eb:db:da"
+        }
+      },
+      {
+        "id": "5e870075-5040-550d-97ed-ee77fbe88dde",
+        "kinds": [
+          "DummyComputer"
+        ],
+        "properties": {
+          "name": "desktop-72.fisher.com",
+          "displayname": "desktop-72.fisher.com",
+          "last_seen": "2026-02-10T02:35:29.976578",
+          "tenant": "abc",
+          "hostname": "desktop-72.fisher.com",
+          "ip_address": "177.237.5.240",
+          "mac_address": "14:31:6f:78:94:92"
+        }
+      },
+      {
+        "id": "b20df658-9d83-533b-948e-a5fc3401b67e",
+        "kinds": [
+          "DummyComputer"
+        ],
+        "properties": {
+          "name": "lt-76.chen.net",
+          "displayname": "lt-76.chen.net",
+          "last_seen": "2026-02-10T02:35:29.979596",
+          "tenant": "abc",
+          "hostname": "lt-76.chen.net",
+          "ip_address": "137.36.174.7",
+          "mac_address": "b4:b9:60:d5:d0:9a"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "kind": "ExampleReference",
+        "start": {
+          "value": "45c51726-a8ab-5ae0-92c3-0de14ec13dda",
+          "match_by": "id"
+        },
+        "end": {
+          "value": "4af60ea2-a08b-574b-8580-1e9596f34f50",
+          "match_by": "id"
+        },
+        "properties": {
+          "composed": false,
+          "traversable": false
+        }
+      },
+      {
+        "kind": "ExampleReference",
+        "start": {
+          "value": "45c51726-a8ab-5ae0-92c3-0de14ec13dda",
+          "match_by": "id"
+        },
+        "end": {
+          "value": "5e870075-5040-550d-97ed-ee77fbe88dde",
+          "match_by": "id"
+        },
+        "properties": {
+          "composed": false,
+          "traversable": false
+        }
+      },
+      {
+        "kind": "ExampleReference",
+        "start": {
+          "value": "b20df658-9d83-533b-948e-a5fc3401b67e",
+          "match_by": "id"
+        },
+        "end": {
+          "value": "68bfd66b9bae-a41c-51b1-b167-7933dca4f649",
+          "match_by": "id"
+        },
+        "properties": {
+          "composed": false,
+          "traversable": false
+        }
+      }
+    ]
+  },
+  "metadata": {
+    "ingest_version": "v1",
+    "collector": {
+      "name": "openhound",
+      "version": "beta",
+      "properties": {
+        "collection_methods": [
+          "Custom Method"
+        ],
+        "windows_server_version": "n/a"
+      }
+    }
+  }
+}
