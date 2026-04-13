@@ -11,9 +11,6 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 ARG OPENHOUND_VERSION
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=${OPENHOUND_VERSION}
 
-ENV UV_INDEX='ARTIFACTS=https://pkgs.dev.azure.com/SpecterDev/openhound/_packaging/private/pypi/simple/'
-ENV UV_INDEX_ARTIFACTS_USERNAME='dummy'
-
 # Omit development dependencies
 ENV UV_NO_DEV=1
 
@@ -24,8 +21,6 @@ ENV UV_PYTHON_DOWNLOADS=0
 WORKDIR /app
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=ARTIFACT_TOKEN \
-    export UV_INDEX_ARTIFACTS_PASSWORD="$(cat /run/secrets/ARTIFACT_TOKEN)" && \
     uv sync --extra all --frozen
 
 
