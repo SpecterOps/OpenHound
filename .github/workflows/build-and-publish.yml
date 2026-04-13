@@ -18,12 +18,12 @@ permissions:
 
 jobs:
   build:
-    environment: publish
+    environment: pypi
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }} # using input tags or github ref if tags are manually pushed
           fetch-depth: 0
