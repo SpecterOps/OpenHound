@@ -1,0 +1,38 @@
+﻿name: Validate Branch Name
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+jobs:
+  validate-branch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate source branch name
+        run: |
+          BRANCH_NAME="${{ github.head_ref }}"
+          echo "Source branch: $BRANCH_NAME"
+
+          if [[ "$BRANCH_NAME" =~ ^(fix|patch|feature|minor|major)\/[A-Za-z0-9._-]+$ ]]; then
+            echo "Branch name is valid"
+          else
+            echo "Invalid branch name!"
+            echo ""
+            echo "Allowed formats:"
+            echo "  fix/<description>"
+            echo "  patch/<description>"
+            echo "  feature/<description>"
+            echo "  minor/<description>"
+            echo "  major/<description>"
+            echo ""
+            echo "Example:"
+            echo "  feature/add-authentication"
+            exit 1
+          fi

@@ -1,0 +1,61 @@
+name: Run tests
+on:
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+  workflow_call:
+
+permissions:
+  contents: read
+  id-token: write   # This is required for requesting the JWT for the OIDC provider
+
+jobs:
+  test-core:
+    runs-on: ubuntu-latest
+    # TODO:  add more python versions to tests
+    # strategy:
+    #   matrix:
+    #     python-version: ["3.13"]
+
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create virtual environment
+        run: uv venv .venv
+
+      - name: Install dependencies
+        run: |
+          uv pip install --python .venv -e ".[all]" --group dev
+
+      - name: Run log handling tests
+        run: |
+          .venv/bin/pytest tests/test_log_handlers.py -v
+
+      - name: Run privilege zone selector sync tests
+        run: |
+          .venv/bin/pytest tests/test_pz_selector_sync.py -v
+
+      - name: Run saved searches sync tests
+        run: |
+          .venv/bin/pytest tests/test_saved_searches_sync.py -v
+
+      - name: Run extension validation tests
+        run: |
+          .venv/bin/pytest tests/test_extensions_format.py -v
+
+      - name: Run BHE job scheduling test
+        run: |
+          .venv/bin/pytest tests/test_bhe_job_scheduling.py -v

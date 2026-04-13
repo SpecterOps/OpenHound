@@ -1,0 +1,92 @@
+﻿name: Create Release Tag and publish new version
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "README.md"
+
+permissions:
+  contents: write
+  id-token: write   # This is required for requesting the JWT for the OIDC provider
+
+jobs:
+
+  test-core:
+    if: github.event.pull_request.merged == true
+    uses: ./.github/workflows/test.yml
+    secrets: inherit
+
+  tag-release:
+    needs: test-core
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --tags
+
+      - name: Determine next version
+        id: versioning
+        run: |
+          # Get latest tag or fallback
+          LATEST_TAG=$(git tag --sort=-v:refname | head -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.0.0"
+          fi
+
+          echo "Latest tag: $LATEST_TAG"
+
+          VERSION=${LATEST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+          echo "Merged branch: $BRANCH_NAME"
+
+          if [[ "$BRANCH_NAME" == fix/* || "$BRANCH_NAME" == patch/* ]]; then
+            PATCH=$((PATCH + 1))
+          elif [[ "$BRANCH_NAME" == feature/* || "$BRANCH_NAME" == minor/* ]]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          elif [[ "$BRANCH_NAME" == major/* ]]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          else
+            echo "Branch does not trigger release."
+            exit 0
+          fi
+
+          NEW_VERSION="v$MAJOR.$MINOR.$PATCH"
+
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "Next version: $NEW_VERSION"
+
+      - name: Create and push tag
+        if: env.NEW_VERSION != ''
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git tag $NEW_VERSION
+          git push origin $NEW_VERSION
+
+  publish:
+    needs: tag-release
+    if: github.event.pull_request.merged == true
+    uses: ./.github/workflows/build-and-publish.yml
+    with:
+      tag: ${{ needs.tag-release.outputs.new_version }}
+    secrets: inherit

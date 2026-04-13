@@ -1,0 +1,74 @@
+---
+icon: fontawesome/solid/{{ node.icon }}
+tags:
+  - node
+---
+
+# :fontawesome-solid-{{ node.icon }}: {{ node.kind }}
+
+This page describes the **{{ node.kind }}** OpenGraph node type as exported by the {{ name }} source. This node was generated from the [{{ node.produced_by }}](../../collection/assets/{{ node.produced_by }}.md) asset.
+
+--8<-- "{{ node.kind }}.md"
+
+{% if node.properties %}
+## Node properties
+{#??? Properties#}
+
+::: {{  node.properties }}
+    options:
+      show_docstring_attributes: true
+      inherited_members: true
+      members_order: source
+
+{%  endif  %}
+
+## Edges
+
+{% if node.outgoing or node.incoming %}
+```mermaid
+flowchart LR
+{%- set seen_kinds = [] %}
+{% do seen_kinds.append(node.kind) %}
+    {{ node.kind }}["fa:fa-{{ node.icon }}"]:::bhNode
+{%- for edge in node.outgoing %}
+{%- if edge.end not in seen_kinds %}
+{%- do seen_kinds.append(edge.end) %}
+    {% if edge.end in node_index %}{{ edge.end }}["fa:fa-{{ node_index[edge.end].icon  }}"]:::bhNode{% endif %}
+{%- endif %}
+{%- endfor %}
+{%- for edge in node.incoming %}
+{%- if edge.start not in seen_kinds %}
+{%- do seen_kinds.append(edge.start) %}
+    {% if edge.start in node_index %}{{ edge.start }}["fa:fa-{{ node_index[edge.start].icon }}"]:::bhNode{% endif %}
+{%- endif %}
+{%- endfor %}
+{%- for edge in node.outgoing %}
+    {{ edge.start }} -- {{ edge.kind }} --> {{ edge.end }}
+{%- endfor %}
+{%- for edge in node.incoming %}
+    {{ edge.start }} -- {{ edge.kind }} --> {{ edge.end }}
+{%- endfor %}
+```
+{% endif %}
+
+### Outgoing
+{% if node.outgoing %}
+| Start | End | Kind | Description |
+|-------|-----|------|-------------|
+{% for edge in node.outgoing -%}
+| [{{ edge.start }}]({{ edge.start }}.md) | [{{ edge.end }}]({{ edge.end }}.md) | [{{ edge.kind }}](../../graph/edges/{{ edge.kind }}.md) | {{ edge.description }} |
+{% endfor %}
+{% else %}
+No outgoing edges.
+{% endif %}
+
+### Incoming
+{% if node.incoming %}
+| Start | End | Kind | Description |
+|-------|-----|------|-------------|
+{% for edge in node.incoming -%}
+| [{{ edge.start }}]({{ edge.start }}.md) | [{{ edge.end }}]({{ edge.end }}.md) | [{{ edge.kind }}](../../graph/edges/{{ edge.kind }}.md) | {{ edge.description }} |
+{% endfor %}
+{% else %}
+No incoming edges.
+{% endif %}

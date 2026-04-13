@@ -1,0 +1,28 @@
+# Example values for the JAMF collector
+image:
+  repository: docker.io/specterops/openhound
+  tag: "0.1.0-scheduler"
+
+# Optional environment variables.
+env:
+  LOG_CONTAINER: "true"
+  RUNTIME__LOG_LEVEL: "INFO"
+  EXTRACT__WORKERS: "6"
+
+# The dlt config.toml and secrets.toml stored in a Kubernetes ConfigMap and Secret.
+# These should be pre-created and contain the necessary configuration for the collector and destination.
+config:
+  existingConfigMap: openhound-jamf-config
+  existingSecret: openhound-jamf-secrets
+
+# Which collector to run and any additional secret-backed files to mount for that collector.
+# eg. a private key PEM for a GitHub app or a JSON credential file for Okta.
+collector:
+  name: jamf
+  extraSecretMounts: { }
+
+# The BHE destination config. This is typically stored inside the same secrets.toml referenced by config.existingSecret, but non-sensitive values can be provided here for convenience.
+destination:
+  bloodhoundEnterprise:
+    url: https://test.bloodhoundenterprise.io
+    interval: "300"

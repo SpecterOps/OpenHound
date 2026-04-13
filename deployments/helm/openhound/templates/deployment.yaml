@@ -1,0 +1,130 @@
+{{- include "openhound.validate" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openhound.fullname" . }}
+  labels:
+    {{- include "openhound.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "openhound.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "openhound.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if or .Values.collector.extraSecretMounts .Values.podAnnotations }}
+      annotations:
+        {{- if .Values.collector.extraSecretMounts }}
+        checksum/extra-secrets: {{ .Values.collector.extraSecretMounts | toYaml | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "openhound.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: openhound
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: DESTINATION__BLOODHOUNDENTERPRISE__COLLECTOR_NAME
+              value: {{ .Values.collector.name | quote }}
+            {{- if .Values.destination.bloodhoundEnterprise.url }}
+            - name: DESTINATION__BLOODHOUNDENTERPRISE__URL
+              value: {{ .Values.destination.bloodhoundEnterprise.url | quote }}
+            {{- end }}
+            {{- if .Values.destination.bloodhoundEnterprise.interval }}
+            - name: DESTINATION__BLOODHOUNDENTERPRISE__INTERVAL
+              value: {{ .Values.destination.bloodhoundEnterprise.interval | quote }}
+            {{- end }}
+            {{- range $name, $value := .Values.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- range $name, $value := .Values.collector.env }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- if or .Values.config.existingConfigMap .Values.config.existingSecret .Values.collector.extraSecretMounts }}
+          volumeMounts:
+            {{- if .Values.config.existingConfigMap }}
+            - name: dlt-config
+              mountPath: {{ .Values.config.mountPath }}/config.toml
+              subPath: config.toml
+              readOnly: true
+            {{- end }}
+            {{- if .Values.config.existingSecret }}
+            - name: dlt-secrets
+              mountPath: {{ .Values.config.mountPath }}/secrets.toml
+              subPath: secrets.toml
+              readOnly: true
+            {{- end }}
+            {{- if .Values.collector.extraSecretMounts }}
+            {{- range $name, $secret := .Values.collector.extraSecretMounts }}
+            - name: dlt-extra-secret-{{ $name | lower | replace "_" "-" | replace "." "-" }}
+              mountPath: {{ $secret.mountPath }}
+              subPath: {{ $secret.secretKey }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if or .Values.config.existingConfigMap .Values.config.existingSecret .Values.collector.extraSecretMounts }}
+      volumes:
+        {{- if .Values.config.existingConfigMap }}
+        - name: dlt-config
+          configMap:
+            name: {{ .Values.config.existingConfigMap }}
+        {{- end }}
+        {{- if .Values.config.existingSecret }}
+        - name: dlt-secrets
+          secret:
+            secretName: {{ .Values.config.existingSecret }}
+        {{- end }}
+        {{- if .Values.collector.extraSecretMounts }}
+        {{- range $name, $secret := .Values.collector.extraSecretMounts }}
+        - name: dlt-extra-secret-{{ $name | lower | replace "_" "-" | replace "." "-" }}
+          secret:
+            secretName: {{ $secret.secretName }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

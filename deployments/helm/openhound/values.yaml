@@ -1,0 +1,60 @@
+image:
+  repository: docker.io/specterops/openhound
+  pullPolicy: IfNotPresent
+  tag: "latest-scheduler"
+
+imagePullSecrets: [ ]
+nameOverride: ""
+fullnameOverride: ""
+
+# The current service account is a placeholder for future use where
+# openhound can collect Kubernetes resources and needs permissions to the Kubernetes API to do so.
+serviceAccount:
+  create: true
+  annotations: { }
+  name: ""
+
+podAnnotations: { }
+podLabels: { }
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: false
+
+
+args: [ ]
+
+env:
+  LOG_CONTAINER: "true"
+
+envFrom: [ ]
+
+collector:
+  name: ""
+  env: { }
+  extraSecretMounts: { }
+
+destination:
+  bloodhoundEnterprise:
+    url: ""
+    interval: ""
+
+resources: { }
+
+nodeSelector: { }
+tolerations: [ ]
+affinity: { }
+
+config:
+  mountPath: /app/.dlt
+  existingConfigMap: ""
+  existingSecret: ""
