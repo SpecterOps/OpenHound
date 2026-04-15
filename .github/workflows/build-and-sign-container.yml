@@ -22,7 +22,7 @@ jobs:
             publish_latest: true
           - target: enterprise
             suffix: "-enterprise"
-            publish_latest: false
+            publish_latest: true
     env:
       DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
       DOCKER_REPOSITORY: ${{ vars.DOCKER_REPOSITORY }}
@@ -58,7 +58,7 @@ jobs:
           TAGS="${{ steps.image-ref.outputs.version_tag }}"
 
           if [ "${{ matrix.publish_latest }}" = "true" ]; then
-            TAGS="${TAGS}"$'\n'"${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:latest"
+            TAGS="${TAGS}"$'\n'"${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:latest${{ matrix.suffix }}"
           fi
 
           {
