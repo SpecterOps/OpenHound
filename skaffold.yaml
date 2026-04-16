@@ -1,0 +1,33 @@
+# Example skaffold to test/deploy the jamf collector
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: openhound
+
+build:
+  local:
+    push: false
+    useBuildkit: true
+  artifacts:
+    - image: docker.io/specterops/openhound
+      docker:
+        dockerfile: Dockerfile
+        target: scheduler
+        buildArgs:
+          OPENHOUND_VERSION: 0.1.0
+        secrets:
+          - id: ARTIFACT_TOKEN
+            env: ARTIFACT_TOKEN
+
+deploy:
+  helm:
+    releases:
+      - name: openhound-jamf
+        chartPath: deployments/helm/openhound
+        valuesFiles:
+          - deployments/helm/values.example.yaml
+        setValueTemplates:
+          image.repository: "{{.IMAGE_REPO_docker_io_specterops_openhound}}"
+          image.tag: "{{.IMAGE_TAG_docker_io_specterops_openhound}}@{{.IMAGE_DIGEST_docker_io_specterops_openhound}}"
+        setValues:
+          image.pullPolicy: IfNotPresent
