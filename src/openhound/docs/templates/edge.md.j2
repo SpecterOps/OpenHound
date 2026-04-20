@@ -8,7 +8,9 @@ tags:
 
 This page describes the **{{ edge.kind }}** OpenGraph edge type as exported by the {{ name }} source. This edge was generated via the {% for asset in edge.produced_by %}[{{ asset }}](../../collection/assets/{{ asset }}.md){% if not loop.last %}, {% endif %}{% endfor %} assets.
 
---8<-- "{{ edge.kind }}.md"
+{% if edge_description %}
+{{ edge_description }}
+{% endif %}
 
 ## Source and destination nodes
 
