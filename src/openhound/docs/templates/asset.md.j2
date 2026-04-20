@@ -8,14 +8,10 @@ This section describes the exported OpenGraph asset(s) for the {{ graph_resource
 | [{{ graph_resource.node.kind }}](../../graph/nodes/{{ graph_resource.node.kind}}.md) | :fontawesome-solid-{{ graph_resource.node.icon }}: |
 {% endif %}
 
-{% if graph_resource.node and "properties" in graph_resource.node %}
-??? Properties
+{% if graph_resource.node and "node_properties_table" in graph_resource %}
+## Node properties
 
-    ::: {{  graph_resource.node.properties }}
-        options:
-          show_docstring_attributes: true
-          inherited_members: true
-          members_order: source
+{{ graph_resource.node_properties_table }}
 
 {% endif %}
 
@@ -34,4 +30,4 @@ This section describes the exported OpenGraph asset(s) for the {{ graph_resource
 ## Resource attributes
 This section describes the data collected and available fields as present in the exported jsonl/parquet files.
 
-::: {{ graph_resource.path }}
+{{ graph_resource.resource_attributes_table }}
