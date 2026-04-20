@@ -8,17 +8,14 @@ tags:
 
 This page describes the **{{ node.kind }}** OpenGraph node type as exported by the {{ name }} source. This node was generated from the [{{ node.produced_by }}](../../collection/assets/{{ node.produced_by }}.md) asset.
 
---8<-- "{{ node.kind }}.md"
+{% if node_description %}
+{{ node_description }}
+{% endif %}
 
 {% if node.properties %}
 ## Node properties
-{#??? Properties#}
 
-::: {{  node.properties }}
-    options:
-      show_docstring_attributes: true
-      inherited_members: true
-      members_order: source
+{{ node.properties_table }}
 
 {%  endif  %}
 
