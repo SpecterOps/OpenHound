@@ -20,7 +20,7 @@ services:
       <<: *env
       DESTINATION__BLOODHOUNDENTERPRISE__COLLECTOR_NAME: jamf
     secrets:
-      - source: secrets
+      - source: secrets_jamf
         target: /app/.dlt/secrets.toml
 
   scheduler-github:
@@ -29,7 +29,7 @@ services:
       <<: *env
       DESTINATION__BLOODHOUNDENTERPRISE__COLLECTOR_NAME: github
     secrets:
-      - source: secrets
+      - source: secrets_github
         target: /app/.dlt/secrets.toml
       - source: key_github
         target: /app/.dlt/github.pem
@@ -40,15 +40,19 @@ services:
       <<: *env
       DESTINATION__BLOODHOUNDENTERPRISE__COLLECTOR_NAME: okta
     secrets:
-      - source: secrets
+      - source: secrets_okta
         target: /app/.dlt/secrets.toml
       - source: key_okta
         target: /app/.dlt/okta.json
 
 secrets:
-  secrets:
-    file: ${HOME}/.dlt/secrets.toml
+  secrets_github:
+    file: ${HOME}/.dlt/secrets_github.toml
   key_github:
     file: ${HOME}/.dlt/github.pem
+  secrets_jamf:
+    file: ${HOME}/.dlt/secrets_jamf.toml
+  secrets_okta:
+    file: ${HOME}/.dlt/secrets_okta.toml
   key_okta:
     file: ${HOME}/.dlt/okta.json
