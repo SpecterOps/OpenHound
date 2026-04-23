@@ -6,6 +6,10 @@
 #   4. Run all collectors:    docker compose up -d
 #      Or run a single one:   docker compose up -d scheduler-jamf
 #
+# WARNING: All config and secret files referenced below MUST exist before running
+# `docker compose up`. If they are missing, Docker will create them as directories,
+# which will cause the collector to fail. Follow the Quick-start steps above first.
+#
 # Full configuration reference: https://bloodhound.specterops.io/openhound/enterprise
 
 x-scheduler: &scheduler

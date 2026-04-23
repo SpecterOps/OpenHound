@@ -1,6 +1,5 @@
 # Example docker-compose file for running OpenHound with Jamf, GitHub, and Okta collectors.
-# The output graph is stored inside a named volume per collector. Copy the OpenGraph contents using:
-#   `<docker|podman> cp <container_name>:/tmp/output/graph <destination_path>`
+# Collector output is written to local bind-mount directories under ./output/<collector>/.
 #
 # Quick-start:
 #   1. Copy the .dlt-example folder to ${HOME}/.dlt and fill in your credentials.
@@ -9,6 +8,10 @@
 #      Or run to pull from docker-compose.yml: docker compose pull
 #   4. Run all collectors:    docker compose up -d
 #      Or run a single one:   docker compose up -d scheduler-jamf
+#
+# WARNING: All config and secret files referenced below MUST exist before running
+# `docker compose up`. If they are missing, Docker will create them as directories,
+# which will cause the collector to fail. Follow the Quick-start steps above first.
 
 x-cli: &cli
   image: specterops/openhound:latest
@@ -22,16 +25,41 @@ x-cli: &cli
     EXTRACT__WORKERS: 8
     LOG_CONTAINER: true
 
+x-jamf: &jamf
+  <<: *cli
+  volumes:
+    - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+    - ./output/jamf:/tmp/output
+  secrets:
+    - source: secrets_jamf
+      target: /app/.dlt/secrets.toml
+
+x-github: &github
+  <<: *cli
+  volumes:
+    - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+    - ./output/github:/tmp/output
+  secrets:
+    - source: secrets_github
+      target: /app/.dlt/secrets.toml
+    - source: key_github
+      target: /app/.dlt/github.pem
+
+x-okta: &okta
+  <<: *cli
+  volumes:
+    - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+    - ./output/okta:/tmp/output
+  secrets:
+    - source: secrets_okta
+      target: /app/.dlt/secrets.toml
+    - source: key_okta
+      target: /app/.dlt/okta.json
+
 services:
   # --- Jamf ---
   collect-jamf:
-    <<: *cli
-    volumes:
-      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-      - jamf-output:/tmp/output
-    secrets:
-      - source: secrets_jamf
-        target: /app/.dlt/secrets.toml
+    <<: *jamf
     command:
       - collect
       - jamf
@@ -39,13 +67,7 @@ services:
       - --progress=log
 
   preprocess-jamf:
-    <<: *cli
-    volumes:
-      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-      - jamf-output:/tmp/output
-    secrets:
-      - source: secrets_jamf
-        target: /app/.dlt/secrets.toml
+    <<: *jamf
     command:
       - preprocess
       - jamf
@@ -57,13 +79,7 @@ services:
         condition: service_completed_successfully
 
   convert-jamf:
-    <<: *cli
-    volumes:
-      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-      - jamf-output:/tmp/output
-    secrets:
-      - source: secrets_jamf
-        target: /app/.dlt/secrets.toml
+    <<: *jamf
     command:
       - convert
       - jamf
@@ -77,15 +93,7 @@ services:
 
   # --- GitHub ---
   collect-github:
-    <<: *cli
-    volumes:
-      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-      - github-output:/tmp/output
-    secrets:
-      - source: secrets_github
-        target: /app/.dlt/secrets.toml
-      - source: key_github
-        target: /app/.dlt/github.pem
+    <<: *github
     command:
       - collect
       - github
@@ -93,15 +101,7 @@ services:
       - --progress=log
 
   preprocess-github:
-    <<: *cli
-    volumes:
-      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-      - github-output:/tmp/output
-    secrets:
-      - source: secrets_github
-        target: /app/.dlt/secrets.toml
-      - source: key_github
-        target: /app/.dlt/github.pem
+    <<: *github
     command:
       - preprocess
       - github
@@ -113,15 +113,7 @@ services:
         condition: service_completed_successfully
 
   convert-github:
-    <<: *cli
-    volumes:
-      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-      - github-output:/tmp/output
-    secrets:
-      - source: secrets_github
-        target: /app/.dlt/secrets.toml
-      - source: key_github
-        target: /app/.dlt/github.pem
+    <<: *github
     command:
       - convert
       - github
@@ -135,15 +127,7 @@ services:
 
   # --- Okta ---
   collect-okta:
-    <<: *cli
-    volumes:
-      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-      - okta-output:/tmp/output
-    secrets:
-      - source: secrets_okta
-        target: /app/.dlt/secrets.toml
-      - source: key_okta
-        target: /app/.dlt/okta.json
+    <<: *okta
     command:
       - collect
       - okta
@@ -151,15 +135,7 @@ services:
       - --progress=log
 
   preprocess-okta:
-    <<: *cli
-    volumes:
-      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-      - okta-output:/tmp/output
-    secrets:
-      - source: secrets_okta
-        target: /app/.dlt/secrets.toml
-      - source: key_okta
-        target: /app/.dlt/okta.json
+    <<: *okta
     command:
       - preprocess
       - okta
@@ -171,15 +147,7 @@ services:
         condition: service_completed_successfully
 
   convert-okta:
-    <<: *cli
-    volumes:
-      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-      - okta-output:/tmp/output
-    secrets:
-      - source: secrets_okta
-        target: /app/.dlt/secrets.toml
-      - source: key_okta
-        target: /app/.dlt/okta.json
+    <<: *okta
     command:
       - convert
       - okta
@@ -190,11 +158,6 @@ services:
     depends_on:
       preprocess-okta:
         condition: service_completed_successfully
-
-volumes:
-  jamf-output:
-  github-output:
-  okta-output:
 
 secrets:
   # Jamf: username + password auth
