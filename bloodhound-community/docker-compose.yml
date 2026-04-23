@@ -1,13 +1,18 @@
-# This is an example docker-compose file for running OpenHound with the JAMF collector.
-# the output graph will be stored inside a named volume. You can copy the OpenGraph contents using the
-# following command: `<docker|podman> cp <container_name>:/tmp/output/graph <destination_path>`
+# Example docker-compose file for running OpenHound with Jamf, GitHub, and Okta collectors.
+# The output graph is stored inside a named volume per collector. Copy the OpenGraph contents using:
+#   `<docker|podman> cp <container_name>:/tmp/output/graph <destination_path>`
+#
+# Quick-start:
+#   1. Copy the .dlt-example folder to ${HOME}/.dlt and fill in your credentials.
+#   2. Place any required key files (github.pem, okta.json) in ${HOME}/.dlt.
+#   3. Pull image from SpecterOps Docker Hub:  docker pull specterops/openhound:latest
+#      Or run to pull from docker-compose.yml: docker compose pull
+#   4. Run all collectors:    docker compose up -d
+#      Or run a single one:   docker compose up -d scheduler-jamf
 
 x-cli: &cli
   image: specterops/openhound:latest
   restart: no
-  volumes:
-    - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
-    - jamf-output:/tmp/output
 
   # These environment variables can also be set inside the ~/.dlt/config.toml file
   # and act as an example. Configuring openhound can be done using environment variables,
@@ -17,13 +22,16 @@ x-cli: &cli
     EXTRACT__WORKERS: 8
     LOG_CONTAINER: true
 
-  secrets:
-    - source: secrets_jamf
-      target: /app/.dlt/secrets.toml
-
 services:
+  # --- Jamf ---
   collect-jamf:
     <<: *cli
+    volumes:
+      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+      - jamf-output:/tmp/output
+    secrets:
+      - source: secrets_jamf
+        target: /app/.dlt/secrets.toml
     command:
       - collect
       - jamf
@@ -32,6 +40,12 @@ services:
 
   preprocess-jamf:
     <<: *cli
+    volumes:
+      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+      - jamf-output:/tmp/output
+    secrets:
+      - source: secrets_jamf
+        target: /app/.dlt/secrets.toml
     command:
       - preprocess
       - jamf
@@ -44,6 +58,12 @@ services:
 
   convert-jamf:
     <<: *cli
+    volumes:
+      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+      - jamf-output:/tmp/output
+    secrets:
+      - source: secrets_jamf
+        target: /app/.dlt/secrets.toml
     command:
       - convert
       - jamf
@@ -55,9 +75,140 @@ services:
       preprocess-jamf:
         condition: service_completed_successfully
 
+  # --- GitHub ---
+  collect-github:
+    <<: *cli
+    volumes:
+      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+      - github-output:/tmp/output
+    secrets:
+      - source: secrets_github
+        target: /app/.dlt/secrets.toml
+      - source: key_github
+        target: /app/.dlt/github.pem
+    command:
+      - collect
+      - github
+      - /tmp/output/raw
+      - --progress=log
+
+  preprocess-github:
+    <<: *cli
+    volumes:
+      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+      - github-output:/tmp/output
+    secrets:
+      - source: secrets_github
+        target: /app/.dlt/secrets.toml
+      - source: key_github
+        target: /app/.dlt/github.pem
+    command:
+      - preprocess
+      - github
+      - /tmp/output/raw/github
+      - /tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      collect-github:
+        condition: service_completed_successfully
+
+  convert-github:
+    <<: *cli
+    volumes:
+      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+      - github-output:/tmp/output
+    secrets:
+      - source: secrets_github
+        target: /app/.dlt/secrets.toml
+      - source: key_github
+        target: /app/.dlt/github.pem
+    command:
+      - convert
+      - github
+      - /tmp/output/raw/github
+      - /tmp/output/graph
+      - --lookup-file=/tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      preprocess-github:
+        condition: service_completed_successfully
+
+  # --- Okta ---
+  collect-okta:
+    <<: *cli
+    volumes:
+      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+      - okta-output:/tmp/output
+    secrets:
+      - source: secrets_okta
+        target: /app/.dlt/secrets.toml
+      - source: key_okta
+        target: /app/.dlt/okta.json
+    command:
+      - collect
+      - okta
+      - /tmp/output/raw
+      - --progress=log
+
+  preprocess-okta:
+    <<: *cli
+    volumes:
+      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+      - okta-output:/tmp/output
+    secrets:
+      - source: secrets_okta
+        target: /app/.dlt/secrets.toml
+      - source: key_okta
+        target: /app/.dlt/okta.json
+    command:
+      - preprocess
+      - okta
+      - /tmp/output/raw/okta
+      - /tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      collect-okta:
+        condition: service_completed_successfully
+
+  convert-okta:
+    <<: *cli
+    volumes:
+      - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+      - okta-output:/tmp/output
+    secrets:
+      - source: secrets_okta
+        target: /app/.dlt/secrets.toml
+      - source: key_okta
+        target: /app/.dlt/okta.json
+    command:
+      - convert
+      - okta
+      - /tmp/output/raw/okta
+      - /tmp/output/graph
+      - --lookup-file=/tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      preprocess-okta:
+        condition: service_completed_successfully
+
 volumes:
   jamf-output:
+  github-output:
+  okta-output:
 
 secrets:
+  # Jamf: username + password auth
   secrets_jamf:
     file: ${HOME}/.dlt/secrets_jamf.toml
+
+  # GitHub: GitHub App auth (app_id, client_id, org_name) + private key PEM (github.pem)
+  secrets_github:
+    file: ${HOME}/.dlt/secrets_github.toml
+  key_github:
+    file: ${HOME}/.dlt/github.pem
+
+  # Okta: OAuth client credentials (base_url, client_id) + private key JSON (okta.json)
+  secrets_okta:
+    file: ${HOME}/.dlt/secrets_okta.toml
+  key_okta:
+    file: ${HOME}/.dlt/okta.json

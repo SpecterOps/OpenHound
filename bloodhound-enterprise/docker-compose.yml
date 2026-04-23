@@ -1,3 +1,13 @@
+# Quick-start:
+#   1. Copy the .dlt-example folder to ${HOME}/.dlt and fill in your credentials.
+#   2. Place any required key files (github.pem, okta.json) in ${HOME}/.dlt.
+#   3. Pull image from SpecterOps Docker Hub:  docker pull specterops/openhound:0.1.1-enterprise
+#      Or run to pull from docker-compose.yml: docker compose pull
+#   4. Run all collectors:    docker compose up -d
+#      Or run a single one:   docker compose up -d scheduler-jamf
+#
+# Full configuration reference: https://bloodhound.specterops.io/openhound/enterprise
+
 x-scheduler: &scheduler
   image: specterops/openhound:${IMAGE_VERSION:-0.1.1-enterprise}
   restart: unless-stopped
@@ -14,6 +24,7 @@ x-scheduler: &scheduler
     LOG_CONTAINER: true
 
 services:
+  # --- Jamf ---
   scheduler-jamf:
     <<: *scheduler
     environment:
@@ -23,6 +34,7 @@ services:
       - source: secrets_jamf
         target: /app/.dlt/secrets.toml
 
+  # --- GitHub ---
   scheduler-github:
     <<: *scheduler
     environment:
@@ -34,6 +46,7 @@ services:
       - source: key_github
         target: /app/.dlt/github.pem
 
+  # --- Okta ---
   scheduler-okta:
     <<: *scheduler
     environment:
@@ -46,12 +59,20 @@ services:
         target: /app/.dlt/okta.json
 
 secrets:
+  # Copy the .dlt-example folder to ${HOME}/.dlt as a starting point for each secrets file.
+  # Each secrets file must also contain [destination.bloodhoundenterprise] with url, token_id, and token_key.
+
+  # Jamf: username + password auth
+  secrets_jamf:
+    file: ${HOME}/.dlt/secrets_jamf.toml
+
+  # GitHub: GitHub App auth (app_id, client_id, org_name) + private key PEM (github.pem)
   secrets_github:
     file: ${HOME}/.dlt/secrets_github.toml
   key_github:
     file: ${HOME}/.dlt/github.pem
-  secrets_jamf:
-    file: ${HOME}/.dlt/secrets_jamf.toml
+
+  # Okta: OAuth client credentials (base_url, client_id) + private key JSON (okta.json)
   secrets_okta:
     file: ${HOME}/.dlt/secrets_okta.toml
   key_okta:
