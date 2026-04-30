@@ -1,0 +1,14 @@
+nav:
+  - index.md
+  - getting-started.md
+  - cli.md
+  - logging.md
+  - Development:
+    - "development/creating-collector.md"
+    - "development/collection.md"
+    - "development/modelling.md"
+    - "development/graph.md"
+  - API:
+    - "api/*"
+  - Sources:
+    - "sources/*"
