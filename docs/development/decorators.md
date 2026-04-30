@@ -40,7 +40,7 @@ def collect(ctx: CollectContext):
 Registers a CLI command that (optionally) preprocesses collected resources and builds lookup data for the OpenGraph
 conversion stage. This function should return a dictionary mapping resource names to table names.
 
-Optionally, you can provide a `transformer` function that applies Ibis-based transformations to the loaded data in
+Optionally, you can provide a `transformer` function that applies SQL-based transformations to the loaded data in
 DuckDB. The transformer function receives a DuckDB connection and can create new tables derived from the loaded
 resources.
 
