@@ -89,28 +89,6 @@ def convert(ctx: ConvertContext) -> Tuple[DltSource, dict]:
 - `lookup`: An optional lookup class for resolving resources during OpenGraph conversion.
 - `ctx` (ConvertContext): Pipeline context for the OpenGraph conversion stage.
 
-### @app.icons()
-
-Registers a CLI command that synchronizes custom icons with BloodHound. This function should return a dictionary mapping
-the primary node kind to the icon name. The example below includes the icons as a dictionary, though these can also be
-read from a configuration file.
-
-```python
-@app.icons(color="#EE7D0C")
-def icons():
-    return {
-        "AWSUser": "user",
-        "AWSGroup": "user-group",
-        "AWSRole": "id-badge",
-        "AWSInlinePolicy": "file-contract",
-        "AWSPolicy": "file-contract",
-    }
-```
-
-**Parameters:**
-
-- `color`: The default color for the custom icons
-
 ## Pipeline Flow
 
 ```mermaid
