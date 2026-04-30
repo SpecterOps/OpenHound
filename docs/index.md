@@ -62,21 +62,13 @@ like:
 
 ## Supported sources (current state)
 
-- Kubernetes: Collects all resource types (including CRDs) with additional enrichment for commonly used objects like
-  pods, service accounts, roles, and secrets;
-- AWS: Primarily collects IAM users, groups, roles and policies. Additionally discovers resources via AWS Resource
-  Explorer;
-- Rapid7 InsightVM: Collects assets and discovered vulnerabilities. Each vulnerability will be transformed into its own
-  node and automatically linked to existing BloodHound assets by matching hostnames;
-- BloodHound: BloodHound itself is also a source. By collecting all BloodHound nodes and storing them in our embedded
-  DuckDB database, the collectors can efficiently query and reference any pre-existing node by any of its properties.
-  This is also how the Rapid7 InsightVM source matches vulnerabilities to assets, and how you can potentially link other
-  external identities to existing AD users without having to query the BloodHound API every time.
+- Okta
+- Github
+- Jamf
 
 ## Supported destinations
 
 - File Export: Generates local OpenGraph JSON files which are automatically split into multiple files based on your
-  configured (entry) size limit and resource type. This can be useful if you want to review the data before ingestion,
-  want to share graphs, or don’t have access to the BloodHound API at the time;
-- Direct API: Generates the same OpenGraph format but uploads the content via the BloodHound API without the storing
-  files on disk first.
+  configured (entry) size limit and resource type.
+- Ingest API: Generates the same OpenGraph format but uploads the content via the BloodHound BHE API without the storing
+  files on disk first. This feature is only supported for BloodHound enterprise customers.
