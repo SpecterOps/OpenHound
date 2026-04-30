@@ -25,12 +25,6 @@ Create a new collector using the "create collector" command, which will prompt y
 openhound create collector
 ```
 
-Or create the collector by specifying the required options directly
-
-```console
-openhound create collector
-```
-
 ## 4. Done
 
 You should now be able to see the name of your new collector registered using the following command:
