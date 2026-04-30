@@ -14,16 +14,34 @@ these fields, the application will exit with an error. More information on how t
 found [here](https://docs.pydantic.dev/latest/concepts/fields/).
 
 ```py
-@app.asset(kind=NodeTypes.Asset, description="Example Asset",
-           edges=[
-               EdgeDef(
-                   start=NodeTypes.Asset,
-                   end=NodeTypes.Group,
-                   kind=EdgeTypes.MemberOf,
-                   description="Asset belongs to group",
-               )
-           ]
-           )
+
+@dataclass
+class AssetProperties(BaseNodeProperties):
+    """Properties for the Asset node.
+    
+    Attributes:
+        hostname: The asset hostname.
+    """
+    hostname: str
+
+
+@app.asset(
+    node=NodeDef(
+        kind=nk.Asset,
+        description="Asset node",
+        icon="computer",
+        properties=AssetProperties,
+    ),
+    edges=[
+        EdgeDef(
+            start=nk.Asset,
+            end=nk.Group,
+            kind=ek.MemberOf,
+            description="Asset belongs to group",
+            traversable=False
+        )
+    ]
+)
 class Asset(BaseAsset):
     id: int  # ID should be an integer
     name: str  # Name should be a string
@@ -31,23 +49,23 @@ class Asset(BaseAsset):
     groups: list[str]  # contains a list of groups (value string)
 
     @property
-    def as_node(self) -> "ExtendedNode":
-        properties = ExtendedProperties(
+    def as_node(self):
+        properties = AssetProperties(
             name=self.name, displayname=self.name, hostname=self.hostname
         )
-        return ExtendedNode(properties=properties)
+        return Node(properties=properties)
 
     @property
-    def _groups_memberships(self) -> Iterator[Edge]:
+    def _groups_memberships(self):
         # Assuming the groups are also retrieved and the group name is the reference used
         # to generate the ID
         for group in self.groups:
             start = EdgePath(value=self.as_node.id, match_by="id")
-            end = EdgePath(value=Node.guid(name=group, node_type=NodeTypes.Group), match_by="id")
-            yield Edge(kind=EdgeTypes.MemberOf, start=start, end=end)
+            end = EdgePath(value=group.id, match_by="id")
+            yield Edge(kind=ek.MemberOf, start=start, end=end)
 
     @property
-    def edges(self) -> Iterator[Edge]:
+    def edges(self):
         # Can yield multiple different edges
         yield from self._groups_memberships
         yield from ...
@@ -71,7 +89,7 @@ them with resource-specific fields by defining your own ExtendedProperties and i
 
 ```py
 @dataclass
-class ExtendedProperties(BaseNodeProperties):
+class AssetProperties(BaseNodeProperties):
     hostname: str
 
 ```
