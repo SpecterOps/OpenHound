@@ -26,7 +26,7 @@ helm install -f values.yml openhound-<name> ./deployments/helm/openhound
 # Example values for the JAMF collector
 image:
   repository: docker.io/specterops/openhound
-  tag: "0.1.0-scheduler"
+  tag: "0.1.0-enterprise"
 
 # Optional environment variables.
 env:
