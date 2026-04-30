@@ -5,14 +5,16 @@ site/
 addons/
 collectors/
 
+# Notebooks/output
 notebooks
-
 output
 graph
 logs
 dbt_packages
-.vscode
 
+# Ignore editor settings
+.vscode
+.idea
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
