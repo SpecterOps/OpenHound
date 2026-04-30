@@ -1,0 +1,5 @@
+| Field | Type | Description |
+|-------|------|-------------|
+{% for documented_field in fields -%}
+| `{{ escape_markdown_cell(documented_field.name) }}` | `{{ escape_markdown_cell(documented_field.type_name) }}` | {{ escape_markdown_cell(documented_field.description or "-") }} |
+{% endfor %}

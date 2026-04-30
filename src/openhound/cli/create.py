@@ -1,16 +1,23 @@
 import re
+from enum import Enum
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Annotated
 
 import typer
+
+
+class Template(str, Enum):
+    mintlify = "mintlify"
+    mkdocs = "mkdocs"
+
 
 create_app = typer.Typer(
     help="Create a new OpenHound collector based on the cookiecutter template"
 )
 
 
-def generate_docs(base_path: Path, group: str = "openhound.sources") -> None:
+def generate_docs(base_path: Path, template: Template, group: str = "openhound.sources") -> None:
     """Loads the collector extensions via entrypoints and uses griffe to generate OpenHound collector docs.
 
     Args:
@@ -54,42 +61,47 @@ def generate_docs(base_path: Path, group: str = "openhound.sources") -> None:
 
 @create_app.command()
 def docs(
-    output_dir: Path = typer.Argument(
-        Path("./docs"),
-        help="Where to create the docs for extensions",
-        file_okay=False,
-        dir_okay=True,
-        exists=True,
-    ),
+        output_dir: Path = typer.Argument(
+            Path("./docs"),
+            help="Where to create the docs for extensions",
+            file_okay=False,
+            dir_okay=True,
+            exists=True,
+        ),
+        template: Annotated[Template, typer.Option(
+            help="Which template to use for docs generation")
+        ] = Template.mkdocs,
+
 ):
     """Generate OpenHound collector docs based on @app.asset decorators and docstrings in each collector.
 
     Args:
         output_dir (Path): Base path where to create the collector docs (default: ./docs).
+        template (Template): Template to use for docs generation
 
     """
-    generate_docs(output_dir)
+    generate_docs(output_dir, template)
 
 
 @create_app.command()
 def collector(
-    output_dir: Path = typer.Argument(
-        help="Where to create the collector",
-        file_okay=False,
-        dir_okay=True,
-    ),
-    config: Optional[Path] = typer.Option(
-        None,
-        "--config",
-        "-c",
-        help="Path to config file (YAML/JSON)",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-    ),
-    template: str = typer.Option(
-        "gh:SpecterOps/OpenHound-template", "--template", "-t", help="Template to use"
-    ),
+        output_dir: Path = typer.Argument(
+            help="Where to create the collector",
+            file_okay=False,
+            dir_okay=True,
+        ),
+        config: Optional[Path] = typer.Option(
+            None,
+            "--config",
+            "-c",
+            help="Path to config file (YAML/JSON)",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+        ),
+        template: str = typer.Option(
+            "gh:SpecterOps/OpenHound-template", "--template", "-t", help="Template to use"
+        ),
 ):
     """Generate a new OpenHound collector using a cookiecutter template.
 

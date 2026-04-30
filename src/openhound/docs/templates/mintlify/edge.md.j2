@@ -1,0 +1,43 @@
+---
+tags:
+  - edge
+  - {% if edge.traversable -%}traversable{% else %}non-traversable{% endif %}
+---
+
+# {{ edge.kind }}
+
+This page describes the **{{ edge.kind }}** OpenGraph edge type as exported by the {{ name }} source. This edge was generated via the {% for asset in edge.produced_by %}[{{ asset }}](../../collection/assets/{{ asset }}.md){% if not loop.last %}, {% endif %}{% endfor %} assets.
+
+{% if edge_description %}
+{{ edge_description }}
+{% endif %}
+
+## Source and destination nodes
+
+The following node pairs are connected via the **{{ edge.kind }}** edge:
+
+| Start | Kind | End |
+|-------|-----------|-------|
+{% for instance in edge.instances -%}
+| [{{ instance.start }}](../../graph/nodes/{{ instance.start }}.md) | {{ edge.kind }} | [{{ instance.end }}](../../graph/nodes/{{ instance.end }}.md) |
+{% endfor %}
+
+{% if edge.instances %}
+```mermaid
+flowchart LR
+{%- set seen_kinds = [] %}
+{%- for instance in edge.instances %}
+{%- if instance.start not in seen_kinds %}
+{%- do seen_kinds.append(instance.start) %}
+    {{ instance.start }}["{{ instance.start }}"]:::bhNode
+{%- endif %}
+{%- if instance.end not in seen_kinds %}
+{%- do seen_kinds.append(instance.end) %}
+    {{ instance.end }}["{{ instance.end }}"]:::bhNode
+{%- endif %}
+{%- endfor %}
+{%- for instance in edge.instances %}
+    {{ instance.start }} -- {{ edge.kind }} --> {{ instance.end }}
+{%- endfor %}
+```
+{% endif %}

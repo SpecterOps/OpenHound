@@ -1,0 +1,33 @@
+# {{ graph_resource.class }}
+This section describes the exported OpenGraph asset(s) for the {{ graph_resource.class }} class. Each resource wrapped with the @app.asset decorator will export documentation for an OpenGraph node, multiple edges or a combination of both.
+
+{% if graph_resource.node %}
+## Node
+| Name | Icon |
+|------|------|
+| [{{ graph_resource.node.kind }}](../../graph/nodes/{{ graph_resource.node.kind}}.md) | :fontawesome-solid-{{ graph_resource.node.icon }}: |
+{% endif %}
+
+{% if graph_resource.node and "node_properties_table" in graph_resource %}
+## Node properties
+
+{{ graph_resource.node_properties_table }}
+
+{% endif %}
+
+{% if graph_resource.edges %}
+## Edges
+
+| Start | End | Kind | Description |
+|-------|-----|------|-------------|
+{% for edge in graph_resource.edges -%}
+| [{{ edge.start }}](../../graph/nodes/{{ edge.start }}.md) | [{{ edge.end }}](../../graph/nodes/{{ edge.end }}.md) | [{{ edge.kind }}](../../graph/edges/{{ edge.kind }}.md) | {{ edge.description }} |
+{% endfor %}
+{% endif %}
+
+
+
+## Resource attributes
+This section describes the data collected and available fields as present in the exported jsonl/parquet files.
+
+{{ graph_resource.resource_attributes_table }}

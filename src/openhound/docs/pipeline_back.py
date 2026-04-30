@@ -1,18 +1,13 @@
 import importlib
 from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
+from typing import Any, Literal
 
 import griffe
 from jinja2 import Environment, FileSystemLoader
 
 ROOT_PATH = Path(__file__).resolve().parents[1]
-
-
-class Template(str, Enum):
-    mintlify = "mintlify"
-    mkdocs = "mkdocs"
 
 
 @dataclass
@@ -21,6 +16,13 @@ class Collector:
     sources: list = field(default_factory=list)
     resources: list = field(default_factory=list)
     transformers: list = field(default_factory=list)
+
+
+@dataclass
+class DocumentedField:
+    name: str
+    type_name: str
+    description: str | None = None
 
 
 class GraphResourceDecorator(griffe.Extension):
@@ -82,13 +84,39 @@ class GraphResourceDecorator(griffe.Extension):
         return str(expr).replace("'", "")
 
     @staticmethod
+    def _parse_node_properties(properties_cls: griffe.Class, docstring_style: Literal['google'] = "google") -> dict:
+        """Parses the node properties as a dictionary.
+
+        Args:
+            properties_cls: The Griffe class being processed.
+        """
+
+        descriptions: dict[str, str] = {}
+        all_attributes = {}
+        for attribute, content in properties_cls.attributes.items():
+            all_attributes[attribute] = {'type': content.annotation.canonical_name}
+
+        sections = properties_cls.docstring.parse(docstring_style)
+        for section in sections:
+            if section.kind is not griffe.DocstringSectionKind.attributes:
+                continue
+            for docs_attribute in section.value:
+                descriptions[docs_attribute.name] = (docs_attribute.description or "").strip()
+
+        return descriptions
+
+    @staticmethod
     def _node(arg, cls) -> dict:
         """Parse a ``NodeDef(...)`` as a dictionary. Returns the kind, description, icon."""
         node = {}
         for argument in arg.value.arguments:
-            node[argument.canonical_name] = GraphResourceDecorator._resolve(
-                argument.value, cls
-            )
+            if argument.name in ['kind', 'description', 'icon']:
+                node[argument.canonical_name] = GraphResourceDecorator._resolve(
+                    argument.value, cls
+                )
+            if argument.name == 'properties':
+                node['properties'] = GraphResourceDecorator._parse_node_properties(argument.value.resolved)
+
         return {"node": node}
 
     @staticmethod
@@ -145,10 +173,10 @@ class GraphResourceDecorator(griffe.Extension):
                 collector.transformers.append(entry)
 
     def on_class(
-        self,
-        *,
-        cls: griffe.Class,
-        **kwargs,
+            self,
+            *,
+            cls: griffe.Class,
+            **kwargs,
     ) -> None:
 
         parsers = {
@@ -180,26 +208,146 @@ class GraphResourceDecorator(griffe.Extension):
 
 class CustomCollectorDocs:
     def __init__(
-        self,
-        name: str,
-        base_docs_dir: Path,
-        assets: list[dict],
-        sources: list[dict] | None = None,
-        resources: list[dict] | None = None,
-        transformers: list[dict] | None = None,
-        template: Template = Template.mkdocs,
-        template_dir: Path = Path("docs/templates"),
+            self,
+            name: str,
+            base_docs_dir: Path,
+            assets: list[dict],
+            sources: list[dict] | None = None,
+            resources: list[dict] | None = None,
+            transformers: list[dict] | None = None,
+            descriptions_dir: Path | None = None,
+            template_dir: Path = Path("docs/templates"),
     ):
         self.name = name
         self.base_docs_dir = base_docs_dir
+        self.descriptions_dir = descriptions_dir or (base_docs_dir / "descriptions")
         self.assets = assets
         self.sources = sources or []
         self.resources = resources or []
         self.transformers = transformers or []
         self.env = Environment(
-            loader=FileSystemLoader(ROOT_PATH / template_dir / template.value),
+            loader=FileSystemLoader(ROOT_PATH / template_dir),
             extensions=["jinja2.ext.do"],
         )
+        self.env.globals["escape_markdown_cell"] = self.escape_markdown_cell
+        self._griffe_class_cache: dict[str, griffe.Class | None] = {}
+
+    @staticmethod
+    def escape_markdown_cell(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).replace("|", r"\|").replace("\n", "<br>")
+
+    def _load_griffe_class(self, class_path: str) -> griffe.Class | None:
+        if class_path in self._griffe_class_cache:
+            return self._griffe_class_cache[class_path]
+
+        try:
+            loaded_obj = griffe.load(
+                class_path,
+                resolve_aliases=True,
+                resolve_external=True,
+            )
+        except ImportError:
+            self._griffe_class_cache[class_path] = None
+            return None
+
+        resolved_class = loaded_obj if isinstance(loaded_obj, griffe.Class) else None
+        self._griffe_class_cache[class_path] = resolved_class
+
+        return resolved_class
+
+    @staticmethod
+    def _format_type_name(annotation: Any) -> str:
+        if annotation is None or annotation is type(None):
+            return "None"
+
+        if isinstance(annotation, str):
+            return annotation
+
+        if getattr(annotation, "__module__", "") == "builtins" and hasattr(
+                annotation, "__name__"
+        ):
+            return annotation.__name__
+
+        rendered = str(annotation)
+        # TODO: what the fuck is this
+        # if rendered.startswith("<class '") and rendered.endswith("'>"):
+        #     return rendered.removeprefix("<class '").removesuffix("'>").split(".")[-1]
+
+        return rendered.replace("typing.", "").replace("NoneType", "None")
+
+    def _field_descriptions(
+            self, cls: griffe.Class, include_inherited: bool = False
+    ) -> dict[str, str]:
+        descriptions: dict[str, str] = {}
+
+        # TODO: Slop
+        if include_inherited:
+            classes = [*reversed(cls.mro()), cls]
+        else:
+            classes = [cls]
+
+        for mro_cls in classes:
+            docstring = mro_cls.docstring
+            if docstring is None:
+                continue
+
+            sections = docstring.parse("google")
+            for section in sections:
+                if section.kind is not griffe.DocstringSectionKind.attributes:
+                    continue
+                for attribute in section.value:
+                    descriptions[attribute.name] = (attribute.description or "").strip()
+
+        return descriptions
+
+    def _documented_fields(
+            self, cls: griffe.Class, include_inherited: bool = False
+    ) -> list[DocumentedField]:
+        descriptions = self._field_descriptions(cls, include_inherited=include_inherited)
+        members = cls.all_members if include_inherited else cls.members
+
+        documented_fields: list[DocumentedField] = []
+        for field_name, member in members.items():
+            labels = getattr(member, "labels", set())
+            annotation = getattr(member, "annotation", None)
+
+            if "instance-attribute" not in labels:
+                continue
+            if annotation is None:
+                continue
+
+            documented_fields.append(
+                DocumentedField(
+                    name=field_name,
+                    type_name=self._format_type_name(annotation),
+                    description=descriptions.get(field_name) or None,
+                )
+            )
+
+        return documented_fields
+
+    def render_class_table(self, class_path: str, include_inherited: bool = False) -> str:
+        template = self.env.get_template("class_table.md.j2")
+        resolved_class = self._load_griffe_class(class_path)
+        if resolved_class is None:
+            return template.render(fields=[])
+
+        # TODO: Handle multiple cases for:
+        # dataclasses, pydantic models
+
+        return template.render(
+            fields=self._documented_fields(
+                resolved_class, include_inherited=include_inherited
+            )
+        )
+
+    def _description_file_content(self, category: str, name: str) -> str:
+        description_path = self.descriptions_dir / self.name / category / f"{name}.md"
+        if description_path.is_file():
+            return description_path.read_text()
+        return ""
 
     @property
     def collector_template(self) -> str:
@@ -239,8 +387,17 @@ class CustomCollectorDocs:
         results = []
         template = self.env.get_template("asset.md.j2")
         for asset in self.assets:
-            result = template.render(graph_resource=asset)
-            results.append({**asset, "render": result})
+            graph_resource = {**asset}
+            graph_resource["resource_attributes_table"] = self.render_class_table(
+                graph_resource["path"]
+            )
+            if graph_resource.get("node", {}).get("properties"):
+                graph_resource["node_properties_table"] = self.render_class_table(
+                    graph_resource["node"]["properties"], include_inherited=True
+                )
+
+            result = template.render(graph_resource=graph_resource)
+            results.append({**graph_resource, "render": result})
         return results
 
     @property
@@ -337,7 +494,18 @@ class CustomCollectorDocs:
         template = self.env.get_template("node.md.j2")
         index = self._node_index
         for kind, node_data in index.items():
-            render = template.render(name=self.name, node=node_data, node_index=index)
+            node = {**node_data}
+            if node.get("properties"):
+                node["properties_table"] = self.render_class_table(
+                    node["properties"], include_inherited=True
+                )
+
+            render = template.render(
+                name=self.name,
+                node=node,
+                node_index=index,
+                node_description=self._description_file_content("nodes", kind),
+            )
             results.append({"kind": kind, "render": render})
         return results
 
@@ -351,7 +519,11 @@ class CustomCollectorDocs:
         results = []
         template = self.env.get_template("edge.md.j2")
         for kind, edge_data in self._edge_index.items():
-            render = template.render(name=self.name, edge=edge_data)
+            render = template.render(
+                name=self.name,
+                edge=edge_data,
+                edge_description=self._description_file_content("edges", kind),
+            )
             results.append({"kind": kind, "render": render})
         return results
 
