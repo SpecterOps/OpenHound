@@ -138,4 +138,3 @@ class JAMFNode(BaseNode):
 ## Profit!
 
 Your collector is now able to collect raw resources, perform data validation and perform the conversion to OpenGraph.
-Check out the [CLI](../cli.md) page for more details on how to run your custom collector.
