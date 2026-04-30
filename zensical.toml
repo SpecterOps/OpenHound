@@ -1,0 +1,46 @@
+[project]
+site_name = "OpenHound"
+description = "OpenGraph collectors using OpenHound"
+site_url = "https://specterops.github.io/OpenHound"
+extra_css = ["stylesheets/mermaid-custom.css"]
+extra_javascript = ["javascript/custom.mjs", "javascript/mermaid.mjs"]
+repo_url = "https://github.com/specterops/openhound"
+repo_name = "specterops/openhound"
+
+[project.theme.icon]
+repo = "fontawesome/brands/github"
+
+
+[project.theme]
+features = [
+    "navigation.tracking"
+]
+
+[project.plugins.mkdocstrings.handlers.python.options]
+heading_level = 3
+show_root_toc_entry = false
+
+[[project.plugins.mkdocstrings.handlers.python.options.extensions]]
+[project.plugins.mkdocstrings.handlers.python.options.extensions.griffe_fieldz]
+include_inherited = true
+include_private = false
+add_fields_to = "docstring-attributes"
+remove_fields_from_members = false
+strip_annotated = false
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[project.markdown_extensions.admonition]
+
+[project.markdown_extensions.pymdownx.details]
+
+[project.markdown_extensions.pymdownx.emoji]
+emoji_index = "zensical.extensions.emoji.twemoji"
+emoji_generator = "zensical.extensions.emoji.to_svg"
+
+
+[project.markdown_extensions.pymdownx.superfences]
+custom_fences = [
+    { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }
+]
