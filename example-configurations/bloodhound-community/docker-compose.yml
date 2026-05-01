@@ -1,0 +1,162 @@
+x-cli: &cli
+  image: specterops/openhound:latest
+  restart: no
+
+  # These environment variables can also be set inside the ~/.dlt/config.toml file
+  # and act as an example. Configuring openhound can be done using environment variables,
+  # configuration files or a combination of both.
+  environment: &env
+    LOG_LEVEL: INFO
+    EXTRACT__WORKERS: 8
+    LOG_CONTAINER: true
+
+x-jamf: &jamf
+  <<: *cli
+  volumes:
+    - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+    - ./output/jamf:/tmp/output
+  secrets:
+    - source: secrets_jamf
+      target: /app/.dlt/secrets.toml
+
+x-github: &github
+  <<: *cli
+  volumes:
+    - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+    - ./output/github:/tmp/output
+  secrets:
+    - source: secrets_github
+      target: /app/.dlt/secrets.toml
+    - source: key_github
+      target: /app/.dlt/github.pem
+
+x-okta: &okta
+  <<: *cli
+  volumes:
+    - ${HOME}/.dlt/config.toml:/app/.dlt/config.toml:ro
+    - ./output/okta:/tmp/output
+  secrets:
+    - source: secrets_okta
+      target: /app/.dlt/secrets.toml
+    - source: key_okta
+      target: /app/.dlt/okta.json
+
+services:
+  # --- Jamf ---
+  collect-jamf:
+    <<: *jamf
+    command:
+      - collect
+      - jamf
+      - /tmp/output/raw
+      - --progress=log
+
+  preprocess-jamf:
+    <<: *jamf
+    command:
+      - preprocess
+      - jamf
+      - /tmp/output/raw/jamf
+      - /tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      collect-jamf:
+        condition: service_completed_successfully
+
+  convert-jamf:
+    <<: *jamf
+    command:
+      - convert
+      - jamf
+      - /tmp/output/raw/jamf
+      - /tmp/output/graph
+      - --lookup-file=/tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      preprocess-jamf:
+        condition: service_completed_successfully
+
+  # --- GitHub ---
+  collect-github:
+    <<: *github
+    command:
+      - collect
+      - github
+      - /tmp/output/raw
+      - --progress=log
+
+  preprocess-github:
+    <<: *github
+    command:
+      - preprocess
+      - github
+      - /tmp/output/raw/github
+      - /tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      collect-github:
+        condition: service_completed_successfully
+
+  convert-github:
+    <<: *github
+    command:
+      - convert
+      - github
+      - /tmp/output/raw/github
+      - /tmp/output/graph
+      - --lookup-file=/tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      preprocess-github:
+        condition: service_completed_successfully
+
+  # --- Okta ---
+  collect-okta:
+    <<: *okta
+    command:
+      - collect
+      - okta
+      - /tmp/output/raw
+      - --progress=log
+
+  preprocess-okta:
+    <<: *okta
+    command:
+      - preprocess
+      - okta
+      - /tmp/output/raw/okta
+      - /tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      collect-okta:
+        condition: service_completed_successfully
+
+  convert-okta:
+    <<: *okta
+    command:
+      - convert
+      - okta
+      - /tmp/output/raw/okta
+      - /tmp/output/graph
+      - --lookup-file=/tmp/output/lookup.duckdb
+      - --progress=log
+    depends_on:
+      preprocess-okta:
+        condition: service_completed_successfully
+
+secrets:
+  # Jamf: username + password auth
+  secrets_jamf:
+    file: ${HOME}/.dlt/secrets_jamf.toml
+
+  # GitHub: GitHub App auth (app_id, client_id, org_name) + private key PEM (github.pem)
+  secrets_github:
+    file: ${HOME}/.dlt/secrets_github.toml
+  key_github:
+    file: ${HOME}/.dlt/github.pem
+
+  # Okta: OAuth client credentials (base_url, client_id) + private key JSON (okta.json)
+  secrets_okta:
+    file: ${HOME}/.dlt/secrets_okta.toml
+  key_okta:
+    file: ${HOME}/.dlt/okta.json
