@@ -41,6 +41,19 @@ def test_convert_uses_default_lookup_file(monkeypatch, tmp_path):
     assert captured["lookup_session"] == "lookup-session"
 
 
+def test_convert_stores_lookup_factory():
+    app = OpenHound("test", "test")
+
+    def lookup(client):
+        return client
+
+    @app.convert(lookup=lookup)
+    def convert(ctx):
+        return object(), {}
+
+    assert app.lookup_factory is lookup
+
+
 def test_convert_accepts_custom_lookup_file(monkeypatch, tmp_path):
     captured: dict[str, object] = {}
     custom_lookup = tmp_path / "custom.duckdb"
