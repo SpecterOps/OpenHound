@@ -62,10 +62,18 @@ def _(Path):
 @app.cell
 def _(DEFAULT_PIPELINE_PATH, list_local_pipelines, mo):
     dlt_pipeline_dir, all_dlt_pipelines = list_local_pipelines(DEFAULT_PIPELINE_PATH)
+    collect_pipelines = [
+        pipeline["name"]
+        for pipeline in all_dlt_pipelines
+        if pipeline["name"].endswith("collect")
+    ]
+    mo.stop(not collect_pipelines, "No collect pipelines found")
     selected_pipeline = mo.ui.dropdown(
-        options=[pipeline["name"] for pipeline in all_dlt_pipelines if pipeline["name"].endswith("collect")],
+        options=collect_pipelines,
+        value=collect_pipelines[0],
         label="Collect pipeline",
         full_width=True,
+        allow_select_none=False,
     )
     selected_pipeline
     return (selected_pipeline,)
@@ -245,10 +253,10 @@ def _(dlt_dataset, dlt_pipeline, os, pl, selected_table):
 
 
 @app.cell
-def _(Path, last_fs_destination, pl, selected_schema, selected_table):
+def _(Path, dlt_pipeline, last_fs_destination, pl, selected_table):
     dataset_path = (
         Path(last_fs_destination.replace("file://", ""))
-        / selected_schema.value
+        / dlt_pipeline.dataset_name
         / selected_table.value
     )
     table_df = pl.read_ndjson(dataset_path)
@@ -274,17 +282,21 @@ def _(CollectorManager):
 
 
 @app.cell
-def _(collector_options, mo, selected_schema):
+def _(collector_options, dlt_pipeline, mo, selected_schema):
     matched_extension_name = None
-    if not selected_schema.value:
-        matched_extension_stat = mo.callout("Select a schema", kind="info")
-    elif selected_schema.value not in collector_options:
+    extension_name = (
+        selected_schema.value
+        if selected_schema.value in collector_options
+        else dlt_pipeline.dataset_name
+    )
+
+    if extension_name not in collector_options:
         matched_extension_stat = mo.callout(
-            f"No loaded extension matches schema `{selected_schema.value}`.",
+            f"No loaded extension matches schema `{selected_schema.value}` or dataset `{dlt_pipeline.dataset_name}`.",
             kind="warn",
         )
     else:
-        matched_extension_name = selected_schema.value
+        matched_extension_name = extension_name
         matched_extension_stat = mo.stat(
             value=matched_extension_name,
             label="Matched extension",
@@ -351,12 +363,14 @@ def _(selected_extension):
 def _(DEFAULT_LOOKUP_FILE, duckdb, mo, selected_extension):
     lookup_session = None
     if selected_extension.lookup_factory:
-        mo.stop(
-            not DEFAULT_LOOKUP_FILE.exists(),
-            f"Run preproc before previewing graph output. Missing lookup file: {DEFAULT_LOOKUP_FILE}",
-        )
-        lookup_client = duckdb.connect(str(DEFAULT_LOOKUP_FILE), read_only=True)
-        lookup_session = selected_extension.lookup_factory(lookup_client)
+        if DEFAULT_LOOKUP_FILE.exists():
+            lookup_client = duckdb.connect(str(DEFAULT_LOOKUP_FILE), read_only=True)
+            lookup_session = selected_extension.lookup_factory(lookup_client)
+        else:
+            mo.callout(
+                f"Lookup file `{DEFAULT_LOOKUP_FILE}` was not found. Node preview will still run, but lookup-backed properties may fail.",
+                kind="warn",
+            )
     return (lookup_session,)
 
 
@@ -401,7 +415,7 @@ def _(
 
         node_dict = node_to_dict(node)
         properties = node_dict.pop("properties", {}) or {}
-        return {**node_dict, **properties}
+        return {**node_dict, **{f"prop_{key}": value for key, value in properties.items()}}
 
     node_preview_rows = [
         preview_row
@@ -415,12 +429,6 @@ def _(
     as_node_df = pl.DataFrame(node_preview_rows)
     as_node_df
     return
-
-
-@app.cell
-def _():
-    return
-
 
 if __name__ == "__main__":
     app.run()
