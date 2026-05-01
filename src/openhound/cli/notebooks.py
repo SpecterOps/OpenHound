@@ -47,7 +47,7 @@ def start(
 
     except ImportError:
         console.print(
-            "[red]Error:[/red] Marimo is not installed. Install OpenHound with Marimo extras using openhound\\[notebook] [red]"
+            "[red]Error:[/red] Marimo is not installed. Install OpenHound with Marimo extras using openhound\\[notebooks] [red]"
         )
         raise typer.Exit(1)
 
