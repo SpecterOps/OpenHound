@@ -42,7 +42,6 @@ notebooks = [
     "altair>=6.0.0",
     "polars>=1.40.1",
     "pyarrow>=24.0.0",
-    "fastapi>=0.129.0",
 ]
 
 [project.scripts]
