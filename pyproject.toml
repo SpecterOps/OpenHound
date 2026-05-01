@@ -38,7 +38,7 @@ okta = [
 ]
 
 notebooks = [
-    "marimo>=0.23.4",
+    "marimo~=0.23.4",
     "altair>=6.0.0",
     "polars>=1.40.1",
     "pyarrow>=24.0.0",
