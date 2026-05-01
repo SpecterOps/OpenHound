@@ -72,7 +72,7 @@ local_scheme = "no-local-version"
 
 [dependency-groups]
 dev = [
-    "openhound-faker==0.0.4",
+    "openhound-faker==0.0.6",
     "pre-commit>=4.5.1",
     "pytest>=9.0.1",
     "fastapi>=0.129.0",
