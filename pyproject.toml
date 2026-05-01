@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "alive-progress>=3.3.0",
-    "dlt==1.22.2",
+    "dlt==1.26.0",
     "duckdb==1.5.0",
     "griffe>=1.15.0",
     "griffe-fieldz>=0.5.0",
@@ -35,6 +35,14 @@ github = [
 
 okta = [
     "openhound-okta==0.1.1",
+]
+
+notebooks = [
+    "marimo>=0.23.4",
+    "altair>=6.0.0",
+    "polars>=1.40.1",
+    "pyarrow>=24.0.0",
+    "fastapi>=0.129.0",
 ]
 
 [project.scripts]
@@ -66,11 +74,8 @@ local_scheme = "no-local-version"
 [dependency-groups]
 dev = [
     "openhound-faker==0.0.4",
-    "ipython>=9.12.0",
     "pre-commit>=4.5.1",
     "pytest>=9.0.1",
-    "marimo>=0.23.0",
-    "altair>=6.0.0",
     "fastapi>=0.129.0",
     "zensical>=0.0.23",
     "ruff>=0.15.4",
