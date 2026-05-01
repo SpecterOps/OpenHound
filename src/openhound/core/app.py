@@ -62,6 +62,7 @@ class OpenHound:
         self.collector: Callable | None = None
         self.converter: Callable | None = None
         self.preprocessor: Callable | None = None
+        self.lookup_factory: Callable | None = None
 
         # Store DLT resources/transformers for this source to be used when building the DLT pipeline
         self.dlt_source: DltSource | None = None
@@ -146,6 +147,8 @@ class OpenHound:
             help (str, optional): Typer CLI help text.
             progress (Literal["tqdm", "log", "alive_progress"], optional): Progress backend. Log is preferred for producteion use and alive_progress for interactive use.
         """
+
+        self.lookup_factory = lookup
 
         def decorator(func: Callable):
             def run_convert(
