@@ -12,7 +12,7 @@ def _():
     from dlt._workspace.helpers.dashboard.utils.visualization import (
         load_package_status_labels,
     )
-    from dataclasses import dataclass
+    from dataclasses import asdict, dataclass, is_dataclass
     from datetime import datetime
     from openhound.core.app import DEFAULT_LOOKUP_FILE
     from openhound.core.manager import CollectorManager
@@ -27,10 +27,12 @@ def _():
         DEFAULT_LOOKUP_FILE,
         Path,
         alt,
+        asdict,
         dataclass,
         datetime,
         duckdb,
         get_pipeline,
+        is_dataclass,
         list_local_pipelines,
         load_package_status_labels,
         mo,
@@ -44,8 +46,9 @@ def _(mo):
     mo.md(r"""
     # OpenHound Pipeline Dashboard
 
-    Inspect OpenHound collection performance and preview their OpenGraph node representation.
-    Select a completed `*_collect` pipelin and choose a schema and table to inspect. The matching OpenHound extension is selected automatically based on the schema name. For extensions that use lookup data during conversion, run `preprocess` first so `lookup.duckdb` is available.
+    Inspect recent OpenHound collection runs and preview the OpenGraph representation of collected resources.
+
+    Select a completed `*_collect` pipeline and choose a schema + resource table to inspect. The matching OpenHound extension is selected automatically from the schema name. For extensions that use lookup data during conversion, run `preprocess` first so `lookup.duckdb` is available.
     """)
     return
 
@@ -61,7 +64,8 @@ def _(DEFAULT_PIPELINE_PATH, list_local_pipelines, mo):
     dlt_pipeline_dir, all_dlt_pipelines = list_local_pipelines(DEFAULT_PIPELINE_PATH)
     selected_pipeline = mo.ui.dropdown(
         options=[pipeline["name"] for pipeline in all_dlt_pipelines if pipeline["name"].endswith("collect")],
-        label="Choose pipeline",
+        label="Collect pipeline",
+        full_width=True,
     )
     selected_pipeline
     return (selected_pipeline,)
@@ -120,10 +124,11 @@ def _(alt, mo, traces_df):
         alt.Chart(traces_df)
         .mark_bar()
         .encode(
-            x="duration_ms",
-            y="pipeline",
-            color="name",
-        ).properties(height=30, width="container")
+            x=alt.X("duration_ms", title="Duration (ms)"),
+            y=alt.Y("pipeline", title=None),
+            color=alt.Color("name", title="Step"),
+            tooltip=["name", "duration_ms", "started_at", "finished_at"],
+        ).properties(height=40, width="container")
     )
     return (pipeline_duration_chart,)
 
@@ -136,7 +141,7 @@ def _(
     pipeline_success,
     selected_pipeline,
 ):
-    trace_title = mo.md(f"## Pipeline stats: {selected_pipeline.value}")
+    trace_title = mo.md(f"## Pipeline Overview: `{selected_pipeline.value}`")
     pipeline_destination = mo.stat(
         value=dlt_pipeline.destination.destination_type, label="Destination"
     )
@@ -157,8 +162,13 @@ def _(
 @app.cell
 def _(dlt_pipeline, mo):
     # Available schemas
+    mo.stop(not dlt_pipeline.schema_names, "Selected pipeline has no schemas")
     selected_schema = mo.ui.dropdown(
-        options=dlt_pipeline.schema_names, label="Choose schema"
+        options=dlt_pipeline.schema_names,
+        value=dlt_pipeline.schema_names[0],
+        label="Dataset schema",
+        full_width=True,
+        allow_select_none=False,
     )
     return (selected_schema,)
 
@@ -172,7 +182,14 @@ def _(dlt_pipeline, mo, selected_schema):
     dataset_tables = [
         table for table in dlt_dataset.tables if not table.startswith("_dlt")
     ]
-    selected_table = mo.ui.dropdown(options=dataset_tables, label="Choose a table")
+    mo.stop(not dataset_tables, f"Schema '{selected_schema.value}' has no resource tables")
+    selected_table = mo.ui.dropdown(
+        options=dataset_tables,
+        value=dataset_tables[0],
+        label="Resource table",
+        full_width=True,
+        allow_select_none=False,
+    )
     return dlt_dataset, selected_table
 
 
@@ -186,8 +203,23 @@ def _(mo):
 
 
 @app.cell
-def _(mo, selected_schema, selected_table):
-    data_filters = mo.hstack([selected_schema, selected_table])
+def _(matched_extension_stat, mo, selected_schema, selected_table):
+    context_message = (
+        f"Inspecting `{selected_schema.value}.{selected_table.value}` with extension `{selected_schema.value}`."
+        if selected_schema.value and selected_table.value
+        else "Select a schema and table to inspect collected resources."
+    )
+    data_filters = mo.vstack(
+        [
+            mo.hstack(
+                [selected_schema, selected_table, matched_extension_stat],
+                gap=1,
+                widths="equal",
+            ),
+            mo.md(context_message),
+        ],
+        gap=1,
+    )
     data_filters
     return
 
@@ -202,8 +234,7 @@ def _(mo):
 
 
 @app.cell
-def _(dlt_dataset, dlt_pipeline, mo, os, pl, selected_table):
-    mo.stop(not selected_table.value, "Select a table top continue")
+def _(dlt_dataset, dlt_pipeline, os, pl, selected_table):
     last_load_info = dlt_pipeline.last_trace.last_load_info.asdict()
     last_fs_destination = last_load_info["destination_displayable_credentials"]
     os.environ["BUCKET_URL"] = last_fs_destination
@@ -244,16 +275,22 @@ def _(CollectorManager):
 
 @app.cell
 def _(collector_options, mo, selected_schema):
-    mo.stop(not selected_schema.value, "Select a schema")
-    mo.stop(
-        selected_schema.value not in collector_options,
-        f"No loaded extension matches schema '{selected_schema.value}'",
-    )
-
-    selected_model = mo.ui.dropdown(
-        collector_options.keys(), value=selected_schema.value, label="Extension"
-    )
-    return (selected_model,)
+    matched_extension_name = None
+    if not selected_schema.value:
+        matched_extension_stat = mo.callout("Select a schema", kind="info")
+    elif selected_schema.value not in collector_options:
+        matched_extension_stat = mo.callout(
+            f"No loaded extension matches schema `{selected_schema.value}`.",
+            kind="warn",
+        )
+    else:
+        matched_extension_name = selected_schema.value
+        matched_extension_stat = mo.stat(
+            value=matched_extension_name,
+            label="Matched extension",
+            caption="Matched from dataset schema",
+        )
+    return matched_extension_name, matched_extension_stat
 
 
 @app.cell
@@ -270,8 +307,8 @@ def _(mo, table_df):
 
 
 @app.cell
-def _(mo, sample_count, selected_model):
-    mo.hstack([selected_model, sample_count])
+def _(mo, sample_count):
+    mo.hstack([sample_count], widths="equal")
     return
 
 
@@ -293,9 +330,9 @@ def _(mo, sample_count, table_df):
 
 
 @app.cell
-def _(collector_options, mo, selected_model):
-    mo.stop(not selected_model.value, "Select an extension")
-    selected_extension = collector_options[selected_model.value]
+def _(collector_options, matched_extension_name, mo):
+    mo.stop(not matched_extension_name, "No loaded extension matches the selected schema")
+    selected_extension = collector_options[matched_extension_name]
     return (selected_extension,)
 
 
@@ -332,25 +369,56 @@ def _(mo):
 
 
 @app.cell
-def _(lookup_session, mo, pl, sample_df, selected_table, table_to_asset):
+def _(
+    asdict,
+    is_dataclass,
+    lookup_session,
+    mo,
+    pl,
+    sample_df,
+    selected_table,
+    table_to_asset,
+):
     mo.stop(
         selected_table.value not in table_to_asset,
         f"Selected table '{selected_table.value}' is not mapped to an OpenHound asset",
     )
 
-    def as_node(row, model):
+    def node_to_dict(node):
+        if hasattr(node, "model_dump"):
+            return node.model_dump(mode="json")
+        if is_dataclass(node):
+            return asdict(node)
+        return dict(node)
+
+    def as_node_preview(row, model):
         parsed_model = model.model_validate(row)
         parsed_model._lookup = lookup_session
         parsed_model._extras = {}
-        return parsed_model.as_node
+        node = parsed_model.as_node
+        if node is None:
+            return None
 
-    as_node_df = pl.DataFrame(
-        [
-            as_node(row, table_to_asset[selected_table.value])
+        node_dict = node_to_dict(node)
+        properties = node_dict.pop("properties", {}) or {}
+        return {**node_dict, **properties}
+
+    node_preview_rows = [
+        preview_row
+        for preview_row in [
+            as_node_preview(row, table_to_asset[selected_table.value])
             for row in sample_df.iter_rows(named=True)
         ]
-    )
+        if preview_row is not None
+    ]
+
+    as_node_df = pl.DataFrame(node_preview_rows)
     as_node_df
+    return
+
+
+@app.cell
+def _():
     return
 
 
