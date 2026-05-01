@@ -59,3 +59,7 @@ jobs:
       - name: Run BHE job scheduling test
         run: |
           .venv/bin/pytest tests/test_bhe_job_scheduling.py -v
+
+      - name: Run notebook execution test
+        run: |
+          .venv/bin/pytest tests/test_notebooks.py -v
