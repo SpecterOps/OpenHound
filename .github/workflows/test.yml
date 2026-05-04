@@ -59,3 +59,11 @@ jobs:
       - name: Run BHE job scheduling test
         run: |
           .venv/bin/pytest tests/test_bhe_job_scheduling.py -v
+
+      - name: Run preprocess lookup generation tests
+        run: |
+          .venv/bin/pytest tests/test_preproc.py -v
+
+      - name: Run DuckDB lookup exception handling tests
+        run: |
+          .venv/bin/pytest tests/test_lookup.py -v
