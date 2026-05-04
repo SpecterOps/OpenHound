@@ -1,4 +1,9 @@
+import logging
+
+import duckdb
 from duckdb import DuckDBPyConnection
+
+logger = logging.getLogger(__name__)
 
 
 class LookupManager:
@@ -18,9 +23,18 @@ class LookupManager:
         Returns:
             list: Query result rows as a list of tuples.
         """
-        self.client.execute(*args)
-        results = self.client.fetchall()
-        return results
+        try:
+            self.client.execute(*args)
+            results = self.client.fetchall()
+            return results
+
+        except duckdb.CatalogException as err:
+            logger.error("DuckDB lookup failed, missing table: %s", err)
+            return []
+
+        except duckdb.Error as err:
+            logger.error("DuckDB lookup query failed: %s", err)
+            return []
 
     def _find_single_object(self, *args) -> str | None:
         """Execute a query and return the ID of the matching row
@@ -28,6 +42,15 @@ class LookupManager:
         Returns:
             str | None: The first column (ie. ID) value as a string or None if no result is found
         """
-        self.client.execute(*args)
-        result = self.client.fetchone()
-        return str(result[0]) if result else None
+        try:
+            self.client.execute(*args)
+            result = self.client.fetchone()
+            return str(result[0]) if result else None
+
+        except duckdb.CatalogException as err:
+            logger.error("DuckDB lookup failed, missing table: %s", err)
+            return None
+
+        except duckdb.Error as err:
+            logger.error("DuckDB lookup query failed: %s", err)
+            return None
