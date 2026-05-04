@@ -3,7 +3,7 @@
    1. Copy `.dlt-example` to `${HOME}/.dlt`and `docker-compose.yml` to `${HOME}`.
    2. Fill in your credentials in the toml files.
    3. Place any required key files (github.pem, okta.json) in `${HOME}/.dlt`.
-   4. Pull image from SpecterOps Docker Hub:  `docker pull specterops/openhound:0.1.1-enterprise`
+   4. Pull image from SpecterOps Docker Hub:  `docker pull specterops/openhound:latest-enterprise`
       or run to pull from docker-compose.yml: `docker compose pull`
    5. Run all collectors:    `docker compose up -d`
       or run a single one:   `docker compose up -d scheduler-jamf`
