@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from rich import Console
 
 from openhound.core.models.saved_search import QueryBundle
 from openhound.core.progress import Progress
@@ -69,7 +70,8 @@ def bundle(
                 help="Directory where saved searches are located",
             ),
         ],
-        output_path: Annotated[typer.FileTextWrite, typer.Argument()],
+        output_path: Annotated[typer.FileTextWrite, typer.Argument(
+            help="Output file path for the generated saved-search bundle (including filename)")],
         file_format: Format = typer.Option(
             default=Format.json,
             help="File format of the saved searches (json or yaml)",
@@ -79,11 +81,18 @@ def bundle(
             help="File format for the saved searches bundle (json or zip)",
         )
 ):
-    search_files = (
+    search_files = list(
         path.rglob("**/*.json")
         if file_format == Format.json
         else path.rglob("**/*.yaml")
     )
 
-    bundle_object = QueryBundle.from_paths(list(search_files), file_format=file_format)
+    bundle_object = QueryBundle.from_paths(search_files, file_format=file_format)
     bundle_object.save(output_path, output_format=output_format)
+
+    console = Console()
+    console.print("[bold green]Saved-search bundle created[/bold green]")
+    console.print(f"[bold magenta]Saved searches:[/bold magenta] {len(bundle_object.queries)}")
+    console.print(
+        f"[bold magenta]Output path:[/bold magenta] [italic]{Path(output_path.name).resolve()}[/italic]"
+    )
