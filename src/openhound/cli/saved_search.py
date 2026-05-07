@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich import Console
+from rich.console import Console
 
 from openhound.core.models.saved_search import QueryBundle
 from openhound.core.progress import Progress
