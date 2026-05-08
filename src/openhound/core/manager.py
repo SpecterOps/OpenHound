@@ -137,7 +137,11 @@ class CollectorManager:
             return False, None
 
     @classmethod
-    def from_entrypoint(cls, group: str = "openhound.sources") -> "CollectorManager":
+    def from_entrypoint(
+        cls,
+        group: str = "openhound.sources",
+        load_sources: bool = False,
+    ) -> "CollectorManager":
         discover_extension = entry_points(group=group)
         extensions: list[OpenHound] = []
         for extension in discover_extension:
@@ -149,6 +153,9 @@ class CollectorManager:
                 )
 
             load_extension: OpenHound = extension.load()
+            if load_sources:
+                cls._load_extension_source(extension)
+
             is_valid_extension = cls.validate_extension(load_extension, extension.name)
             if is_valid_extension:
                 load_extension.metadata = metadata
@@ -163,3 +170,17 @@ class CollectorManager:
                     extra={"extension": extension.name, "phase": "extension_loading"},
                 )
         return cls(collectors=extensions)
+
+    @staticmethod
+    def _load_extension_source(extension: EntryPoint) -> None:
+        parent_module_name = extension.module.rsplit(".", 1)[0]
+        source_module_name = f"{parent_module_name}.source"
+        try:
+            import_module(source_module_name)
+        except ModuleNotFoundError as err:
+            if err.name != source_module_name:
+                raise
+            logger.warning(
+                f"Extension '{extension.name}' does not have a source module '{source_module_name}'",
+                extra={"extension": extension.name, "phase": "extension_loading"},
+            )

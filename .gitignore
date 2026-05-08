@@ -5,8 +5,6 @@ site/
 addons/
 collectors/
 
-notebooks
-
 output
 graph
 logs
