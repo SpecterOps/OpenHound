@@ -38,7 +38,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv pip install --python .venv -e ".[all,notebooks]" --group dev
+          uv pip install --python .venv -e ".[all]" --group dev
 
       - name: Run log handling tests
         run: |
@@ -60,6 +60,10 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_bhe_job_scheduling.py -v
 
-      - name: Run notebook execution test
+      - name: Run preprocess lookup generation tests
         run: |
-          .venv/bin/pytest tests/test_notebooks.py -v
+          .venv/bin/pytest tests/test_preproc.py -v
+
+      - name: Run DuckDB lookup exception handling tests
+        run: |
+          .venv/bin/pytest tests/test_lookup.py -v

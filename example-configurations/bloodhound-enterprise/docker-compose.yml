@@ -1,5 +1,5 @@
 x-scheduler: &scheduler
-  image: specterops/openhound:${IMAGE_VERSION:-0.1.0-enterprise}
+  image: specterops/openhound:${IMAGE_VERSION:latest-enterprise}
   restart: unless-stopped
   init: true
   volumes:
@@ -14,6 +14,7 @@ x-scheduler: &scheduler
     LOG_CONTAINER: true
 
 services:
+  # --- Jamf ---
   scheduler-jamf:
     <<: *scheduler
     environment:
@@ -23,6 +24,7 @@ services:
       - source: secrets_jamf
         target: /app/.dlt/secrets.toml
 
+  # --- GitHub ---
   scheduler-github:
     <<: *scheduler
     environment:
@@ -34,6 +36,7 @@ services:
       - source: key_github
         target: /app/.dlt/github.pem
 
+  # --- Okta ---
   scheduler-okta:
     <<: *scheduler
     environment:
@@ -46,12 +49,20 @@ services:
         target: /app/.dlt/okta.json
 
 secrets:
+  # Copy the .dlt-example folder to ${HOME}/.dlt as a starting point for each secrets file.
+  # Each secrets file must also contain [destination.bloodhoundenterprise] with url, token_id, and token_key.
+
+  # Jamf: username + password auth
   secrets_jamf:
     file: ${HOME}/.dlt/secrets_jamf.toml
+
+  # GitHub: GitHub App auth (app_id, client_id, org_name) + private key PEM (github.pem)
   secrets_github:
     file: ${HOME}/.dlt/secrets_github.toml
   key_github:
     file: ${HOME}/.dlt/github.pem
+
+  # Okta: OAuth client credentials (base_url, client_id) + private key JSON (okta.json)
   secrets_okta:
     file: ${HOME}/.dlt/secrets_okta.toml
   key_okta:

@@ -1,0 +1,16 @@
+# Example configuration: https://bloodhound.specterops.io/openhound/configuration
+[runtime]
+http_show_error_body = true
+log_cli_level = "WARNING"
+log_format = "JSON"
+log_rotate_when = "midnight"
+
+[extract]
+workers = 8
+
+[normalize]
+workers = 3
+
+[load]
+delete_completed_jobs = true
+truncate_staging_dataset = true
