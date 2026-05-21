@@ -230,6 +230,13 @@ class CustomLogger:
         return resolved_spec_path
 
     @staticmethod
+    def _close_handlers(logger: logging.Logger) -> None:
+        """Remove and close all handlers attached directly to a logger."""
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
+
+    @staticmethod
     def default_platform_path() -> Path:
         """Get the default log path based on platform
 
@@ -260,7 +267,7 @@ class CustomLogger:
         log_file_path = self.base_path / f"ext_{name}.log"
         valid_path = self._is_valid_path(self.base_path, log_file_path)
         self.dlt_logger.setLevel(self.root_logger.level)
-        self.dlt_logger.handlers.clear()
+        self._close_handlers(self.dlt_logger)
         self.handlers[self.runtime_mode](self.dlt_logger, valid_path)
         self.dlt_logger.propagate = False
 
@@ -293,14 +300,14 @@ class CustomLogger:
         self.backup_count = dlt_backup_count if dlt_backup_count else self.backup_count
         self.interval = dlt_interval if dlt_interval else self.interval
 
-        # Clear the default DLT log handlers and set our own handlers based on the runtime mode
-        self.dlt_logger.handlers.clear()
-        self.handlers[self.runtime_mode](self.dlt_logger, self.log_file_path)
-        self.dlt_logger.propagate = False
+        # The root logger owns the default OpenHound file handler. DLT logs propagate
+        # there until set_handler routes them to an extension-specific log file.
+        self._close_handlers(self.dlt_logger)
+        self.dlt_logger.setLevel(getattr(logging, self.level))
+        self.dlt_logger.propagate = True
 
-        # Set the root logger level and handlers based on the runtime mode
         self.root_logger.setLevel(getattr(logging, self.level))
-        self.root_logger.handlers.clear()
+        self._close_handlers(self.root_logger)
         self.handlers[self.runtime_mode](self.root_logger, self.log_file_path)
 
     def container_handlers(self, logger: logging.Logger, file_path: Path) -> None:

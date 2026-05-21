@@ -4,6 +4,14 @@ import logging
 from openhound.core.logging import RotatingFileHandler, logger_override
 
 
+def _rotating_handlers(logger: logging.Logger) -> list[RotatingFileHandler]:
+    return [
+        handler
+        for handler in logger.handlers
+        if isinstance(handler, RotatingFileHandler)
+    ]
+
+
 def test_root_handler_setup():
     """Test that the root logger has a handler configured and that it is a RotatingFileHandler"""
     root_logger = logging.getLogger()
@@ -11,31 +19,35 @@ def test_root_handler_setup():
         "The root logger should have at least one handler configured"
     )
 
-    base_handler = root_logger.handlers[0]
-    assert isinstance(base_handler, RotatingFileHandler), (
+    rotating_handlers = _rotating_handlers(root_logger)
+    assert len(rotating_handlers) == 1, (
         "The root logger should use RotatingFileHandler"
     )
+    base_handler = rotating_handlers[0]
     assert base_handler.baseFilename.endswith("openhound.log"), (
         "The root logger should log to 'openhound.log'"
     )
 
 
-def test_dlt_handler_setup():
-    """Test that the default DLT handler is overwritten by our RotatingFileHandler"""
+def test_dlt_handler_setup(tmp_path):
+    """Test that default DLT logs propagate to the root OpenHound handler."""
+    logger_override.base_path = tmp_path
+    logger_override.setup()
+
     dlt_logger = logging.getLogger("dlt")
-    assert len(dlt_logger.handlers) > 0, (
-        "The default DLT logger should have at least one handler configured"
+    assert len(dlt_logger.handlers) == 0, (
+        "The default DLT logger should not own a separate file handler"
     )
-    assert dlt_logger.propagate is False, (
-        "The DLT logger should have propagation disabled to prevent duplicate logs in the root logger"
+    assert dlt_logger.propagate is True, (
+        "The DLT logger should propagate to the root OpenHound handler"
     )
 
-    base_handler = dlt_logger.handlers[0]
-    assert isinstance(base_handler, RotatingFileHandler), (
-        "The default DLT logger should use RotatingFileHandler"
+    root_handlers = _rotating_handlers(logging.getLogger())
+    assert len(root_handlers) == 1, (
+        "Only the root logger should own the default OpenHound file handler"
     )
-    assert base_handler.baseFilename.endswith("openhound.log"), (
-        "The default DLT logger should log to 'openhound.log'"
+    assert root_handlers[0].baseFilename.endswith("openhound.log"), (
+        "Default DLT logs should flow to 'openhound.log'"
     )
 
 
