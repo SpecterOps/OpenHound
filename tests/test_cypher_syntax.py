@@ -3,16 +3,17 @@ import os
 import sys
 
 import pytest
-import yaml
 from antlr4 import CommonTokenStream, InputStream
 from antlr4.error.ErrorListener import ErrorListener
+from openhound.core.models.saved_search import SavedSearch
 from pydantic import ValidationError
-from schema import CypherQuery
 
-from grammar.CypherLexer import CypherLexer
-from grammar.CypherParser import CypherParser
+from .grammar.CypherLexer import CypherLexer
+from .grammar.CypherParser import CypherParser
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+EXPECTED_CYPHER_FAILURES = {"jamf_query_by_name_error.json"}
 
 
 class CypherErrorListener(ErrorListener):
@@ -25,20 +26,24 @@ class CypherErrorListener(ErrorListener):
         raise ValueError(f"Syntax error at line: {line}, msg: {msg}")
 
 
-def get_query_files(cypher_dir: str = "queries") -> list:
+def get_query_files(cypher_dir: str = "tests/test_data/extensions/saved_searches/") -> list:
     if not os.path.exists(cypher_dir):
         return []
-    return glob.glob(os.path.join("queries", "**", "*.yml"), recursive=True)
+    return [
+        pytest.param(
+            file_path,
+            os.path.basename(file_path) in EXPECTED_CYPHER_FAILURES,
+            id=os.path.basename(file_path),
+        )
+        for file_path in sorted(glob.glob(os.path.join(cypher_dir, "*.json"), recursive=True))
+    ]
 
 
-@pytest.mark.parametrize("file_path", get_query_files("queries"))
-def test_cypher_validation(file_path: str, request: pytest.FixtureRequest) -> None:
-    with open(file_path, "r") as f:
-        yaml_object = yaml.safe_load(f)
-
+@pytest.mark.parametrize("file_path,should_fail", get_query_files())
+def test_cypher_validation(file_path: str, should_fail: bool, request: pytest.FixtureRequest) -> None:
     try:
         # Load the query using the Pydantic schema
-        validate_schema = CypherQuery(**yaml_object)
+        validate_schema = SavedSearch.from_file(file_path)
     except ValidationError as e:
         pytest.fail(f"Pydantic validation failed for {file_path}: {str(e)}", pytrace=False)
 
@@ -56,29 +61,15 @@ def test_cypher_validation(file_path: str, request: pytest.FixtureRequest) -> No
     parser = CypherParser(stream)
     parser.addErrorListener(CypherErrorListener())
 
+    if should_fail:
+        with pytest.raises(ValueError):
+            parser.oC_Cypher()
+        return
+
     # Attempt to parse the query or raise a generic exception
     try:
-        parse_query = parser.oC_Query()
+        parse_query = parser.oC_Cypher()
         assert parse_query.exception is None
 
     except Exception as e:
         pytest.fail(f"Parsing failed for file {file_path}: {str(e)}", pytrace=False)
-
-
-def test_duplicate_guid() -> None:
-    query_files = get_query_files("queries")
-    guids = set()
-
-    # Iterate over all query files and check for duplicate GUIDs
-    for file_path in query_files:
-        with open(file_path, "r") as f:
-            yaml_object = yaml.safe_load(f)
-
-        query_guid = yaml_object["guid"]
-        if query_guid in guids:
-            pytest.fail(f"Duplicate GUID found: {query_guid} in file {file_path}", pytrace=False)
-        guids.add(query_guid)
-
-
-if __name__ == "__main__":
-    pytest.main(["-v", __file__])

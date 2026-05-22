@@ -1,0 +1,5 @@
+{
+  "name": "Jamf v2: Account Access by Name but with incorrect Cypher",
+  "description": "This is an identical query but duplicated for CICD tests",
+  "query": "MATCH p==(s:jamf_Account)-[*1..5]->(t)\nWHERE s.name STARTS WITH 'LC'\nRETURN p\nLIMIT 1000"
+}

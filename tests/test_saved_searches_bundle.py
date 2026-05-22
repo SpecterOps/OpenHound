@@ -2,9 +2,8 @@ import json
 import zipfile
 from pathlib import Path
 
-from typer.testing import CliRunner
-
 from openhound.main import app
+from typer.testing import CliRunner
 
 TEST_DATA_DIR = Path(__file__).parent / "test_data" / "extensions" / "saved_searches"
 
@@ -31,7 +30,7 @@ def test_saved_search_bundle_writes_json(tmp_path):
     assert output_path.suffix == ".json"
 
     saved_searches = json.loads(output_path.read_text())
-    assert len(saved_searches) == 2
+    assert len(saved_searches) == 3
 
 
 def test_saved_search_bundle_writes_zip(tmp_path):
@@ -57,10 +56,10 @@ def test_saved_search_bundle_writes_zip(tmp_path):
 
     with zipfile.ZipFile(output_path) as archive:
         archive_names = archive.namelist()
-        assert len(archive_names) == 2
+        assert len(archive_names) == 3
         assert all(name.endswith(".json") for name in archive_names)
         saved_searches = [
             json.loads(archive.read(name).decode()) for name in archive_names
         ]
 
-    assert len(saved_searches) == 2
+    assert len(saved_searches) == 3
