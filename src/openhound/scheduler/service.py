@@ -122,8 +122,8 @@ class Service:
             The first pending support-bundle operation, or None if there are none.
 
         # TODO(BED-8266): Validate the response field names once
-        # GET /api/v2/clients/management is fully implemented in BHE.
-        # Endpoint path and enum values confirmed via BHADR-6 ADR (BED-8268).
+        # GET /api/v2/clients/management/available is fully implemented in BHE.
+        # Endpoint path confirmed by BED-8266 ticket spec; enum values confirmed via BED-8268.
         """
         logger.info("Checking for management operations in BloodHound Enterprise.")
         management = self.client.management_available

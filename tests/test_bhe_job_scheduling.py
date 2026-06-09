@@ -83,10 +83,10 @@ def mock_bloodhound_api():
         app.state.ingested_edges += len(validate_graph.graph.edges)
         return {"status": "success"}
 
-    # Endpoint path confirmed via BHADR-6 ADR (BED-8268).
-    # TODO(BED-8266): Confirm response field names once GET /api/v2/clients/management
+    # Path confirmed by BED-8266 ticket spec.
+    # TODO(BED-8266): Confirm response field names once GET /api/v2/clients/management/available
     # is fully implemented in BHE.
-    @app.get("/api/v2/clients/management")
+    @app.get("/api/v2/clients/management/available")
     async def management_available():
         return {"data": app.state.management_operations}
 

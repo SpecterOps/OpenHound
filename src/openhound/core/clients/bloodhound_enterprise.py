@@ -57,10 +57,10 @@ class BloodHoundEnterprise(BloodHound):
 
     @property
     def management_available(self) -> ManagementAvailable:
-        # Endpoint confirmed via BHADR-6 ADR (BED-8268).
+        # Path confirmed by BED-8266 ticket spec.
         # TODO(BED-8266): Confirm response field names match the Go handler once
-        # GET /api/v2/clients/management is fully implemented in BHE.
-        path = "/api/v2/clients/management"
+        # GET /api/v2/clients/management/available is fully implemented in BHE.
+        path = "/api/v2/clients/management/available"
         response = self.request(method="GET", path=path)
         return ManagementAvailable.model_validate(response.json())
 
