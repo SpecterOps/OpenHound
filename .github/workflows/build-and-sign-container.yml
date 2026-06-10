@@ -57,7 +57,7 @@ jobs:
         run: |
           TAGS="${{ steps.image-ref.outputs.version_tag }}"
 
-          if [ -n "${{ matrix.latest_tag }}" ]; then
+          if [ -n "${{ matrix.latest_tag }}" ] && [ "${{ github.event.release.prerelease }}" != "true" ]; then
             TAGS="${TAGS}"$'\n'"${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:${{ matrix.latest_tag }}"
           fi
 
