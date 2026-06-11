@@ -88,3 +88,8 @@ class ManagementOperation(BaseModel):
 
 class ManagementAvailable(BaseModel):
     data: list[ManagementOperation]
+
+
+class ManagementOperationResult(BaseModel):
+    """Response wrapper returned by POST /start and POST /end."""
+    data: ManagementOperation

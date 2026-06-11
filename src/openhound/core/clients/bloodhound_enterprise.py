@@ -10,6 +10,8 @@ from openhound.core.clients.models.jobs import (
     JobsEnd,
     JobStart,
     ManagementAvailable,
+    ManagementOperationResult,
+    ManagementOperationStatus,
 )
 
 
@@ -63,6 +65,31 @@ class BloodHoundEnterprise(BloodHound):
         path = "/api/v2/clients/management/available"
         response = self.request(method="GET", path=path)
         return ManagementAvailable.model_validate(response.json())
+
+    def start_operation(self, operation_id: str) -> ManagementOperationResult:
+        """Claim a queued management operation, moving it to running.
+
+        Args:
+            operation_id: The UUID of the management operation to claim.
+        """
+        path = "/api/v2/clients/management/start"
+        body = json.dumps({"id": operation_id})
+        response = self.request(method="POST", path=path, body=body.encode())
+        return ManagementOperationResult.model_validate(response.json())
+
+    def end_operation(
+        self, operation_id: str, status: ManagementOperationStatus
+    ) -> ManagementOperationResult:
+        """Mark a running management operation as succeeded, failed, or canceled.
+
+        Args:
+            operation_id: The UUID of the management operation to complete.
+            status: The final status — typically SUCCEEDED or FAILED.
+        """
+        path = "/api/v2/clients/management/end"
+        body = json.dumps({"id": operation_id, "status": status})
+        response = self.request(method="POST", path=path, body=body.encode())
+        return ManagementOperationResult.model_validate(response.json())
 
     def upload_support_bundle(self, bundle_path: Path) -> None:
         """Upload a support bundle zip file to BHE.

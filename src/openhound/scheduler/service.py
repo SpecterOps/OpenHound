@@ -10,6 +10,7 @@ from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, J
 from openhound.core.clients.models.jobs import (
     Job,
     ManagementOperation,
+    ManagementOperationStatus,
     ManagementOperationType,
 )
 from openhound.core.logging import CustomLogger
@@ -136,7 +137,7 @@ class Service:
         return None
 
     def _send_support_bundle(self, operation: ManagementOperation) -> None:
-        """Collect all log files, zip them, and upload the bundle to BHE.
+        """Claim the operation, collect log files, zip and upload them, then report completion.
 
         Runs synchronously in the poll thread so that no collection jobs are
         started while the upload is in progress (per BED-7975 acceptance criteria).
@@ -148,18 +149,31 @@ class Service:
         logger.info(
             f"Starting support bundle upload for operation {operation.id}."
         )
-        bundle_path = create_support_bundle(self.collector_name, self.log_base_path)
+        self.client.start_operation(operation.id)
+
+        bundle_path = None
         try:
+            bundle_path = create_support_bundle(self.collector_name, self.log_base_path)
             self.client.upload_support_bundle(bundle_path)
+            self.client.end_operation(operation.id, ManagementOperationStatus.SUCCEEDED)
             logger.info(
                 f"Support bundle uploaded successfully for operation {operation.id}."
             )
-            # TODO(BED-8266): Determine whether OH needs to notify BHE that the
-            # management operation is complete (e.g. PATCH status to "succeeded").
-            # If a completion callback is required it should be called here.
+        except Exception:
+            logger.exception(
+                f"Support bundle upload failed for operation {operation.id}."
+            )
+            try:
+                self.client.end_operation(operation.id, ManagementOperationStatus.FAILED)
+            except Exception:
+                logger.exception(
+                    f"Failed to mark operation {operation.id} as failed in BHE."
+                )
+            raise
         finally:
-            bundle_path.unlink(missing_ok=True)
-            logger.debug(f"Cleaned up temporary support bundle at {bundle_path}.")
+            if bundle_path is not None:
+                bundle_path.unlink(missing_ok=True)
+                logger.debug(f"Cleaned up temporary support bundle at {bundle_path}.")
 
     def check_jobs(self) -> Job | None:
         """Checks BloodHound enterprise for available jobs. These can either be new jobs or jobs currently started and not finished/stopped.

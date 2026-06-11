@@ -46,11 +46,13 @@ def mock_bloodhound_api():
     app.state.ingested_edges = 0
     app.state.ingested_nodes = 0
     # Management / support-bundle state
-    # TODO(BED-8266): Update management_operations fixture data once the real
-    # GET /api/v2/clients/management/available response shape is confirmed.
     app.state.management_operations = []  # list of dicts; set per-test to inject ops
     app.state.bundle_uploaded = False
     app.state.bundle_content = b""
+    app.state.operation_started = False
+    app.state.operation_start_payload = None
+    app.state.operation_ended = False
+    app.state.operation_end_payload = None
 
     @app.get("/api/v2/jobs/available")
     async def jobs_available():
@@ -83,20 +85,27 @@ def mock_bloodhound_api():
         app.state.ingested_edges += len(validate_graph.graph.edges)
         return {"status": "success"}
 
-    # Path confirmed by BED-8266 ticket spec.
-    # TODO(BED-8266): Confirm response field names once GET /api/v2/clients/management/available
-    # is fully implemented in BHE.
     @app.get("/api/v2/clients/management/available")
     async def management_available():
         return {"data": app.state.management_operations}
 
-    # TODO(BED-7968): Confirm endpoint path and accepted Content-Types once
-    # POST /api/v2/clients/management/artifacts is merged into BHE main.
+    @app.post("/api/v2/clients/management/start")
+    async def start_operation(body: dict):
+        app.state.operation_started = True
+        app.state.operation_start_payload = body
+        return {"data": {"id": body.get("id"), "type": "support_bundle", "status": "running", "created_at": "2026-01-01T00:00:00Z"}}
+
     @app.post("/api/v2/clients/management/artifacts")
     async def upload_artifact(request: Request):
         app.state.bundle_uploaded = True
         app.state.bundle_content = await request.body()
         return Response(status_code=202)
+
+    @app.post("/api/v2/clients/management/end")
+    async def end_operation(body: dict):
+        app.state.operation_ended = True
+        app.state.operation_end_payload = body
+        return {"data": {"id": body.get("id"), "type": "support_bundle", "status": body.get("status"), "created_at": "2026-01-01T00:00:00Z"}}
 
     return TestClient(app)
 
@@ -442,7 +451,7 @@ def test_create_support_bundle_contains_log_files(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_send_support_bundle_uploads_to_bhe(mock_service, mock_bloodhound_api, tmp_path):
-    """_send_support_bundle() creates a zip and POSTs it to the artifacts endpoint."""
+    """_send_support_bundle() claims the op, uploads a zip, and reports success."""
     _create_log_files(tmp_path)
     mock_service.log_base_path = tmp_path
 
@@ -457,8 +466,11 @@ def test_send_support_bundle_uploads_to_bhe(mock_service, mock_bloodhound_api, t
 
     mock_service._send_support_bundle(op)
 
+    assert mock_bloodhound_api.app.state.operation_started is True
+    assert mock_bloodhound_api.app.state.operation_start_payload == {"id": op.id}
     assert mock_bloodhound_api.app.state.bundle_uploaded is True
-    # Verify BHE received a valid zip
+    assert mock_bloodhound_api.app.state.operation_ended is True
+    assert mock_bloodhound_api.app.state.operation_end_payload == {"id": op.id, "status": "succeeded"}
     with zipfile.ZipFile(
         __import__("io").BytesIO(mock_bloodhound_api.app.state.bundle_content)
     ) as zf:
@@ -496,8 +508,8 @@ def test_send_support_bundle_cleans_up_temp_file(mock_service, mock_bloodhound_a
     assert not captured_bundle_path[0].exists(), "Temp bundle file was not cleaned up"
 
 
-def test_send_support_bundle_cleans_up_on_upload_failure(mock_service, monkeypatch, tmp_path):
-    """_send_support_bundle() deletes the temp zip even when the upload raises."""
+def test_send_support_bundle_cleans_up_on_upload_failure(mock_service, mock_bloodhound_api, monkeypatch, tmp_path):
+    """_send_support_bundle() deletes the temp zip and reports failure when upload raises."""
     _create_log_files(tmp_path)
     mock_service.log_base_path = tmp_path
 
@@ -526,8 +538,6 @@ def test_send_support_bundle_cleans_up_on_upload_failure(mock_service, monkeypat
         created_at=datetime.now(UTC),
     )
 
-    # _send_support_bundle itself re-raises; the outer _poll() catch swallows it.
-    # Here we just verify the cleanup happened.
     try:
         mock_service._send_support_bundle(op)
     except RuntimeError:
@@ -535,3 +545,37 @@ def test_send_support_bundle_cleans_up_on_upload_failure(mock_service, monkeypat
 
     assert len(captured_bundle_path) == 1
     assert not captured_bundle_path[0].exists(), "Temp bundle file was not cleaned up after failure"
+    assert mock_bloodhound_api.app.state.operation_started is True
+    assert mock_bloodhound_api.app.state.operation_ended is True
+    assert mock_bloodhound_api.app.state.operation_end_payload == {"id": op.id, "status": "failed"}
+
+
+def test_send_support_bundle_reports_failed_when_end_also_fails(mock_service, mock_bloodhound_api, monkeypatch, tmp_path):
+    """_send_support_bundle() still cleans up and re-raises even if /end itself fails."""
+    _create_log_files(tmp_path)
+    mock_service.log_base_path = tmp_path
+
+    monkeypatch.setattr(
+        mock_service.client,
+        "upload_support_bundle",
+        lambda path: (_ for _ in ()).throw(RuntimeError("upload failed")),
+    )
+    monkeypatch.setattr(
+        mock_service.client,
+        "end_operation",
+        lambda op_id, status: (_ for _ in ()).throw(RuntimeError("end failed")),
+    )
+
+    from openhound.core.clients.models.jobs import ManagementOperation, ManagementOperationStatus
+    from datetime import datetime, UTC
+    op = ManagementOperation(
+        id="test-op-id",
+        type=ManagementOperationType.SUPPORT_BUNDLE,
+        status=ManagementOperationStatus.QUEUED,
+        created_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(RuntimeError, match="upload failed"):
+        mock_service._send_support_bundle(op)
+
+    assert mock_bloodhound_api.app.state.operation_started is True
