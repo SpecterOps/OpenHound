@@ -3,11 +3,19 @@ import signal
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 
 import openhound.core.logging  # noqa: F401
 from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
-from openhound.core.clients.models.jobs import Job
+from openhound.core.clients.models.jobs import (
+    Job,
+    ManagementOperation,
+    ManagementOperationStatus,
+    ManagementOperationType,
+)
+from openhound.core.logging import CustomLogger
 from openhound.core.manager import CollectorManager
+from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import dataflow
 
 logger = logging.getLogger(__name__)
@@ -57,8 +65,9 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
 class Service:
     """Base scheduler service that checks for available jobs in BloodHound Enterprise.
 
-    Runs on a simple loop every X seconds and checks for available jobs. If a job is available,
-    a subprocess is started for the configured collector to run the DLT/OpenHound pipeline.
+    Runs on a simple loop every X seconds. On each cycle the management endpoint
+    is checked first (per BHADR-6); if a management operation is pending it is
+    executed before any collection job is started.
     """
 
     def __init__(
@@ -68,6 +77,7 @@ class Service:
         token_id: str,
         collector_name: str,
         interval: int = 5,
+        log_base_path: Path | None = None,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
@@ -77,6 +87,10 @@ class Service:
         )
         # Interval how often to check for a job
         self.interval = interval
+
+        # Directory from which log files are collected for support bundles.
+        # Falls back to the platform default if not supplied explicitly.
+        self.log_base_path: Path = log_base_path or CustomLogger.default_platform_path()
 
         # Stores the ID of currently running BHE job
         self.job_running: int | None = None
@@ -98,6 +112,68 @@ class Service:
         logger.info("Collection service stopping.")
         self.executor.shutdown(wait=True, cancel_futures=True)
         logger.info("Collection service stopped.")
+
+    def check_management(self) -> ManagementOperation | None:
+        """Check the BHE management endpoint for pending operations.
+
+        Per BHADR-6 this is always called before checking for collection jobs so
+        that management operations (e.g. support-bundle upload) take priority.
+
+        Returns:
+            The first pending support-bundle operation, or None if there are none.
+
+        # TODO(BED-8266): Validate the response field names once
+        # GET /api/v2/clients/management/available is fully implemented in BHE.
+        # Endpoint path confirmed by BED-8266 ticket spec; enum values confirmed via BED-8268.
+        """
+        logger.info("Checking for management operations in BloodHound Enterprise.")
+        management = self.client.management_available
+        for operation in management.data:
+            if operation.type == ManagementOperationType.SUPPORT_BUNDLE:
+                logger.info(
+                    f"Support bundle operation found: {operation.id}"
+                )
+                return operation
+        return None
+
+    def _send_support_bundle(self, operation: ManagementOperation) -> None:
+        """Claim the operation, collect log files, zip and upload them, then report completion.
+
+        Runs synchronously in the poll thread so that no collection jobs are
+        started while the upload is in progress (per BED-7975 acceptance criteria).
+        The temporary zip file is always cleaned up regardless of upload success.
+
+        Args:
+            operation: The management operation that triggered this upload.
+        """
+        logger.info(
+            f"Starting support bundle upload for operation {operation.id}."
+        )
+        self.client.start_operation(operation.id)
+
+        bundle_path = None
+        try:
+            bundle_path = create_support_bundle(self.collector_name, self.log_base_path)
+            self.client.upload_support_bundle(bundle_path)
+            self.client.end_operation(operation.id, ManagementOperationStatus.SUCCEEDED)
+            logger.info(
+                f"Support bundle uploaded successfully for operation {operation.id}."
+            )
+        except Exception:
+            logger.exception(
+                f"Support bundle upload failed for operation {operation.id}."
+            )
+            try:
+                self.client.end_operation(operation.id, ManagementOperationStatus.FAILED)
+            except Exception:
+                logger.exception(
+                    f"Failed to mark operation {operation.id} as failed in BHE."
+                )
+            raise
+        finally:
+            if bundle_path is not None:
+                bundle_path.unlink(missing_ok=True)
+                logger.debug(f"Cleaned up temporary support bundle at {bundle_path}.")
 
     def check_jobs(self) -> Job | None:
         """Checks BloodHound enterprise for available jobs. These can either be new jobs or jobs currently started and not finished/stopped.
@@ -176,8 +252,17 @@ class Service:
             self.job_running = None
 
     def _poll(self) -> None:
-        """Checks if jobs are completed and if a job should be run."""
-        # If a job is currently running check if the future is done and handle completion
+        """Checks if jobs are completed and if a job or management operation should be run.
+
+        Poll sequence (per BHADR-6):
+        1. If a job future is done, handle its completion.
+        2. If no job is currently running:
+           a. Check the management endpoint FIRST.
+           b. If a support-bundle operation is pending, send the bundle and
+              skip the job check for this cycle (job polling resumes next cycle).
+           c. Otherwise check for available collection jobs and start one if found.
+        """
+        # Step 1: Handle completion of any currently running job.
         try:
             if self.future is not None and self.future.done():
                 self._handle_completed_job(self.future)
@@ -186,12 +271,23 @@ class Service:
             self.future = None
             self.job_running = None
 
-        # If no job is currently running, check for new jobs available and start the job
+        if self.job_running is not None:
+            return
+
+        # Step 2a-b: Check management operations first.
         try:
-            if self.job_running is None:
-                available_job = self.check_jobs()
-                if available_job:
-                    self._start_job(available_job)
+            management_op = self.check_management()
+            if management_op:
+                self._send_support_bundle(management_op)
+                return
+        except Exception:
+            logger.exception("Error checking or executing management operations.")
+
+        # Step 2c: No management work — check for collection jobs.
+        try:
+            available_job = self.check_jobs()
+            if available_job:
+                self._start_job(available_job)
         except Exception:
             logger.exception("Error checking for or starting jobs.")
 
