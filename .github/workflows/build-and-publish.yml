@@ -42,5 +42,28 @@ jobs:
       - name: Build package
         run: uv build
 
+      - name: Verify built version matches tag
+        run: |
+          REF="${{ inputs.tag || github.ref_name }}"
+          TAG_VERSION="${REF#v}"
+          echo "Tag version: ${TAG_VERSION}"
+          ls dist/
+          if ! ls "dist/openhound-${TAG_VERSION}.tar.gz" >/dev/null 2>&1 \
+             || ! ls "dist/openhound-${TAG_VERSION}-"*.whl >/dev/null 2>&1; then
+            echo "::error::Built artifacts in dist/ do not match tag version ${TAG_VERSION}."
+            echo "::error::This usually means hatch-vcs resolved a different tag (e.g. a lightweight tag pointing to the same commit). Re-tag on a distinct commit, preferably as an annotated tag."
+            exit 1
+          fi
+
+      - name: Verify version not already on PyPI
+        run: |
+          REF="${{ inputs.tag || github.ref_name }}"
+          TAG_VERSION="${REF#v}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/openhound/${TAG_VERSION}/json")
+          if [ "${STATUS}" = "200" ]; then
+            echo "::error::openhound ${TAG_VERSION} already exists on PyPI; refusing to republish."
+            exit 1
+          fi
+
       - name: Publish package
-        run: uv publish
+        run: uv publish --check-url https://pypi.org/simple/
