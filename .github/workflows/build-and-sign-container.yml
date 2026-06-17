@@ -1,8 +1,12 @@
 name: Build, Sign, and Publish Container Image
 
 on:
-  release:
-    types: [ published ]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build the container image from (e.g. v1.3.0 or v1.3.0rc1)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -12,7 +16,6 @@ jobs:
   push-to-docker-registry:
     name: Push Image to Docker Registry (${{ matrix.target }})
     runs-on: ubuntu-latest
-    environment: pypi
     strategy:
       fail-fast: false
       matrix:
@@ -33,13 +36,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ github.event.release.tag_name }}
+          ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Set image reference
         id: image-ref
         run: |
-          CLEAN_VERSION="${{ github.event.release.tag_name }}"
+          CLEAN_VERSION="${{ inputs.tag }}"
 
           if [ -z "$CLEAN_VERSION" ]; then
             echo "Error: version is empty"
@@ -55,9 +58,19 @@ jobs:
       - name: Set image tags
         id: image-tags
         run: |
+          TAG="${{ inputs.tag }}"
+          # Stable release tags match strict vMAJOR.MINOR.PATCH; anything else
+          # (RCs, alphas, betas, etc.) is treated as a prerelease and does not
+          # get the floating 'latest' tag applied.
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            IS_PRERELEASE="false"
+          else
+            IS_PRERELEASE="true"
+          fi
+
           TAGS="${{ steps.image-ref.outputs.version_tag }}"
 
-          if [ "${{ github.event.release.prerelease }}" != "true" ] && [ -n "${{ matrix.latest_tag }}" ]; then
+          if [ "$IS_PRERELEASE" != "true" ] && [ -n "${{ matrix.latest_tag }}" ]; then
             TAGS="${TAGS}"$'\n'"${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:${{ matrix.latest_tag }}"
           fi
 

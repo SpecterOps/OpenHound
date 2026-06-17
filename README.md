@@ -42,6 +42,18 @@ Follow the docs for setup, CLI usage, and collector development:
 
 - Overview: [OpenHound Documentation](https://bloodhound.specterops.io/openhound/overview)
 
+### Install
+
+```bash
+pip install openhound
+```
+
+To try the latest development build from `main` (published to PyPI automatically on every merge):
+
+```bash
+pip install --pre openhound
+```
+
 ## How it works
 
 - **Collect**: OpenHound uses DLT to collect resources from various services. Resources are parsed using a Pydantic

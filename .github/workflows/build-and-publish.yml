@@ -67,3 +67,12 @@ jobs:
 
       - name: Publish package
         run: uv publish --check-url https://pypi.org/simple/
+
+  containerize:
+    needs: build
+    # Skip container build for dev publishes from the merge-to-main flow.
+    if: ${{ !contains(inputs.tag || github.ref_name, '.dev') }}
+    uses: ./.github/workflows/build-and-sign-container.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    secrets: inherit

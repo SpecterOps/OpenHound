@@ -1,4 +1,4 @@
-﻿name: Create Release Tag and publish new version
+﻿name: Create Dev Release Tag and publish new version
 
 on:
   pull_request:
@@ -27,6 +27,8 @@ jobs:
     needs: test-core
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.versioning.outputs.new_version }}
 
     steps:
       - name: Checkout
@@ -37,42 +39,56 @@ jobs:
       - name: Fetch tags
         run: git fetch --tags
 
-      - name: Determine next version
+      - name: Determine next dev version
         id: versioning
         run: |
-          # Get latest tag or fallback
-          LATEST_TAG=$(git tag --sort=-v:refname | head -n 1)
-          if [ -z "$LATEST_TAG" ]; then
-            LATEST_TAG="v0.0.0"
+          # Get latest stable tag (vMAJOR.MINOR.PATCH only, excluding dev/pre-release tags)
+          LATEST_STABLE=$(git tag --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | head -n 1 || true)
+          if [ -z "$LATEST_STABLE" ]; then
+            LATEST_STABLE="v0.0.0"
           fi
+          echo "Latest stable tag: $LATEST_STABLE"
 
-          echo "Latest tag: $LATEST_TAG"
-
-          VERSION=${LATEST_TAG#v}
+          # Dev releases target the next version on top of the last stable.
+          # Branch prefix selects the bump level; unknown prefixes default to patch.
+          VERSION=${LATEST_STABLE#v}
           IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
 
           BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
           echo "Merged branch: $BRANCH_NAME"
 
-          if [[ "$BRANCH_NAME" == fix/* || "$BRANCH_NAME" == patch/* ]]; then
-            PATCH=$((PATCH + 1))
-          elif [[ "$BRANCH_NAME" == feature/* || "$BRANCH_NAME" == minor/* ]]; then
-            MINOR=$((MINOR + 1))
-            PATCH=0
-          elif [[ "$BRANCH_NAME" == major/* ]]; then
+          if [[ "$BRANCH_NAME" == major/* ]]; then
             MAJOR=$((MAJOR + 1))
             MINOR=0
             PATCH=0
+          elif [[ "$BRANCH_NAME" == feature/* || "$BRANCH_NAME" == minor/* ]]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
           else
-            echo "Branch does not trigger release."
-            exit 0
+            # fix/*, patch/*, or any other branch name
+            PATCH=$((PATCH + 1))
           fi
 
-          NEW_VERSION="v$MAJOR.$MINOR.$PATCH"
+          NEXT_BASE="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "Next dev base: $NEXT_BASE"
+
+          # Find the next dev number for this base
+          LAST_DEV=$(git tag --list "${NEXT_BASE}.dev*" \
+            | sed "s|^${NEXT_BASE}\.dev||" \
+            | sort -n | tail -n 1)
+          if [ -z "$LAST_DEV" ]; then
+            DEV_NUM=1
+          else
+            DEV_NUM=$((LAST_DEV + 1))
+          fi
+
+          NEW_VERSION="${NEXT_BASE}.dev${DEV_NUM}"
 
           echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "Next version: $NEW_VERSION"
+          echo "Next dev version: $NEW_VERSION"
 
       - name: Create and push tag
         if: env.NEW_VERSION != ''
