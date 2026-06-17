@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
+from enum import StrEnum
 from typing import Union
 
 
@@ -51,3 +52,44 @@ class JobsCurrent(BaseModel):
 
 class JobsEnd(BaseModel):
     data: Job
+
+
+# Values match the CHECK constraint on collector_management_operations.type in BHE.
+# See: lib/go/database/migration/migrations/20260529140822_v9_collector_artifacts.sql
+class ManagementOperationType(StrEnum):
+    SUPPORT_BUNDLE = "support_bundle"
+
+
+# Values match the CHECK constraint on collector_management_operations.status in BHE.
+# See: lib/go/database/migration/migrations/20260529140822_v9_collector_artifacts.sql
+class ManagementOperationStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELED = "canceled"
+    TIMED_OUT = "timed_out"
+    EXPIRED = "expired"
+
+
+class ManagementOperation(BaseModel):
+    # Fields sourced from the collector_management_operations DB schema (BED-8268).
+    # TODO(BED-8266): Confirm all field names match the actual BHE JSON response shape
+    # once GET /api/v2/clients/management is implemented in BHE.
+    id: str
+    type: str
+    status: str
+    created_at: datetime
+    requested_by_user_id: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    execution_time: datetime | None = None
+
+
+class ManagementAvailable(BaseModel):
+    data: list[ManagementOperation]
+
+
+class ManagementOperationResult(BaseModel):
+    """Response wrapper returned by POST /start and POST /end."""
+    data: ManagementOperation

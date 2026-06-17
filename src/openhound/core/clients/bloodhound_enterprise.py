@@ -1,6 +1,7 @@
 import gzip
 import json
 from enum import Enum
+from pathlib import Path
 
 from openhound.core.clients.bloodhound import BloodHound
 from openhound.core.clients.models.jobs import (
@@ -8,6 +9,9 @@ from openhound.core.clients.models.jobs import (
     JobsCurrent,
     JobsEnd,
     JobStart,
+    ManagementAvailable,
+    ManagementOperationResult,
+    ManagementOperationStatus,
 )
 
 
@@ -51,4 +55,63 @@ class BloodHoundEnterprise(BloodHound):
         compressed_data = gzip.compress(data.encode())
         self.request(
             method="POST", path=path, body=compressed_data, extra_headers=headers
+        )
+
+    @property
+    def management_available(self) -> ManagementAvailable:
+        # Path confirmed by BED-8266 ticket spec.
+        # TODO(BED-8266): Confirm response field names match the Go handler once
+        # GET /api/v2/clients/management/available is fully implemented in BHE.
+        path = "/api/v2/clients/management/available"
+        response = self.request(method="GET", path=path)
+        return ManagementAvailable.model_validate(response.json())
+
+    def start_operation(self, operation_id: str) -> ManagementOperationResult:
+        """Claim a queued management operation, moving it to running.
+
+        Args:
+            operation_id: The UUID of the management operation to claim.
+        """
+        path = "/api/v2/clients/management/start"
+        body = json.dumps({"id": operation_id})
+        response = self.request(method="POST", path=path, body=body.encode())
+        return ManagementOperationResult.model_validate(response.json())
+
+    def end_operation(
+        self, operation_id: str, status: ManagementOperationStatus
+    ) -> ManagementOperationResult:
+        """Mark a running management operation as succeeded, failed, or canceled.
+
+        Args:
+            operation_id: The UUID of the management operation to complete.
+            status: The final status — typically SUCCEEDED or FAILED.
+        """
+        path = "/api/v2/clients/management/end"
+        body = json.dumps({"id": operation_id, "status": status})
+        response = self.request(method="POST", path=path, body=body.encode())
+        return ManagementOperationResult.model_validate(response.json())
+
+    def upload_support_bundle(self, bundle_path: Path) -> None:
+        """Upload a support bundle zip file to BHE.
+
+        Reads the entire zip file into memory and POSTs it as raw bytes with
+        Content-Type: application/zip. BHE returns 202 Accepted on success.
+
+        Args:
+            bundle_path: Path to the zip file to upload.
+
+        # TODO(BED-7968): Confirm upload endpoint path and Content-Type header once
+        # POST /api/v2/clients/management/artifacts is merged and deployed.
+        # TODO: For bundles >= 1 GB consider streaming instead of reading into memory.
+        #       This requires refactoring BloodHound._request() to accept a file-like body
+        #       since the HMAC signature currently requires the full body bytes.
+        """
+        path = "/api/v2/clients/management/artifacts"
+        with bundle_path.open("rb") as f:
+            body = f.read()
+        self.request(
+            method="POST",
+            path=path,
+            body=body,
+            extra_headers={"Content-Type": "application/zip"},
         )
