@@ -6,6 +6,7 @@ from typing import Annotated, Callable, List
 import dlt
 import duckdb
 import typer
+from dlt.common.libs import pydantic as dlt_pydantic
 from dlt.common.pipeline import LoadInfo
 from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
@@ -13,6 +14,7 @@ from dlt.extract.source import DltSource
 from openhound.cli.collect import collect
 from openhound.cli.convert import convert
 from openhound.cli.preproc import preprocess
+from openhound.core import validate
 from openhound.core.asset import BaseAsset, EdgeDef, NodeDef
 from openhound.core.collect import CollectContext, Collector
 from openhound.core.convert import ConvertContext, Converter, Method
@@ -51,6 +53,9 @@ class Contract(str, Enum):
 
 class OpenHound:
     def __init__(self, name: str, source_kind: str, help: str = "OpenGraph collector"):
+        dlt_pydantic.create_list_model = validate.create_list_model
+        dlt_pydantic._classify_validation_errors = validate._classify_validation_errors
+
         self.name = name
         self.source_kind = source_kind
         self.help = help
