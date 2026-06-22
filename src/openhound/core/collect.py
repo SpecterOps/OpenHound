@@ -14,6 +14,12 @@ from openhound.core.progress import Progress
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SCHEMA_CONTRACT = {
+    "tables": "evolve",
+    "columns": "evolve",
+    "data_type": "evolve",
+}
+
 
 class Collector(BasePipeline):
     def __init__(
@@ -22,11 +28,15 @@ class Collector(BasePipeline):
         output_path: Path,
         resources: list[str] | None = None,
         progress: Progress = Progress.tqdm,
+        schema_contract: dict | None = None,
     ):
         self.name = name
         self.output_path = output_path
         self.resources = resources if resources else []
         self.progress = progress
+        self.schema_contract = (
+            schema_contract if schema_contract is not None else DEFAULT_SCHEMA_CONTRACT
+        )
 
     @property
     def pipeline(self) -> Pipeline:
@@ -56,7 +66,10 @@ class Collector(BasePipeline):
 
         logger_override.set_handler(self.name)
         return self._run(
-            all_resources, write_disposition="replace", loader_file_format="jsonl"
+            all_resources,
+            write_disposition="replace",
+            loader_file_format="jsonl",
+            schema_contract=self.schema_contract,
         )
 
 
