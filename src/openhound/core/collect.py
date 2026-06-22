@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_SCHEMA_CONTRACT = {
     "tables": "evolve",
     "columns": "evolve",
-    "data_type": "evolve",
+    "data_type": "discard_row",
 }
 
 
