@@ -92,18 +92,24 @@ class OpenHound:
                 progress: Progress = typer.Option(
                     Progress.tqdm, help="Select progress tracker option"
                 ),
-                tables_contract: Contract = typer.Option(
-                    Contract.evolve,
-                    help="DLT contract applied when data contains newly seen resources/tables previously not collected",
-                ),
-                columns_contract: Contract = typer.Option(
-                    Contract.evolve,
-                    help="DLT contract applied when data contains values/keys not found in the Pydantic model",
-                ),
-                data_type_contract: Contract = typer.Option(
-                    Contract.discard_row,
-                    help="DLT contract applied when fields do not match the data types defined in the Pydantic model",
-                ),
+                tables_contract: Annotated[
+                    Contract,
+                    typer.Option(
+                        help="DLT contract applied when data contains newly seen resources/tables previously not collected",
+                    ),
+                ] = Contract.evolve,
+                columns_contract: Annotated[
+                    Contract,
+                    typer.Option(
+                        help="DLT contract applied when data contains values/keys not found in the Pydantic model",
+                    ),
+                ] = Contract.evolve,
+                data_type_contract: Annotated[
+                    Contract,
+                    typer.Option(
+                        help="DLT contract applied when fields do not match the data types defined in the Pydantic model",
+                    ),
+                ] = Contract.discard_row,
             ) -> LoadInfo | None:
                 schema_contract = {
                     "tables": tables_contract,
