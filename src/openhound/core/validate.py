@@ -1,3 +1,7 @@
+# This is a patched version of DLT's model validator which adds logging when resources fail
+# pydantic validation and the schema contract is set to discard_row
+# https://github.com/dlt-hub/dlt/blob/devel/dlt/common/libs/pydantic.py
+
 import logging
 from typing import Any, Type
 
