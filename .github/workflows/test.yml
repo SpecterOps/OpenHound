@@ -67,3 +67,7 @@ jobs:
       - name: Run DuckDB lookup exception handling tests
         run: |
           .venv/bin/pytest tests/test_lookup.py -v
+
+      - name: Run DLT Pydantic exception handling (override) test
+        run: |
+          .venv/bin/pytest tests/test_dlt_pydantic_override.py -v
