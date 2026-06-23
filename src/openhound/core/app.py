@@ -21,7 +21,7 @@ from openhound.core.convert import ConvertContext, Converter, Method
 from openhound.core.models.extension import Extension
 from openhound.core.preproc import PreProcContext, PreProcessor
 from openhound.core.progress import Progress
-from openhound.core.resources import safe_resource_wrapper
+from openhound.core.resources import safe_defer_wrapper, safe_resource_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +290,17 @@ class OpenHound:
             )
             return decorated
 
+        return decorator
+
+    def defer(self):
+        """Decorator to register a DLT defer with added exception handling."""
+
+        def decorator(func: Callable) -> DltResource:
+            safe_func = safe_defer_wrapper(func)
+            decorated = dlt.defer(safe_func)
+            return decorated  # type: ignore
+
+        logger.debug(f"Registering defer for {self.name}")
         return decorator
 
     def transformer(

@@ -1,11 +1,23 @@
-import logging
-
-
 import functools
 import inspect
+import logging
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+
+def safe_defer_wrapper(func: Callable) -> Callable:
+
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs):
+        try:
+            gen = func(*args, **kwargs)
+            return gen
+        except Exception as e:
+            logger.error(f"Error executing DLT defer: {e}")
+            return
+
+    return sync_wrapper
 
 
 def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
