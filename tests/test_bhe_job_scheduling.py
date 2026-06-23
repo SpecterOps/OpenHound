@@ -1,6 +1,7 @@
 import gzip
 import json
 from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -198,6 +199,51 @@ def test_poll_missing_extension(mock_service, mock_bloodhound_api):
     assert mock_bloodhound_api.app.state.end_payload == {
         "status": JobStatus.FAILED.value,
         "message": "Collector 'openhound-faker' not found",
+    }
+
+
+def test_poll_recovers_from_broken_process_pool(mock_service, mock_bloodhound_api):
+    """A BrokenProcessPool surfaced via future.result() should fail the job, clear state, and rebuild the executor."""
+    mock_bloodhound_api.app.state.job_started = True
+    future = Future()
+    future.set_exception(BrokenProcessPool("worker died"))
+    mock_service.future = future
+    mock_service.job_running = 123
+    original_executor = mock_service.executor
+
+    mock_service._poll()
+
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.executor is not original_executor
+    assert mock_bloodhound_api.app.state.job_ended is True
+    assert mock_bloodhound_api.app.state.end_payload == {
+        "status": JobStatus.FAILED.value,
+        "message": "Collection worker for 'openhound-faker' was terminated abruptly",
+    }
+
+
+def test_start_job_recovers_when_submit_raises_broken_pool(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    """If executor.submit raises BrokenProcessPool after the BHE job was started, the job should be ended FAILED, state cleared, and the executor rebuilt."""
+
+    def broken_submit(*args, **kwargs):
+        raise BrokenProcessPool("worker died before submit")
+
+    monkeypatch.setattr(mock_service.executor, "submit", broken_submit)
+    original_executor = mock_service.executor
+
+    mock_service._poll()
+
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.executor is not original_executor
+    assert mock_bloodhound_api.app.state.job_started is True
+    assert mock_bloodhound_api.app.state.job_ended is True
+    assert mock_bloodhound_api.app.state.end_payload == {
+        "status": JobStatus.FAILED.value,
+        "message": "Failed to start collector 'openhound-faker': worker pool was broken",
     }
 
 
