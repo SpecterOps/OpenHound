@@ -6,6 +6,7 @@ from typing import Annotated, Callable, List
 import dlt
 import duckdb
 import typer
+from dlt.common.libs import pydantic as dlt_pydantic
 from dlt.common.pipeline import LoadInfo
 from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
@@ -13,6 +14,7 @@ from dlt.extract.source import DltSource
 from openhound.cli.collect import collect
 from openhound.cli.convert import convert
 from openhound.cli.preproc import preprocess
+from openhound.core import validate
 from openhound.core.asset import BaseAsset, EdgeDef, NodeDef
 from openhound.core.collect import CollectContext, Collector
 from openhound.core.convert import ConvertContext, Converter, Method
@@ -46,12 +48,14 @@ DEFAULT_LOOKUP_FILE = Path("lookup.duckdb")
 class Contract(str, Enum):
     evolve = "evolve"
     freeze = "freeze"
-    discard_value = "discard_value"
     discard_row = "discard_row"
 
 
 class OpenHound:
     def __init__(self, name: str, source_kind: str, help: str = "OpenGraph collector"):
+        dlt_pydantic.create_list_model = validate.create_list_model
+        dlt_pydantic._classify_validation_errors = validate._classify_validation_errors
+
         self.name = name
         self.source_kind = source_kind
         self.help = help
@@ -67,9 +71,6 @@ class OpenHound:
         self.dlt_source: DltSource | None = None
         self.dlt_resources: list[DltResource] = []
         self.dlt_transformers: list[DltResource] = []
-        self.table_contract: Contract = Contract.evolve
-        self.data_type_contract: Contract = Contract.freeze
-        self.columns_contract: Contract = Contract.evolve
 
         # Store the graph definitions for this source
         self.assets: list[BaseAsset] = []
@@ -96,30 +97,38 @@ class OpenHound:
                 progress: Progress = typer.Option(
                     Progress.tqdm, help="Select progress tracker option"
                 ),
-                tables: Contract = typer.Option(
-                    Contract.evolve,
-                    help="Contract applied when data contains newly seen resources/tables previously not collected",
-                ),
-                columns: Contract = typer.Option(
-                    Contract.evolve,
-                    help="Contract applied when data contains values/keys not found in the Pydantic model",
-                ),
-                data_type: Contract = typer.Option(
-                    Contract.freeze,
-                    help="Contract applied when fields do not match the data types defined in the Pydantic model",
-                ),
+                tables_contract: Annotated[
+                    Contract,
+                    typer.Option(
+                        help="DLT contract applied when data contains newly seen resources/tables previously not collected",
+                    ),
+                ] = Contract.evolve,
+                columns_contract: Annotated[
+                    Contract,
+                    typer.Option(
+                        help="DLT contract applied when data contains values/keys not found in the Pydantic model",
+                    ),
+                ] = Contract.evolve,
+                data_type_contract: Annotated[
+                    Contract,
+                    typer.Option(
+                        help="DLT contract applied when fields do not match the data types defined in the Pydantic model",
+                    ),
+                ] = Contract.discard_row,
             ) -> LoadInfo | None:
+                schema_contract = {
+                    "tables": tables_contract,
+                    "columns": columns_contract,
+                    "data_type": data_type_contract,
+                }
                 collector = Collector(
                     name=self.name,
                     output_path=output_path,
                     resources=resources,
                     progress=progress,
+                    schema_contract=schema_contract,
                 )
 
-                # TODO: Implement data/table/column contracts
-                # self.data_type_contract = data_type
-                # self.columns_contract = columns
-                # self.table_contract = tables
                 ctx = CollectContext(pipeline=collector)
                 source_method: DltSource = func(ctx)
                 if source_method:
