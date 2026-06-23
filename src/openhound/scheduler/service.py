@@ -2,6 +2,7 @@ import logging
 import signal
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 
 import openhound.core.logging  # noqa: F401
@@ -99,6 +100,14 @@ class Service:
         self.executor.shutdown(wait=True, cancel_futures=True)
         logger.info("Collection service stopped.")
 
+    def _reset_executor(self) -> None:
+        """Tear down and recreate the process pool after it has entered a broken state."""
+        try:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            logger.exception("Error shutting down broken executor.")
+        self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
+
     def check_jobs(self) -> Job | None:
         """Checks BloodHound enterprise for available jobs. These can either be new jobs or jobs currently started and not finished/stopped.
 
@@ -137,9 +146,21 @@ class Service:
         logger.info(f"Starting job {job.id} with collector '{self.collector_name}'")
         self.client.start_job(job.id)
         self.job_running = job.id
-        self.future = self.executor.submit(
-            _subprocess_collect, self.collector_name, job.id
-        )
+        try:
+            self.future = self.executor.submit(
+                _subprocess_collect, self.collector_name, job.id
+            )
+        except BrokenProcessPool:
+            logger.exception(
+                f"Failed to submit job {job.id}: process pool is broken, resetting."
+            )
+            self.future = None
+            self.job_running = None
+            self._reset_executor()
+            self.client.end_job(
+                JobStatus.FAILED,
+                f"Failed to start collector '{self.collector_name}': worker pool was broken",
+            )
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
         """Handles completion of a job and reports success or failure to BloodHound Enterprise
@@ -162,6 +183,16 @@ class Service:
             self.client.end_job(
                 JobStatus.FAILED,
                 f"Collector '{self.collector_name}' not found",
+            )
+
+        except BrokenProcessPool:
+            logger.exception(
+                "Collection worker was terminated abruptly; resetting process pool."
+            )
+            self._reset_executor()
+            self.client.end_job(
+                JobStatus.FAILED,
+                f"Collection worker for '{self.collector_name}' was terminated abruptly",
             )
 
         except Exception:
