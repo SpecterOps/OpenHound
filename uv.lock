@@ -1262,8 +1262,8 @@ requires-dist = [
     { name = "griffe-fieldz", specifier = ">=0.5.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "mkdocstrings", extras = ["python"], specifier = ">=1.0.0" },
-    { name = "openhound-github", marker = "extra == 'all'", specifier = "==0.3.5" },
-    { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.3.5" },
+    { name = "openhound-github", marker = "extra == 'all'", specifier = "==0.3.6" },
+    { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.3.6" },
     { name = "openhound-jamf", marker = "extra == 'all'", specifier = "==0.2.2" },
     { name = "openhound-jamf", marker = "extra == 'jamf'", specifier = "==0.2.2" },
     { name = "openhound-okta", marker = "extra == 'all'", specifier = "==0.1.6" },
@@ -1308,16 +1308,15 @@ wheels = [
 
 [[package]]
 name = "openhound-github"
-version = "0.3.5"
+version = "0.3.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "joserfc" },
-    { name = "openhound" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1e/4f/2b931ece95bc1a6b8b5c5cc3de0b1000058d0a9f0575ee65c003a5f39af2/openhound_github-0.3.5.tar.gz", hash = "sha256:f291da3dc27861cfeb4a9559db5b2a76f6fea926aabd53199f94709f6d52ec91", size = 3569211, upload-time = "2026-06-24T17:27:30.56Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b5/cd/42667b45c47497c7e09f12293ddce7d1c229c1f7f5b91f3660ff75f6396a/openhound_github-0.3.6.tar.gz", hash = "sha256:fbd82bffd54336c14a4c20145b3b94a4c863ce56ac285e0da4ee32f14dd395ac", size = 3569197, upload-time = "2026-06-24T20:35:20.464Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3f/0e/12a825bdf010a117481b71e5b11d211f5e9a915e1c57f22ede7311493bf9/openhound_github-0.3.5-py3-none-any.whl", hash = "sha256:10955879cbcf259f8a1de4e4b77d4374e020b49fdfe8fafba3f6642e5ac1e49e", size = 120697, upload-time = "2026-06-24T17:27:29.066Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/fc/afbb64a43d378753f3455d742e7b31b8b51a37bd1a5c304f03bd7b444d54/openhound_github-0.3.6-py3-none-any.whl", hash = "sha256:5c8d887fd68379ace677a640f2ee5a5b87fccd1e9591f298840a15aba2ee83f7", size = 120686, upload-time = "2026-06-24T20:35:19.212Z" },
 ]
 
 [[package]]
