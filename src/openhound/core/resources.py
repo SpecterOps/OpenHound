@@ -53,9 +53,6 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
             while True:
                 try:
                     item = next(gen)
-                    if callable(item):
-                        item = safe_defer_wrapper(item, resource_name)
-
                     yield item
                 except StopIteration:
                     break
@@ -69,9 +66,6 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
                     )
                     continue
         else:
-            if callable(gen):
-                gen = safe_defer_wrapper(gen, resource_name)
-
             yield gen
 
     @functools.wraps(func)
@@ -94,9 +88,6 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
             while True:
                 try:
                     item = await gen.__anext__()
-                    if callable(item):
-                        item = safe_defer_wrapper(item, resource_name)
-
                     yield item
                 except StopAsyncIteration:
                     break
@@ -113,9 +104,6 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
         else:
             try:
                 result = await gen
-                if callable(result):
-                    result = safe_defer_wrapper(result, resource_name)
-
                 yield result
             except Exception as e:
                 logger.error(
