@@ -292,16 +292,11 @@ class OpenHound:
 
         return decorator
 
-    def defer(self):
+    def defer(self, func: Callable) -> Callable:
         """Decorator to register a DLT defer with added exception handling."""
-
-        def decorator(func: Callable) -> DltResource:
-            safe_func = safe_defer_wrapper(func)
-            decorated = dlt.defer(safe_func)
-            return decorated  # type: ignore
-
         logger.debug(f"Registering defer for {self.name}")
-        return decorator
+        safe_func = safe_defer_wrapper(func)
+        return dlt.defer(safe_func)
 
     def transformer(
         self,
