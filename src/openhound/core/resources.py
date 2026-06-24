@@ -6,16 +6,18 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 
-def safe_defer_wrapper(func: Callable) -> Callable:
+def safe_defer_wrapper(func: Callable, resource_name: str | None = None) -> Callable:
 
     @functools.wraps(func)
     def sync_wrapper(*args, **kwargs):
         try:
-            gen = func(*args, **kwargs)
-            return gen
+            return func(*args, **kwargs)
         except Exception as e:
-            logger.error(f"Error executing DLT defer: {e}")
-            return
+            logger.error(
+                f"Error executing DLT defer: {e}",
+                extra={"resource": resource_name, "phase": "defer_execution"},
+            )
+            return []
 
     return sync_wrapper
 
@@ -48,11 +50,12 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
             return
 
         if inspect.isgenerator(gen):
-            # Note: Don't use while item: := next(gen, None) because this will stop the full iterator
-            # if the resource yields any empty value
             while True:
                 try:
                     item = next(gen)
+                    if callable(item):
+                        item = safe_defer_wrapper(item, resource_name)
+
                     yield item
                 except StopIteration:
                     break
@@ -65,8 +68,10 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
                         },
                     )
                     continue
-
         else:
+            if callable(gen):
+                gen = safe_defer_wrapper(gen, resource_name)
+
             yield gen
 
     @functools.wraps(func)
@@ -86,11 +91,12 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
             return
 
         if inspect.isasyncgen(gen):
-            # Note: Don't use while item: := next(gen, None) because this will stop the full iterator
-            # if the resource yields any empty value
             while True:
                 try:
                     item = await gen.__anext__()
+                    if callable(item):
+                        item = safe_defer_wrapper(item, resource_name)
+
                     yield item
                 except StopAsyncIteration:
                     break
@@ -102,11 +108,14 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
                             "phase": "resource_iteration",
                         },
                     )
-
                     continue
+
         else:
             try:
                 result = await gen
+                if callable(result):
+                    result = safe_defer_wrapper(result, resource_name)
+
                 yield result
             except Exception as e:
                 logger.error(
