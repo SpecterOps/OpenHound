@@ -7,11 +7,6 @@ from openhound.core.collect import Collector
 from openhound.core.progress import Progress
 
 
-class ExampleResource(BaseModel):
-    id: int
-    source: str
-
-
 class Computer(BaseModel):
     id: int
     hostname: str
