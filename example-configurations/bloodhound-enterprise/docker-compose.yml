@@ -1,5 +1,5 @@
 x-scheduler: &scheduler
-  image: specterops/openhound:${IMAGE_VERSION:latest-enterprise}
+  image: specterops/openhound:${IMAGE_VERSION:-latest-enterprise}
   restart: unless-stopped
   init: true
   volumes:
