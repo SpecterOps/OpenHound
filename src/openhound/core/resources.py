@@ -1,11 +1,33 @@
-import logging
-
-
 import functools
 import inspect
+import logging
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+
+def safe_defer_wrapper(func: Callable) -> Callable:
+    """Wrap a DLT defer to catch and log exceptions without stopping the entire pipeline.
+
+    Args:
+        func: The defer function
+
+    Returns:
+        Wrapped function that catches exceptions and continues (if possible of course)
+    """
+
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.error(
+                f"Error executing DLT defer: {e}",
+                extra={"phase": "defer_execution"},
+            )
+            return []
+
+    return sync_wrapper
 
 
 def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
@@ -36,8 +58,6 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
             return
 
         if inspect.isgenerator(gen):
-            # Note: Don't use while item: := next(gen, None) because this will stop the full iterator
-            # if the resource yields any empty value
             while True:
                 try:
                     item = next(gen)
@@ -53,7 +73,6 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
                         },
                     )
                     continue
-
         else:
             yield gen
 
@@ -74,8 +93,6 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
             return
 
         if inspect.isasyncgen(gen):
-            # Note: Don't use while item: := next(gen, None) because this will stop the full iterator
-            # if the resource yields any empty value
             while True:
                 try:
                     item = await gen.__anext__()
@@ -90,8 +107,8 @@ def safe_resource_wrapper(func: Callable, resource_name: str) -> Callable:
                             "phase": "resource_iteration",
                         },
                     )
-
                     continue
+
         else:
             try:
                 result = await gen

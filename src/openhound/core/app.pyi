@@ -99,6 +99,7 @@ class OpenHound:
         parallelized: bool = False,
         _impl_cls: type[DltSource] = DltSource,
     ) -> Any: ...
+    def defer(self, func: Callable[..., Any]) -> Callable[..., Callable[[], Any]]: ...
     def resource(
         self,
         data: Optional[Any] = None,
