@@ -27,6 +27,8 @@ jobs:
     needs: test-core
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.versioning.outputs.new_version }}
 
     steps:
       - name: Checkout
@@ -85,7 +87,7 @@ jobs:
 
   publish:
     needs: tag-release
-    if: github.event.pull_request.merged == true
+    if: github.event.pull_request.merged == true && needs.tag-release.outputs.new_version != ''
     uses: ./.github/workflows/build-and-publish.yml
     with:
       tag: ${{ needs.tag-release.outputs.new_version }}
