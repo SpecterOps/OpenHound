@@ -6,7 +6,15 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 
-def safe_defer_wrapper(func: Callable, resource_name: str | None = None) -> Callable:
+def safe_defer_wrapper(func: Callable) -> Callable:
+    """Wrap a DLT defer to catch and log exceptions without stopping the entire pipeline.
+
+    Args:
+        func: The defer function
+
+    Returns:
+        Wrapped function that catches exceptions and continues (if possible of course)
+    """
 
     @functools.wraps(func)
     def sync_wrapper(*args, **kwargs):
@@ -15,7 +23,7 @@ def safe_defer_wrapper(func: Callable, resource_name: str | None = None) -> Call
         except Exception as e:
             logger.error(
                 f"Error executing DLT defer: {e}",
-                extra={"resource": resource_name, "phase": "defer_execution"},
+                extra={"phase": "defer_execution"},
             )
             return []
 
