@@ -17,9 +17,7 @@ class User(BaseModel):
     email: str
 
 
-class UserDetails(BaseModel):
-    id: int
-    email: str
+class UserDetails(User):
     office: str
 
 
