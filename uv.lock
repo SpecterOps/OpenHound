@@ -1264,8 +1264,8 @@ requires-dist = [
     { name = "mkdocstrings", extras = ["python"], specifier = ">=1.0.0" },
     { name = "openhound-github", marker = "extra == 'all'", specifier = "==0.3.3" },
     { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.3.3" },
-    { name = "openhound-jamf", marker = "extra == 'all'", specifier = "==0.2.1" },
-    { name = "openhound-jamf", marker = "extra == 'jamf'", specifier = "==0.2.1" },
+    { name = "openhound-jamf", marker = "extra == 'all'", specifier = "==0.2.2" },
+    { name = "openhound-jamf", marker = "extra == 'jamf'", specifier = "==0.2.2" },
     { name = "openhound-okta", marker = "extra == 'all'", specifier = "==0.1.4" },
     { name = "openhound-okta", marker = "extra == 'okta'", specifier = "==0.1.4" },
     { name = "psutil", specifier = ">=7.2.1" },
@@ -1321,11 +1321,11 @@ wheels = [
 
 [[package]]
 name = "openhound-jamf"
-version = "0.2.1"
+version = "0.2.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/d8/11/70bba4fa0c2b81cbc4979a966213b6a3ab6a534072d26ca0fdfb7adb6157/openhound_jamf-0.2.1.tar.gz", hash = "sha256:1dab37fa47a7cf1f27ed0f19c5766dcdf3bdfdbc3084a8ebd3c228d801a086c1", size = 3418716, upload-time = "2026-06-22T18:45:13.593Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3c/c0/356e99c29ffeab7770e91ff26c7ba90761f47b17c1a593df65c7a9229826/openhound_jamf-0.2.2.tar.gz", hash = "sha256:91ae72090df8d5c377172b7f2cc7589a3e38439d4b3a9b0f5ca1032b40803d46", size = 3416191, upload-time = "2026-06-23T21:19:42.83Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f8/1f/8576d945cd5be1a66b517b6077bb9952e604af06490163538a16a95f7b0b/openhound_jamf-0.2.1-py3-none-any.whl", hash = "sha256:ccb90891ef4b4d1ad4ba2ce49ea9ddf2a8729c2e0a74a41a9f789f682ed55c59", size = 34954, upload-time = "2026-06-22T18:45:12.659Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/41/3256a6cd08e99f3cbb88a589b8e6eec2e039afe9ea957165b5e957e039ec/openhound_jamf-0.2.2-py3-none-any.whl", hash = "sha256:161bbad151a5fe614b8666bfb79f543ee92b355b1ee0d0964304344296d338d9", size = 32133, upload-time = "2026-06-23T21:19:41.435Z" },
 ]
 
 [[package]]
