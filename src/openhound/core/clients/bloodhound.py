@@ -5,6 +5,7 @@ import hmac
 import logging
 from abc import ABC, abstractmethod
 from datetime import timedelta
+from importlib.metadata import version
 
 import requests
 from dlt.common import json
@@ -20,6 +21,9 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+__version__ = version("openhound")
 
 
 class BloodHoundHTTPError(DltException):
@@ -175,7 +179,7 @@ class BloodHound(BloodHoundClient):
 
         sig = base64.b64encode(digester.digest()).decode()
         headers = {
-            "User-Agent": "openhound/0.1.0",
+            "User-Agent": f"openhound/{__version__}",
             "Authorization": f"bhesignature {self.token_id}",
             "RequestDate": datetime_formatted,
             "Signature": sig,
@@ -203,7 +207,7 @@ class BloodHoundJWT(BloodHoundClient):
         extra_headers: dict[str, str] | None = None,
     ):
         headers = {
-            "User-Agent": "openhound/0.1.0",
+            "User-Agent": f"openhound/{__version__}",
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.token}",
         }

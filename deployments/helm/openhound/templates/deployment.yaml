@@ -59,10 +59,6 @@ spec:
             - name: DESTINATION__BLOODHOUNDENTERPRISE__URL
               value: {{ .Values.destination.bloodhoundEnterprise.url | quote }}
             {{- end }}
-            {{- if .Values.destination.bloodhoundEnterprise.interval }}
-            - name: DESTINATION__BLOODHOUNDENTERPRISE__INTERVAL
-              value: {{ .Values.destination.bloodhoundEnterprise.interval | quote }}
-            {{- end }}
             {{- range $name, $value := .Values.env }}
             - name: {{ $name }}
               value: {{ $value | quote }}

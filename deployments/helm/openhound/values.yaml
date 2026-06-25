@@ -46,7 +46,6 @@ collector:
 destination:
   bloodhoundEnterprise:
     url: ""
-    interval: ""
 
 resources: { }
 

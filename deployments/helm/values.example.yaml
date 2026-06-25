@@ -25,4 +25,3 @@ collector:
 destination:
   bloodhoundEnterprise:
     url: https://test.bloodhoundenterprise.io
-    interval: "300"

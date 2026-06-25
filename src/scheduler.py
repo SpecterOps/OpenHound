@@ -15,7 +15,6 @@ def start():
     # Load BHE config and secrets
     bhe_uri = dlt.config["destination.bloodhoundenterprise.url"]
     collector_name = dlt.config["destination.bloodhoundenterprise.collector_name"]
-    interval = dlt.config.get("destination.bloodhoundenterprise.interval", int)
 
     # Load BHE secrets
     token_key = dlt.secrets["destination.bloodhoundenterprise.token_key"]
@@ -28,7 +27,6 @@ def start():
         token_key=token_key,
         token_id=token_id,
         collector_name=collector_name,
-        interval=interval,
     )
     svc.start()
 
