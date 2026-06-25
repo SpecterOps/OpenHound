@@ -13,6 +13,8 @@ from openhound.scheduler import dataflow
 
 logger = logging.getLogger(__name__)
 
+POLL_INTERVAL = 30  # seconds; fixed poll/check-in cadence, must remain below BHE's 600s client-checkin timeout
+
 
 class ExtensionNotFoundError(Exception):
     """Raised when the configured collector extension cannot be found."""
@@ -68,7 +70,6 @@ class Service:
         token_key: str,
         token_id: str,
         collector_name: str,
-        interval: int = 5,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
@@ -77,7 +78,7 @@ class Service:
             bhe_uri=bhe_uri, token_key=token_key, token_id=token_id
         )
         # Interval how often to check for a job
-        self.interval = interval
+        self.interval = POLL_INTERVAL
 
         # Stores the ID of currently running BHE job
         self.job_running: int | None = None
@@ -223,6 +224,8 @@ class Service:
                 available_job = self.check_jobs()
                 if available_job:
                     self._start_job(available_job)
+            else:
+                self.client.jobs_current
         except Exception:
             logger.exception("Error checking for or starting jobs.")
 
