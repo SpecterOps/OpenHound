@@ -68,7 +68,7 @@ class Service:
         token_key: str,
         token_id: str,
         collector_name: str,
-        interval: int = 5,
+        interval: int = 15,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri

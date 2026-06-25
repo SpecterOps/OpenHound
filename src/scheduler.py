@@ -15,7 +15,12 @@ def start():
     # Load BHE config and secrets
     bhe_uri = dlt.config["destination.bloodhoundenterprise.url"]
     collector_name = dlt.config["destination.bloodhoundenterprise.collector_name"]
-    interval = dlt.config.get("destination.bloodhoundenterprise.interval", int)
+    interval = dlt.config("destination.bloodhoundenterprise.interval")
+    try:
+        interval = int(interval)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid interval: {interval}, defaulting to 15")
+        interval = 15
 
     # Load BHE secrets
     token_key = dlt.secrets["destination.bloodhoundenterprise.token_key"]
