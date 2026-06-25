@@ -94,20 +94,6 @@ class Service:
         self.exit = True
         logger.warning(f"Received signal {sig}, shutting down gracefully.")
 
-    def _checkin(self) -> None:
-        """Send a check-in request to BHE to keep the client's LastCheckIn fresh.
-
-        Only sends a request when a job is currently running. Exceptions are caught and
-        logged as warnings — they do not crash the loop or affect the running job.
-        """
-        if self.job_running is None:
-            return
-        try:
-            self.client.jobs_current
-            logger.debug(f"Check-in sent for job {self.job_running}.")
-        except Exception:
-            logger.warning("Check-in request to BHE failed.", exc_info=True)
-
     def _shutdown(self) -> None:
         """Shut down the executor and wait for running tasks to finish. Executed when the service is shut down."""
         logger.info("Collection service stopping.")
@@ -237,6 +223,8 @@ class Service:
                 available_job = self.check_jobs()
                 if available_job:
                     self._start_job(available_job)
+            else:
+                self.client.jobs_current
         except Exception:
             logger.exception("Error checking for or starting jobs.")
 
@@ -250,7 +238,6 @@ class Service:
         try:
             while not self.exit:
                 self._poll()
-                self._checkin()
                 time.sleep(self.interval)
         finally:
             self._shutdown()
