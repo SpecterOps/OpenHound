@@ -247,15 +247,10 @@ class Service:
         logger.info(
             f"Service started, monitoring {self.bhe_uri} every {self.interval} seconds."
         )
-        tick = 1  # seconds per loop iteration
-        last_poll = time.monotonic() - self.interval  # trigger _poll() immediately on first tick
         try:
             while not self.exit:
-                now = time.monotonic()
-                if now - last_poll >= self.interval:
-                    self._poll()
-                    self._checkin()   # no-op when idle
-                    last_poll = now
-                time.sleep(tick)
+                self._poll()
+                self._checkin()
+                time.sleep(self.interval)
         finally:
             self._shutdown()
