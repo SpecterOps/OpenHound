@@ -114,7 +114,6 @@ def mock_service(mock_bloodhound_api, monkeypatch):
         bhe_uri="http://localhost:8000",
         token_key="test-key",
         token_id="test-id",
-        interval=1,
         collector_name="openhound-faker",
     )
 
@@ -248,8 +247,11 @@ def test_start_job_recovers_when_submit_raises_broken_pool(
 
 
 def test_checkin_calls_jobs_current_when_job_running(mock_service, monkeypatch):
-    """_checkin() should call jobs_current when a job is running."""
+    """_poll() should call jobs_current via the else-branch check-in when a job is running."""
+    # Simulate a job in progress with no completed future — skips the completion handler,
+    # reaches the else-branch, and triggers jobs_current as a check-in heartbeat.
     mock_service.job_running = 123
+    mock_service.future = None  # no completed future to handle
     called = []
 
     def fake_jobs_current(self):
@@ -259,14 +261,17 @@ def test_checkin_calls_jobs_current_when_job_running(mock_service, monkeypatch):
         mock_service.client.__class__, "jobs_current", property(fake_jobs_current)
     )
 
-    mock_service._checkin()
+    mock_service._poll()
 
     assert len(called) == 1
 
 
 def test_checkin_noop_when_no_job_running(mock_service, monkeypatch):
-    """_checkin() should not call jobs_current when no job is running."""
+    """_poll() should not call jobs_current via the else-branch check-in when no job is running."""
+    # When idle (job_running is None), _poll() takes the if-branch and calls check_jobs()
+    # instead of the else-branch check-in. jobs_current should never be touched.
     assert mock_service.job_running is None
+    mock_service.future = None
     called = []
 
     def fake_jobs_current(self):
@@ -275,15 +280,19 @@ def test_checkin_noop_when_no_job_running(mock_service, monkeypatch):
     monkeypatch.setattr(
         mock_service.client.__class__, "jobs_current", property(fake_jobs_current)
     )
+    # Stub check_jobs so _poll doesn't try to start a job; we only care the else-branch doesn't fire
+    monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
 
-    mock_service._checkin()
+    mock_service._poll()
 
     assert len(called) == 0
 
 
 def test_checkin_swallows_exception(mock_service, monkeypatch):
-    """_checkin() should swallow exceptions from jobs_current without re-raising."""
+    """_poll() should swallow exceptions raised by jobs_current in the check-in else-branch."""
+    # A transient BHE error during check-in must not crash the service loop.
     mock_service.job_running = 123
+    mock_service.future = None  # no completed future to handle
 
     def raise_error(self):
         raise RuntimeError("BHE unreachable")
@@ -292,8 +301,8 @@ def test_checkin_swallows_exception(mock_service, monkeypatch):
         mock_service.client.__class__, "jobs_current", property(raise_error)
     )
 
-    # Should not raise
-    mock_service._checkin()
+    # Should not raise — _poll's except block absorbs the error
+    mock_service._poll()
 
 
 def test_scheduler_ingest_opengraph(mock_service, mock_bloodhound_api, monkeypatch):
