@@ -17,6 +17,8 @@ __version__ = version("openhound")
 
 VALID_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
+VALID_FORMATS = ["json", "text"]
+
 # This should be a complete list of default fields as part of a LogRecord
 # this is used to prevent custom fields overwriting the default LogRecord entries
 DEFAULT_LOG_FIELDS = [
@@ -155,6 +157,46 @@ class OpenHoundJSONFormatter(logging.Formatter):
         return json.dumps(log_data)
 
 
+class OpenHoundTextFormatter(logging.Formatter):
+    """Human-readable plain-text formatter for OpenHound file logs"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Format a log record as a single readable line with structured context.
+
+        Args:
+            record (logging.LogRecord): The original log record
+
+        Returns:
+            str: A human-readable plain-text representation of the log record
+        """
+        timestamp = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
+        location = f"{record.name}:{record.funcName}:{record.lineno}"
+        log_line = (
+            f"{timestamp} [{record.levelname}] {location} - {record.getMessage()}"
+        )
+
+        # Append any custom/extra fields (e.g. resource, phase, extension) so the
+        # structured context is preserved without the noise of full JSON
+        extras = {
+            key: value
+            for key, value in record.__dict__.items()
+            if (
+                not key.startswith("_")
+                and key not in DEFAULT_LOG_FIELDS
+                and key != "taskName"
+                and value is not None
+            )
+        }
+        if extras:
+            extra_str = " ".join(f"{key}={value}" for key, value in extras.items())
+            log_line = f"{log_line} | {extra_str}"
+
+        if record.exc_info:
+            log_line = f"{log_line}\n{self.formatException(record.exc_info)}"
+
+        return log_line
+
+
 class OpenHoundRichFormatter(logging.Formatter):
     """Custom formatter for Rich when logging in CLI mode"""
 
@@ -182,6 +224,7 @@ class CustomLogger:
         interval: int = 1,
         cli_level: str = "ERROR",
         base_path: str | None = None,
+        log_format: str = "text",
     ):
         self.level = level
         self.name = name
@@ -192,6 +235,7 @@ class CustomLogger:
         self.backup_count = backup_count
         self.interval = interval
         self.cli_level = cli_level
+        self.log_format = log_format
 
         self.base_path = Path(base_path) if base_path else self.default_platform_path()
         self.log_file_path: Path | None = None
@@ -207,6 +251,14 @@ class CustomLogger:
         normalized_level = level.upper()
         if normalized_level in VALID_LEVELS:
             return normalized_level
+
+        return default
+
+    @staticmethod
+    def _validate_format(log_format: str, default: str = "text") -> str:
+        normalized_format = log_format.lower()
+        if normalized_format in VALID_FORMATS:
+            return normalized_format
 
         return default
 
@@ -275,11 +327,17 @@ class CustomLogger:
         dlt_interval = dlt.config.get("runtime.log_interval", int)
         dlt_cli_level = dlt.config.get("runtime.log_cli_level", str)
         dlt_log_path = dlt.config.get("runtime.log_path", str)
+        # dlt only treats the exact value "JSON" specially. We read it to select json logs and
+        # fall back to text for anything else (including dlt's default format string).
+        dlt_log_format = dlt.config.get("runtime.log_format", str)
 
         # Check if the DLT config values are valid and if so override the defaults
         self.level = self._validate_level(dlt_level or self.level, default="INFO")
         self.cli_level = self._validate_level(
             dlt_cli_level or self.cli_level, default="ERROR"
+        )
+        self.log_format = self._validate_format(
+            dlt_log_format or self.log_format, default="text"
         )
 
         # Override the base path if log_path is set in DLT config, otherwise use the default platform path
@@ -303,17 +361,29 @@ class CustomLogger:
         self.root_logger.handlers.clear()
         self.handlers[self.runtime_mode](self.root_logger, self.log_file_path)
 
+    def _file_formatter(self) -> logging.Formatter:
+        """Return the formatter for file/stdout handlers based on the configured log format.
+
+        Returns:
+            logging.Formatter: A JSON formatter when log_format is 'json', otherwise a
+            human-readable plain-text formatter.
+        """
+        if self.log_format == "json":
+            return OpenHoundJSONFormatter()
+        return OpenHoundTextFormatter()
+
     def container_handlers(self, logger: logging.Logger, file_path: Path) -> None:
         """Set the logging handler/format when running in a container"""
 
-        json_formatter = OpenHoundJSONFormatter()
+        formatter = self._file_formatter()
 
-        # Log to stdout in JSON for better compatibility with container-based logging systems
+        # Log to stdout for better compatibility with container-based logging systems.
+        # Output is human-readable text by default; set runtime.log_format = "JSON" for structured JSON.
         stdout_handler = logging.StreamHandler(sys.stdout)
-        stdout_handler.setFormatter(json_formatter)
+        stdout_handler.setFormatter(formatter)
         logger.addHandler(stdout_handler)
 
-        # But also log the same json format to a file for persistence and debugging when needed
+        # But also log the same format to a file for persistence and debugging when needed
         rotating_file_handler = RotatingFileHandler(
             file_path,
             when=self.rotate_when,
@@ -321,7 +391,7 @@ class CustomLogger:
             backupCount=self.backup_count,
             max_bytes=self.max_bytes,
         )
-        rotating_file_handler.setFormatter(json_formatter)
+        rotating_file_handler.setFormatter(formatter)
         # This regular expression overrides the default extMatch to recognize both
         # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
         rotating_file_handler.extMatch = re.compile(
@@ -347,8 +417,8 @@ class CustomLogger:
         console_handler.setFormatter(rich_formatter)
         logger.addHandler(console_handler)
 
-        # But also save the logs to a file in JSON format :)
-        json_formatter = OpenHoundJSONFormatter()
+        # But also save the logs to a file using the configured format (text by default)
+        file_formatter = self._file_formatter()
         rotating_file_handler = RotatingFileHandler(
             file_path,
             when=self.rotate_when,
@@ -356,7 +426,7 @@ class CustomLogger:
             backupCount=self.backup_count,
             max_bytes=self.max_bytes,
         )
-        rotating_file_handler.setFormatter(json_formatter)
+        rotating_file_handler.setFormatter(file_formatter)
         # This regular expression overrides the default extMatch to recognize both
         # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
         rotating_file_handler.extMatch = re.compile(
@@ -367,7 +437,7 @@ class CustomLogger:
 
     def service_handlers(self, logger: logging.Logger, file_path: Path) -> None:
         """Set the logging handler/format when running the OpenHound service"""
-        json_formatter = OpenHoundJSONFormatter()
+        file_formatter = self._file_formatter()
         rotating_file_handler = RotatingFileHandler(
             file_path,
             when=self.rotate_when,
@@ -375,7 +445,7 @@ class CustomLogger:
             backupCount=self.backup_count,
             max_bytes=self.max_bytes,
         )
-        rotating_file_handler.setFormatter(json_formatter)
+        rotating_file_handler.setFormatter(file_formatter)
         # This regular expression overrides the default extMatch to recognize both
         # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
         rotating_file_handler.extMatch = re.compile(

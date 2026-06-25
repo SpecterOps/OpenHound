@@ -1,7 +1,15 @@
 import json
 import logging
 
-from openhound.core.logging import RotatingFileHandler, logger_override
+import pytest
+
+from openhound.core.logging import (
+    CustomLogger,
+    OpenHoundJSONFormatter,
+    OpenHoundTextFormatter,
+    RotatingFileHandler,
+    logger_override,
+)
 
 
 def test_root_handler_setup():
@@ -59,8 +67,10 @@ def test_dlt_extension_handlers():
     )
 
 
-def test_log_routing_content(tmp_path, caplog):
+def test_log_routing_content(tmp_path, caplog, monkeypatch):
     """Test that logs are correctly routed and that the files are created for the expected paths"""
+    # Pin JSON (dlt's only crash-safe override value) so the JSON-parsing assertions are self-contained.
+    monkeypatch.setenv("RUNTIME__LOG_FORMAT", "JSON")
     logger_override.base_path = tmp_path
     logger_override.setup()
     logger_override.set_handler("test_extension")
@@ -94,3 +104,55 @@ def test_log_routing_content(tmp_path, caplog):
     assert ext_logs_json[0]["message"] == "Extension DLT log", (
         "The extension log message should be present in 'ext_test_extension.log'"
     )
+
+
+def test_validate_format_defaults_to_text():
+    """Test that the log format validation accepts text/json and falls back to text"""
+    assert CustomLogger._validate_format("JSON") == "json"
+    assert CustomLogger._validate_format("text") == "text"
+    assert CustomLogger._validate_format("invalid") == "text"
+
+
+def test_file_formatter_selection():
+    """Test that the configured log_format selects the matching file formatter"""
+    json_logger = CustomLogger("openhound.log", log_format="json")
+    assert isinstance(json_logger._file_formatter(), OpenHoundJSONFormatter), (
+        "log_format 'json' should produce a JSON formatter"
+    )
+
+    text_logger = CustomLogger("openhound.log", log_format="text")
+    assert isinstance(text_logger._file_formatter(), OpenHoundTextFormatter), (
+        "log_format 'text' should produce a plain-text formatter"
+    )
+
+
+def test_text_formatter_produces_plain_text():
+    """Test that the text formatter produces a readable, non-JSON line with extras"""
+    formatter = OpenHoundTextFormatter()
+    record = logging.LogRecord(
+        name="openhound.core.collect",
+        level=logging.ERROR,
+        pathname="collect.py",
+        lineno=61,
+        msg="Starting collector %s",
+        args=("github",),
+        exc_info=None,
+        func="run",
+    )
+    record.resource = "scim_users"
+    record.taskName = None
+
+    output = formatter.format(record)
+
+    assert "Starting collector github" in output, (
+        "The formatted message should be rendered with its args"
+    )
+    assert "[ERROR" in output, "The log level should be present in the output"
+    assert "openhound.core.collect:run:61" in output, (
+        "The logger/function/line location should be present in the output"
+    )
+    assert "resource=scim_users" in output, "Extra fields should be preserved"
+    assert "taskName" not in output, "Null extras like taskName should be dropped"
+
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(output)

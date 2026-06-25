@@ -2,8 +2,10 @@
 [runtime]
 http_show_error_body = true
 log_cli_level = "WARNING"
-log_format = "JSON"
 log_rotate_when = "midnight"
+# Default: logs are set to human readable text
+# To switch to structured JSON instead, uncomment the line below (must be uppercase "JSON")
+# log_format = "JSON"
 
 [extract]
 workers = 8
