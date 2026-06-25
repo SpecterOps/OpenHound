@@ -247,6 +247,55 @@ def test_start_job_recovers_when_submit_raises_broken_pool(
     }
 
 
+def test_checkin_calls_jobs_current_when_job_running(mock_service, monkeypatch):
+    """_checkin() should call jobs_current when a job is running."""
+    mock_service.job_running = 123
+    called = []
+
+    def fake_jobs_current(self):
+        called.append(True)
+
+    monkeypatch.setattr(
+        mock_service.client.__class__, "jobs_current", property(fake_jobs_current)
+    )
+
+    mock_service._checkin()
+
+    assert len(called) == 1
+
+
+def test_checkin_noop_when_no_job_running(mock_service, monkeypatch):
+    """_checkin() should not call jobs_current when no job is running."""
+    assert mock_service.job_running is None
+    called = []
+
+    def fake_jobs_current(self):
+        called.append(True)
+
+    monkeypatch.setattr(
+        mock_service.client.__class__, "jobs_current", property(fake_jobs_current)
+    )
+
+    mock_service._checkin()
+
+    assert len(called) == 0
+
+
+def test_checkin_swallows_exception(mock_service, monkeypatch):
+    """_checkin() should swallow exceptions from jobs_current without re-raising."""
+    mock_service.job_running = 123
+
+    def raise_error(self):
+        raise RuntimeError("BHE unreachable")
+
+    monkeypatch.setattr(
+        mock_service.client.__class__, "jobs_current", property(raise_error)
+    )
+
+    # Should not raise
+    mock_service._checkin()
+
+
 def test_scheduler_ingest_opengraph(mock_service, mock_bloodhound_api, monkeypatch):
     """Run the DLT pipeline with the openhound-faker collector + check the amount of ingested nodes + edges"""
     monkeypatch.setenv(

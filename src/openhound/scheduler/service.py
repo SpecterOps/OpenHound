@@ -1,5 +1,6 @@
 import logging
 import signal
+import threading
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -69,6 +70,7 @@ class Service:
         token_id: str,
         collector_name: str,
         interval: int = 5,
+        checkin_interval: int = 30,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
@@ -78,6 +80,9 @@ class Service:
         )
         # Interval how often to check for a job
         self.interval = interval
+
+        # Interval how often to send a check-in while a job is running
+        self.checkin_interval = checkin_interval
 
         # Stores the ID of currently running BHE job
         self.job_running: int | None = None
@@ -89,14 +94,40 @@ class Service:
         # Exit condition, changed to True when the process needs to stop
         self.exit = False
 
+        # Check-in thread and stop event
+        self._checkin_stop = threading.Event()
+        self._checkin_thread: threading.Thread | None = None
+
     def _exit_handler(self, sig: int, frame):
         """Handle SIGINT and SIGTERM signals. Sets self.exit to True to stop the while loop"""
         self.exit = True
         logger.warning(f"Received signal {sig}, shutting down gracefully.")
 
+    def _checkin(self) -> None:
+        """Send a check-in request to BHE to keep the client's LastCheckIn fresh.
+
+        Only sends a request when a job is currently running. Exceptions are caught and
+        logged as warnings — they do not crash the thread or affect the running job.
+        """
+        if self.job_running is None:
+            return
+        try:
+            self.client.jobs_current
+            logger.debug(f"Check-in sent for job {self.job_running}.")
+        except Exception:
+            logger.warning("Check-in request to BHE failed.", exc_info=True)
+
+    def _checkin_loop(self) -> None:
+        """Background loop that calls _checkin every checkin_interval seconds."""
+        while not self._checkin_stop.wait(self.checkin_interval):
+            self._checkin()
+
     def _shutdown(self) -> None:
         """Shut down the executor and wait for running tasks to finish. Executed when the service is shut down."""
         logger.info("Collection service stopping.")
+        self._checkin_stop.set()
+        if self._checkin_thread is not None:
+            self._checkin_thread.join(timeout=5)
         self.executor.shutdown(wait=True, cancel_futures=True)
         logger.info("Collection service stopped.")
 
@@ -233,6 +264,11 @@ class Service:
         logger.info(
             f"Service started, monitoring {self.bhe_uri} every {self.interval} seconds."
         )
+        self._checkin_stop.clear()
+        self._checkin_thread = threading.Thread(
+            target=self._checkin_loop, daemon=True, name="bhe-checkin"
+        )
+        self._checkin_thread.start()
         try:
             while not self.exit:
                 self._poll()
