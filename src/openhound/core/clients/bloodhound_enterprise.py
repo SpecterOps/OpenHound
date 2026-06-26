@@ -1,7 +1,9 @@
 import gzip
 import json
+import socket
 from enum import Enum
 
+import openhound
 from openhound.core.clients.bloodhound import BloodHound
 from openhound.core.clients.models.jobs import (
     JobsAvailable,
@@ -52,3 +54,27 @@ class BloodHoundEnterprise(BloodHound):
         self.request(
             method="POST", path=path, body=compressed_data, extra_headers=headers
         )
+
+    def update_client_metadata(self) -> None:
+        path = "/api/v2/clients/update"
+        try:
+            hostname = socket.gethostname()
+        except OSError:
+            hostname = "unknown"
+
+        if hostname == "unknown":
+            ip_address = "unknown"
+        else:
+            try:
+                ip_address = socket.gethostbyname(hostname)
+            except OSError:
+                ip_address = "unknown"
+
+        payload = {
+            "Address": ip_address,
+            "Hostname": hostname,
+            "Version": openhound.__version__,
+        }
+        body = json.dumps(payload)
+
+        self.request(method="PUT", path=path, body=body.encode())

@@ -237,6 +237,12 @@ class Service:
             f"Service started, monitoring {self.bhe_uri} every {self.interval} seconds."
         )
         try:
+            self.client.update_client_metadata()
+
+        except Exception as err:
+            logger.exception(f"Unable to update client metadata: {err}")
+
+        try:
             while not self.exit:
                 self._poll()
                 time.sleep(self.interval)

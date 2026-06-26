@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
 
+from openhound.core.clients import bloodhound_enterprise
 from openhound.core.clients.bloodhound_enterprise import JobStatus
 from openhound.core.models.graph import Graph
 from openhound.scheduler import service as scheduler_service
@@ -40,6 +41,7 @@ def mock_bloodhound_api():
     app.state.job_ended = False
     app.state.end_payload = None
     app.state.start_payload = None
+    app.state.client_update_payload = None
     app.state.ingested_edges = 0
     app.state.ingested_nodes = 0
 
@@ -74,6 +76,11 @@ def mock_bloodhound_api():
         app.state.ingested_edges += len(validate_graph.graph.edges)
         return {"status": "success"}
 
+    @app.put("/api/v2/clients/update")
+    async def update_client(body: dict):
+        app.state.client_update_payload = body
+        return {"status": "success"}
+
     return TestClient(app)
 
 
@@ -104,6 +111,8 @@ def mock_service(mock_bloodhound_api, monkeypatch):
             return mock_bloodhound_api.get(path)
         if method.upper() == "POST":
             return mock_bloodhound_api.post(path, **kwargs)
+        if method.upper() == "PUT":
+            return mock_bloodhound_api.put(path, **kwargs)
 
         raise AssertionError(f"Unhandled method: {method}")
 
@@ -116,6 +125,63 @@ def mock_service(mock_bloodhound_api, monkeypatch):
         token_id="test-id",
         collector_name="openhound-faker",
     )
+
+
+def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeypatch):
+    monkeypatch.setattr(bloodhound_enterprise.openhound, "__version__", "1.2.3")
+    monkeypatch.setattr(bloodhound_enterprise.socket, "gethostname", lambda: "test-host")
+    monkeypatch.setattr(
+        bloodhound_enterprise.socket,
+        "gethostbyname",
+        lambda hostname: "192.0.2.10",
+    )
+
+    mock_service.client.update_client_metadata()
+
+    assert mock_bloodhound_api.app.state.client_update_payload == {
+        "Address": "192.0.2.10",
+        "Hostname": "test-host",
+        "Version": "1.2.3",
+    }
+
+
+def test_client_update_uses_unknown_when_hostname_lookup_fails(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    monkeypatch.setattr(bloodhound_enterprise.openhound, "__version__", "1.2.3")
+
+    def raise_error():
+        raise OSError("hostname unavailable")
+
+    monkeypatch.setattr(bloodhound_enterprise.socket, "gethostname", raise_error)
+
+    mock_service.client.update_client_metadata()
+
+    assert mock_bloodhound_api.app.state.client_update_payload == {
+        "Address": "unknown",
+        "Hostname": "unknown",
+        "Version": "1.2.3",
+    }
+
+
+def test_client_update_uses_unknown_when_ip_lookup_fails(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    monkeypatch.setattr(bloodhound_enterprise.openhound, "__version__", "1.2.3")
+    monkeypatch.setattr(bloodhound_enterprise.socket, "gethostname", lambda: "test-host")
+
+    def raise_error(hostname: str):
+        raise OSError(f"{hostname} unavailable")
+
+    monkeypatch.setattr(bloodhound_enterprise.socket, "gethostbyname", raise_error)
+
+    mock_service.client.update_client_metadata()
+
+    assert mock_bloodhound_api.app.state.client_update_payload == {
+        "Address": "unknown",
+        "Hostname": "test-host",
+        "Version": "1.2.3",
+    }
 
 
 def test_jobs_starts_new_job(mock_service, mock_bloodhound_api):
