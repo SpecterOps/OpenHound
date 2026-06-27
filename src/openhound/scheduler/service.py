@@ -10,6 +10,7 @@ from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, J
 from openhound.core.clients.models.jobs import Job
 from openhound.core.manager import CollectorManager
 from openhound.scheduler import dataflow
+from openhound.scheduler.context import RunContext, run_context
 
 logger = logging.getLogger(__name__)
 
@@ -43,18 +44,22 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
     Raises:
         ExtensionNotFoundError: If the collector cannot be found via entrypoints.
     """
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    logger.info(f"Subprocess running collection '{collector_name}' for job {job_id}")
-    available_collectors = CollectorManager.from_entrypoint()
 
-    for collector in available_collectors.collectors:
-        if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
-            results = dataflow.pipeline(extension=collector)
-            logger.info(f"Collection for job {job_id} completed successfully.")
-            return Result(results=results, job_id=job_id)
+    with run_context.set(RunContext(job_id=job_id)):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        logger.info(
+            f"Subprocess running collection '{collector_name}' for job {job_id}"
+        )
+        available_collectors = CollectorManager.from_entrypoint()
 
-    logger.error(f"Collector '{collector_name}' not found in available collectors.")
-    raise ExtensionNotFoundError(f"Collector '{collector_name}' not found.")
+        for collector in available_collectors.collectors:
+            if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
+                results = dataflow.pipeline(extension=collector)
+                logger.info(f"Collection for job {job_id} completed successfully.")
+                return Result(results=results, job_id=job_id)
+
+        logger.error(f"Collector '{collector_name}' not found in available collectors.")
+        raise ExtensionNotFoundError(f"Collector '{collector_name}' not found.")
 
 
 class Service:
