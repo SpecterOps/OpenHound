@@ -13,6 +13,8 @@ import dlt
 from rich.console import Console
 from rich.logging import RichHandler
 
+from openhound.scheduler.context import run_context
+
 __version__ = version("openhound")
 
 VALID_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -118,6 +120,15 @@ class RotatingFileHandler(TimedRotatingFileHandler):
             self.suffix = original_suffix
         else:
             super().doRollover()
+
+
+class OpenHoundContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        get_context = run_context.get()
+        job_id = get_context.job_id
+        if job_id is not None and not hasattr(record, "job_id"):
+            record.job_id = job_id
+        return True
 
 
 class OpenHoundJSONFormatter(logging.Formatter):
@@ -381,6 +392,7 @@ class CustomLogger:
         # Output is human-readable text by default; set runtime.log_format = "JSON" for structured JSON.
         stdout_handler = logging.StreamHandler(sys.stdout)
         stdout_handler.setFormatter(formatter)
+        stdout_handler.addFilter(OpenHoundContextFilter())
         logger.addHandler(stdout_handler)
 
         # But also log the same format to a file for persistence and debugging when needed
@@ -392,6 +404,8 @@ class CustomLogger:
             max_bytes=self.max_bytes,
         )
         rotating_file_handler.setFormatter(formatter)
+        rotating_file_handler.addFilter(OpenHoundContextFilter())
+
         # This regular expression overrides the default extMatch to recognize both
         # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
         rotating_file_handler.extMatch = re.compile(
@@ -415,6 +429,7 @@ class CustomLogger:
             rich_tracebacks=True,
         )
         console_handler.setFormatter(rich_formatter)
+        console_handler.addFilter(OpenHoundContextFilter())
         logger.addHandler(console_handler)
 
         # But also save the logs to a file using the configured format (text by default)
@@ -427,6 +442,7 @@ class CustomLogger:
             max_bytes=self.max_bytes,
         )
         rotating_file_handler.setFormatter(file_formatter)
+        rotating_file_handler.addFilter(OpenHoundContextFilter())
         # This regular expression overrides the default extMatch to recognize both
         # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
         rotating_file_handler.extMatch = re.compile(
@@ -446,6 +462,7 @@ class CustomLogger:
             max_bytes=self.max_bytes,
         )
         rotating_file_handler.setFormatter(file_formatter)
+        rotating_file_handler.addFilter(OpenHoundContextFilter())
         # This regular expression overrides the default extMatch to recognize both
         # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
         rotating_file_handler.extMatch = re.compile(
