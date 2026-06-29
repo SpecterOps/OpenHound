@@ -3,6 +3,13 @@
 http_show_error_body = true
 log_cli_level = "WARNING"
 log_rotate_when = "midnight"
+
+# HTTP retry/backoff for source requests; rides out API rate limits
+# (e.g. GitHub during large collections) instead of failing the run.
+request_max_attempts = 15
+request_backoff_factor = 1.3
+request_max_retry_delay = 900
+
 # Default: logs are set to human readable text
 # To switch to structured JSON instead, uncomment the line below (must be uppercase "JSON")
 # log_format = "JSON"

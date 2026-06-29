@@ -23,15 +23,15 @@ dependencies = [
 
 [project.optional-dependencies]
 all = [
-    "openhound-jamf==0.2.2",
-    "openhound-github==0.3.6",
+    "openhound-jamf==0.2.3",
+    "openhound-github==0.3.7",
     "openhound-okta==0.1.6",
 ]
 jamf = [
-    "openhound-jamf==0.2.2",
+    "openhound-jamf==0.2.3",
 ]
 github = [
-    "openhound-github==0.3.6"
+    "openhound-github==0.3.7"
 ]
 
 okta = [

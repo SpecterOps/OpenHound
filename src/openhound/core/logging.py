@@ -5,15 +5,13 @@ import re
 import sys
 import time
 from enum import Enum
-from importlib.metadata import version
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import dlt
+import openhound
 from rich.console import Console
 from rich.logging import RichHandler
-
-__version__ = version("openhound")
 
 VALID_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -140,7 +138,7 @@ class OpenHoundJSONFormatter(logging.Formatter):
             "function": record.funcName,
             "line": record.lineno,
             "message": record.getMessage(),
-            "openhound_version": __version__,
+            "openhound_version": openhound.__version__,
         }
 
         if record.exc_info:
@@ -209,7 +207,7 @@ class OpenHoundRichFormatter(logging.Formatter):
         Returns:
             str: A formatted string for Rich logging
         """
-        log_fmt = f"time={self.formatTime(record, '%Y-%m-%d %H:%M:%S')}, msg={record.getMessage()} (openhound_version={__version__})"
+        log_fmt = f"time={self.formatTime(record, '%Y-%m-%d %H:%M:%S')}, msg={record.getMessage()} (openhound_version={openhound.__version__})"
         return log_fmt
 
 
