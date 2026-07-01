@@ -242,6 +242,10 @@ class CustomLogger:
         self.base_path = Path(base_path) if base_path else self.default_platform_path()
         self.log_file_path: Path | None = None
 
+        # Share one rotating handler per file across loggers; opening the same file
+        # with multiple handlers breaks rotation on Windows (WinError 32).
+        self._file_handlers: dict[Path, "RotatingFileHandler"] = {}
+
         self.handlers = {
             LogMode.CLI: self.cli_handlers,
             LogMode.CONTAINER: self.container_handlers,
@@ -374,6 +378,32 @@ class CustomLogger:
             return OpenHoundJSONFormatter()
         return OpenHoundTextFormatter()
 
+    def _build_file_handler(self, file_path: Path) -> "RotatingFileHandler":
+        """Create and configure a rotating file handler for the given path."""
+        rotating_file_handler = RotatingFileHandler(
+            file_path,
+            when=self.rotate_when,
+            interval=self.interval,
+            backupCount=self.backup_count,
+            max_bytes=self.max_bytes,
+        )
+        rotating_file_handler.setFormatter(self._file_formatter())
+        # This regular expression overrides the default extMatch to recognize both
+        # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
+        rotating_file_handler.extMatch = re.compile(
+            r"(?<!\d)\d{4}-\d{2}-\d{2}_\d{2}(-\d{2}-\d{2})?(?!\d)", re.ASCII
+        )
+        return rotating_file_handler
+
+    def _get_file_handler(self, file_path: Path) -> "RotatingFileHandler":
+        """Return a shared rotating file handler for the path (one open file per path)."""
+        key = Path(file_path).resolve()
+        handler = self._file_handlers.get(key)
+        if handler is None:
+            handler = self._build_file_handler(file_path)
+            self._file_handlers[key] = handler
+        return handler
+
     def container_handlers(self, logger: logging.Logger, file_path: Path) -> None:
         """Set the logging handler/format when running in a container"""
 
@@ -386,21 +416,7 @@ class CustomLogger:
         logger.addHandler(stdout_handler)
 
         # But also log the same format to a file for persistence and debugging when needed
-        rotating_file_handler = RotatingFileHandler(
-            file_path,
-            when=self.rotate_when,
-            interval=self.interval,
-            backupCount=self.backup_count,
-            max_bytes=self.max_bytes,
-        )
-        rotating_file_handler.setFormatter(formatter)
-        # This regular expression overrides the default extMatch to recognize both
-        # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
-        rotating_file_handler.extMatch = re.compile(
-            r"(?<!\d)\d{4}-\d{2}-\d{2}_\d{2}(-\d{2}-\d{2})?(?!\d)", re.ASCII
-        )
-
-        logger.addHandler(rotating_file_handler)
+        logger.addHandler(self._get_file_handler(file_path))
 
     def cli_handlers(self, logger: logging.Logger, file_path: Path) -> None:
         """Set the logging handler/format when running as a standalone CLI tool"""
@@ -420,40 +436,11 @@ class CustomLogger:
         logger.addHandler(console_handler)
 
         # But also save the logs to a file using the configured format (text by default)
-        file_formatter = self._file_formatter()
-        rotating_file_handler = RotatingFileHandler(
-            file_path,
-            when=self.rotate_when,
-            interval=self.interval,
-            backupCount=self.backup_count,
-            max_bytes=self.max_bytes,
-        )
-        rotating_file_handler.setFormatter(file_formatter)
-        # This regular expression overrides the default extMatch to recognize both
-        # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
-        rotating_file_handler.extMatch = re.compile(
-            r"(?<!\d)\d{4}-\d{2}-\d{2}_\d{2}(-\d{2}-\d{2})?(?!\d)", re.ASCII
-        )
-
-        logger.addHandler(rotating_file_handler)
+        logger.addHandler(self._get_file_handler(file_path))
 
     def service_handlers(self, logger: logging.Logger, file_path: Path) -> None:
         """Set the logging handler/format when running the OpenHound service"""
-        file_formatter = self._file_formatter()
-        rotating_file_handler = RotatingFileHandler(
-            file_path,
-            when=self.rotate_when,
-            interval=self.interval,
-            backupCount=self.backup_count,
-            max_bytes=self.max_bytes,
-        )
-        rotating_file_handler.setFormatter(file_formatter)
-        # This regular expression overrides the default extMatch to recognize both
-        # default time based rotation filenames and size based rotation filenames (which gets a seconds added as well)
-        rotating_file_handler.extMatch = re.compile(
-            r"(?<!\d)\d{4}-\d{2}-\d{2}_\d{2}(-\d{2}-\d{2})?(?!\d)", re.ASCII
-        )
-        logger.addHandler(rotating_file_handler)
+        logger.addHandler(self._get_file_handler(file_path))
 
     @property
     def runtime_mode(self) -> LogMode:
