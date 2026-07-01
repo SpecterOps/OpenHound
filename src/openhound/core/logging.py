@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("RUNTIME__DLTHUB_TELEMETRY", "false")
+
 import json
 import logging
 import os
