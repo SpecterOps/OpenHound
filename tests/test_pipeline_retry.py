@@ -69,9 +69,39 @@ def test_run_retries_transient_permission_error_wrapped():
     assert fake.calls == 3
 
 
-def test_run_retries_bare_permission_error():
+def test_run_retries_bare_permission_error(monkeypatch):
+    monkeypatch.setattr("openhound.core.pipeline.sys.platform", "win32")
     sentinel = object()
     fake = _FakeDlt([_winerror5(), sentinel])
+    pipeline = _FakePipeline(fake)
+
+    assert pipeline._run(source=None) is sentinel
+    assert fake.calls == 2
+
+
+def test_run_does_not_retry_bare_permission_error_on_non_windows(monkeypatch):
+    monkeypatch.setattr("openhound.core.pipeline.sys.platform", "linux")
+    fake = _FakeDlt([_winerror5()])
+    pipeline = _FakePipeline(fake)
+
+    with pytest.raises(PermissionError):
+        pipeline._run(source=None)
+
+    assert fake.calls == 1
+
+
+def test_run_retries_implicit_chained_permission_error():
+    """PermissionError on __context__ (raised without 'from') should be detected and retried."""
+    sentinel = object()
+    # Simulate: some intermediate error raised inside `except PermissionError:` (no 'from'),
+    # so __context__ is set to the PermissionError but __cause__ is not.
+    perm_err = _winerror5()
+    intermediate = RuntimeError("intermediate")
+    intermediate.__context__ = perm_err
+    # dlt wraps the intermediate error in PipelineStepFailed
+    step_failed = _wrap_in_step_failed(intermediate)
+
+    fake = _FakeDlt([step_failed, sentinel])
     pipeline = _FakePipeline(fake)
 
     assert pipeline._run(source=None) is sentinel

@@ -1,5 +1,6 @@
 import errno
 import logging
+import sys
 import time
 from abc import ABC, abstractmethod
 
@@ -29,7 +30,9 @@ def _transient_filesystem_cause(err: BaseException) -> OSError | None:
         if isinstance(current, OSError) and current.errno in _TRANSIENT_RENAME_ERRNOS:
             return current
         nested = getattr(current, "exception", None)
-        current = nested if nested is not None else current.__cause__
+        if nested is None:
+            nested = current.__cause__ or current.__context__
+        current = nested
     return None
 
 
@@ -68,7 +71,7 @@ class BasePipeline(ABC):
                     raise
                 last_err = err
             except PermissionError as err:
-                if err.errno not in _TRANSIENT_RENAME_ERRNOS:
+                if sys.platform != "win32" or err.errno not in _TRANSIENT_RENAME_ERRNOS:
                     raise
                 last_err = err
 
