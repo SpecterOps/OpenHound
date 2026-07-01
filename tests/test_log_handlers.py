@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -156,3 +157,108 @@ def test_text_formatter_produces_plain_text():
 
     with pytest.raises(json.JSONDecodeError):
         json.loads(output)
+
+
+def test_get_file_handler_caches_handler_per_path(tmp_path):
+    """The shared handler cache should return the same instance for a given path and
+    distinct instances for different paths, so each file is only opened once."""
+    custom_logger = CustomLogger("openhound.log", base_path=str(tmp_path))
+
+    path_a = tmp_path / "openhound.log"
+    path_b = tmp_path / "ext_test.log"
+
+    handler_a = custom_logger._get_file_handler(path_a)
+    try:
+        # A repeated lookup (even via a re-built equivalent Path) returns the cache hit
+        assert custom_logger._get_file_handler(path_a) is handler_a, (
+            "The same path should return the cached handler instance"
+        )
+        assert custom_logger._get_file_handler(Path(str(path_a))) is handler_a, (
+            "Equivalent paths should resolve to the same cached handler"
+        )
+
+        # A different path gets its own dedicated handler
+        handler_b = custom_logger._get_file_handler(path_b)
+        assert handler_b is not handler_a, (
+            "A different path should produce a different handler instance"
+        )
+        assert isinstance(handler_b, RotatingFileHandler), (
+            "Cached handlers should be RotatingFileHandler instances"
+        )
+    finally:
+        for handler in custom_logger._file_handlers.values():
+            handler.close()
+
+
+def test_root_and_dlt_loggers_share_single_file_handler(tmp_path, monkeypatch):
+    """The root and dlt loggers writing to openhound.log must share one handler
+    instance so the file is only opened once, which is required for rotation on
+    Windows where an open handle blocks renaming the file."""
+    # A sibling module may set RUNTIME__LOG_PATH on import; keep our explicit base_path.
+    monkeypatch.delenv("RUNTIME__LOG_PATH", raising=False)
+    custom_logger = CustomLogger("openhound.log", base_path=str(tmp_path))
+
+    try:
+        custom_logger.setup()
+
+        root_logger = logging.getLogger()
+        dlt_logger = logging.getLogger("dlt")
+
+        root_file_handlers = [
+            handler
+            for handler in root_logger.handlers
+            if isinstance(handler, RotatingFileHandler)
+        ]
+        dlt_file_handlers = [
+            handler
+            for handler in dlt_logger.handlers
+            if isinstance(handler, RotatingFileHandler)
+        ]
+
+        assert len(root_file_handlers) == 1, (
+            "The root logger should have exactly one rotating file handler"
+        )
+        assert len(dlt_file_handlers) == 1, (
+            "The dlt logger should have exactly one rotating file handler"
+        )
+        assert root_file_handlers[0] is dlt_file_handlers[0], (
+            "Root and dlt loggers must share the same handler instance for openhound.log"
+        )
+        assert root_file_handlers[0].baseFilename.endswith("openhound.log"), (
+            "The shared handler should write to 'openhound.log'"
+        )
+    finally:
+        # Restore the shared global logging state for subsequent tests.
+        logger_override.setup()
+
+
+def test_build_file_handler_applies_rotation_settings(tmp_path):
+    """_build_file_handler should produce a RotatingFileHandler configured with the
+    logger's rotation settings, the custom extMatch, and the selected formatter."""
+    custom_logger = CustomLogger(
+        "openhound.log",
+        base_path=str(tmp_path),
+        backup_count=7,
+        max_bytes=1234,
+        log_format="json",
+    )
+
+    handler = custom_logger._build_file_handler(tmp_path / "openhound.log")
+    try:
+        assert isinstance(handler, RotatingFileHandler), (
+            "The built handler should be a RotatingFileHandler"
+        )
+        assert handler.backupCount == 7, "The configured backup_count should be applied"
+        assert handler.max_bytes == 1234, "The configured max_bytes should be applied"
+        assert isinstance(handler.formatter, OpenHoundJSONFormatter), (
+            "log_format 'json' should attach the JSON formatter to the handler"
+        )
+        # The overridden extMatch must recognize both time- and size-based suffixes
+        assert handler.extMatch.match("2024-01-02_03"), (
+            "extMatch should recognize the time-based rotation suffix"
+        )
+        assert handler.extMatch.match("2024-01-02_03-04-05"), (
+            "extMatch should recognize the size-based rotation suffix"
+        )
+    finally:
+        handler.close()
