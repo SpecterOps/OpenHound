@@ -46,11 +46,11 @@ collector:
   name: jamf
   extraSecretMounts: { }
 
-# The BHE destination config. This is typically stored inside the same secrets.toml referenced by config.existingSecret, but non-sensitive values can be provided here for convenience.
+# The BHE destination url is non-sensitive config; set it here, via environment variable, or in config.toml.
+# Sensitive credentials (token_id and token_key) belong in secrets.toml referenced by config.existingSecret.
 destination:
   bloodhoundEnterprise:
     url: https://test.bloodhoundenterprise.io
-    interval: "300"
 
 ```
 

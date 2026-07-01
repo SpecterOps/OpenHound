@@ -50,7 +50,7 @@ services:
 
 secrets:
   # Copy the .dlt-example folder to ${HOME}/.dlt as a starting point for each secrets file.
-  # Each secrets file must also contain [destination.bloodhoundenterprise] with url, token_id, and token_key.
+  # Each secrets file must contain [destination.bloodhoundenterprise] with token_id and token_key.
 
   # Jamf: username + password auth
   secrets_jamf:

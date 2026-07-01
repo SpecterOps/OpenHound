@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def ingest(
     items: TDataItems,
     table: TTableSchema,
-    url: str = dlt.secrets.value,
+    url: str = dlt.config.value,
     token_id: str = dlt.secrets.value,
     token_key: str = dlt.secrets.value,
     source_kind: str = dlt.config.value,

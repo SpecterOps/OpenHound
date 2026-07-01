@@ -14,6 +14,10 @@ request_max_retry_delay = 900
 # To switch to structured JSON instead, uncomment the line below (must be uppercase "JSON")
 # log_format = "JSON"
 
+# BHE destination URL (non-sensitive; tokens go in secrets.toml)
+[destination.bloodhoundenterprise]
+url = "bhe_url"
+
 [extract]
 workers = 8
 
