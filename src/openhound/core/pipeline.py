@@ -83,5 +83,6 @@ class BasePipeline(ABC):
             )
             time.sleep(_TRANSIENT_RETRY_BACKOFF * (attempt + 1))
 
-        assert last_err is not None
+        if last_err is None:
+            raise RuntimeError("unreachable: retry loop exited without an error")
         raise last_err
