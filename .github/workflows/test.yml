@@ -52,6 +52,14 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_saved_searches_sync.py -v
 
+      - name: Run saved searches bundle test
+        run: |
+          .venv/bin/pytest tests/test_saved_searches_bundle.py -v
+
+      - name: Run Cypher syntax tests
+        run: |
+          .venv/bin/pytest tests/test_cypher_syntax.py -v
+
       - name: Run extension validation tests
         run: |
           .venv/bin/pytest tests/test_extensions_format.py -v
