@@ -54,7 +54,8 @@ def _winerror5() -> PermissionError:
     return PermissionError(errno.EACCES, "Access is denied")
 
 
-def test_run_retries_transient_permission_error_wrapped():
+def test_run_retries_transient_permission_error_wrapped(monkeypatch):
+    monkeypatch.setattr("openhound.core.pipeline.sys.platform", "win32")
     sentinel = object()
     fake = _FakeDlt(
         [
@@ -67,6 +68,19 @@ def test_run_retries_transient_permission_error_wrapped():
 
     assert pipeline._run(source=None) is sentinel
     assert fake.calls == 3
+
+
+def test_run_does_not_retry_transient_permission_error_wrapped_on_non_windows(
+    monkeypatch,
+):
+    monkeypatch.setattr("openhound.core.pipeline.sys.platform", "linux")
+    fake = _FakeDlt([_wrap_in_step_failed(_winerror5())])
+    pipeline = _FakePipeline(fake)
+
+    with pytest.raises(PipelineStepFailed):
+        pipeline._run(source=None)
+
+    assert fake.calls == 1
 
 
 def test_run_retries_bare_permission_error(monkeypatch):
@@ -90,8 +104,9 @@ def test_run_does_not_retry_bare_permission_error_on_non_windows(monkeypatch):
     assert fake.calls == 1
 
 
-def test_run_retries_implicit_chained_permission_error():
+def test_run_retries_implicit_chained_permission_error(monkeypatch):
     """PermissionError on __context__ (raised without 'from') should be detected and retried."""
+    monkeypatch.setattr("openhound.core.pipeline.sys.platform", "win32")
     sentinel = object()
     # Simulate: some intermediate error raised inside `except PermissionError:` (no 'from'),
     # so __context__ is set to the PermissionError but __cause__ is not.
@@ -108,7 +123,8 @@ def test_run_retries_implicit_chained_permission_error():
     assert fake.calls == 2
 
 
-def test_run_reraises_after_max_retries():
+def test_run_reraises_after_max_retries(monkeypatch):
+    monkeypatch.setattr("openhound.core.pipeline.sys.platform", "win32")
     fake = _FakeDlt([_wrap_in_step_failed(_winerror5())] * _MAX_TRANSIENT_RETRIES)
     pipeline = _FakePipeline(fake)
 

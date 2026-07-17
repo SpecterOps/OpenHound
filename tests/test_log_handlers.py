@@ -228,6 +228,11 @@ def test_root_and_dlt_loggers_share_single_file_handler(tmp_path, monkeypatch):
             "The shared handler should write to 'openhound.log'"
         )
     finally:
+        for handler in custom_logger._file_handlers.values():
+            handler.close()
+        # Undo the monkeypatched env before restoring global state so setup()
+        # runs against the real environment, not the modified one.
+        monkeypatch.undo()
         # Restore the shared global logging state for subsequent tests.
         logger_override.setup()
 

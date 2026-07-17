@@ -65,9 +65,9 @@ class BasePipeline(ABC):
                         dataset_name=err.pipeline.dataset_name,
                         step=extract_cause.pipe_name,
                         message=extract_cause.msg,
-                    )
+                    ) from None
 
-                if _transient_filesystem_cause(err) is None:
+                if sys.platform != "win32" or _transient_filesystem_cause(err) is None:
                     raise
                 last_err = err
             except PermissionError as err:
