@@ -1,4 +1,4 @@
-src/openhound/core/convert.pyimport logging
+import logging
 from collections import defaultdict
 from enum import Enum
 
