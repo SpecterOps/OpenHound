@@ -1,8 +1,17 @@
 name: Build, Sign, and Publish Container Image
 
 on:
-  release:
-    types: [ published ]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to build and sign the container image for"
+        required: true
+        type: string
+      prerelease:
+        description: "Whether this release is a pre-release (skips the 'latest' tag)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -12,7 +21,6 @@ jobs:
   push-to-docker-registry:
     name: Push Image to Docker Registry (${{ matrix.target }})
     runs-on: ubuntu-latest
-    environment: pypi
     strategy:
       fail-fast: false
       matrix:
@@ -33,13 +41,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ github.event.release.tag_name }}
+          ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Set image reference
         id: image-ref
         run: |
-          CLEAN_VERSION="${{ github.event.release.tag_name }}"
+          CLEAN_VERSION="${{ inputs.tag }}"
 
           if [ -z "$CLEAN_VERSION" ]; then
             echo "Error: version is empty"
@@ -57,7 +65,7 @@ jobs:
         run: |
           TAGS="${{ steps.image-ref.outputs.version_tag }}"
 
-          if [ "${{ github.event.release.prerelease }}" != "true" ] && [ -n "${{ matrix.latest_tag }}" ]; then
+          if [ "${{ inputs.prerelease }}" != "true" ] && [ -n "${{ matrix.latest_tag }}" ]; then
             TAGS="${TAGS}"$'\n'"${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:${{ matrix.latest_tag }}"
           fi
 

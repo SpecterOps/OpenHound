@@ -1,16 +1,8 @@
 ﻿name: Build and Publish
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_call:
-    inputs:
-      tag:
-        description: "Tag to build and publish"
-        required: true
-        type: string
-
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -25,7 +17,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }} # using input tags or github ref if tags are manually pushed
+          ref: refs/tags/${{ github.event.release.tag_name }} # build from the tag created when the (pre-)release was published
           fetch-depth: 0
 
       - name: Set up Python
@@ -44,7 +36,9 @@ jobs:
 
       - name: Verify built version matches tag
         run: |
-          REF="${{ inputs.tag || github.ref_name }}"
+          # RC tags are written without a dash (e.g. v0.2.13rc1) so the stripped
+          # tag is already the PEP 440 / PyPI version hatch-vcs produces.
+          REF="${{ github.event.release.tag_name }}"
           TAG_VERSION="${REF#v}"
           echo "Tag version: ${TAG_VERSION}"
           ls dist/
@@ -57,7 +51,7 @@ jobs:
 
       - name: Verify version not already on PyPI
         run: |
-          REF="${{ inputs.tag || github.ref_name }}"
+          REF="${{ github.event.release.tag_name }}"
           TAG_VERSION="${REF#v}"
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/openhound/${TAG_VERSION}/json")
           if [ "${STATUS}" = "200" ]; then
@@ -67,3 +61,11 @@ jobs:
 
       - name: Publish package
         run: uv publish --check-url https://pypi.org/simple/
+
+  containers:
+    needs: build
+    uses: ./.github/workflows/build-and-sign-container.yml
+    with:
+      tag: ${{ github.event.release.tag_name }}
+      prerelease: ${{ github.event.release.prerelease }}
+    secrets: inherit
