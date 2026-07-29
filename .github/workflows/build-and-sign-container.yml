@@ -46,8 +46,10 @@ jobs:
 
       - name: Set image reference
         id: image-ref
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          CLEAN_VERSION="${{ inputs.tag }}"
+          CLEAN_VERSION="$RELEASE_TAG"
 
           if [ -z "$CLEAN_VERSION" ]; then
             echo "Error: version is empty"

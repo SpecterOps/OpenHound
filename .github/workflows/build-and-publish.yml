@@ -35,10 +35,12 @@ jobs:
         run: uv build
 
       - name: Verify built version matches tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           # RC tags are written without a dash (e.g. v0.2.13rc1) so the stripped
           # tag is already the PEP 440 / PyPI version hatch-vcs produces.
-          REF="${{ github.event.release.tag_name }}"
+          REF="$RELEASE_TAG"
           TAG_VERSION="${REF#v}"
           echo "Tag version: ${TAG_VERSION}"
           ls dist/
@@ -50,8 +52,10 @@ jobs:
           fi
 
       - name: Verify version not already on PyPI
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          REF="${{ github.event.release.tag_name }}"
+          REF="$RELEASE_TAG"
           TAG_VERSION="${REF#v}"
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/openhound/${TAG_VERSION}/json")
           if [ "${STATUS}" = "200" ]; then
