@@ -29,7 +29,7 @@ class Permissions(str, Enum):
 def saved_searches(
     items: TDataItems,
     table: TTableSchema,
-    url: str = dlt.secrets.value,
+    url: str = dlt.config.value,
     token: str = dlt.secrets.value,
     strategy: Strategy = Strategy.skip,
     permissions: Permissions = Permissions.public,
@@ -68,7 +68,7 @@ def saved_searches(
 def privilege_zones(
     items: TDataItems,
     table: TTableSchema,
-    url: str = dlt.secrets.value,
+    url: str = dlt.config.value,
     token: str = dlt.secrets.value,
     strategy: Strategy = Strategy.skip,
 ):

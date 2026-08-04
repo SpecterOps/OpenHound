@@ -10,7 +10,6 @@ from dlt.extract.source import DltSource
 from dlt.pipeline.pipeline import Pipeline
 
 from openhound.core.asset import BaseAsset
-from openhound.core.clients.bloodhound import BloodHound
 from openhound.core.logging import logger_override
 from openhound.core.lookup import LookupManager
 from openhound.core.pipeline import BasePipeline
@@ -20,13 +19,6 @@ from openhound.destinations.opengraph.destination import opengraph_file
 from openhound.sources.opengraph.source import GraphResource, opengraph
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class Credentials:
-    url: str
-    token_key: str
-    token_id: str
 
 
 class Method(str, Enum):
@@ -52,16 +44,6 @@ class Converter(BasePipeline):
         self.lookup = lookup
         self.progress = progress
         self.method = method
-        self.client: BloodHound | None = None
-        self.upload_id: int | None = None
-
-    @property
-    def _credentials(self) -> Credentials:
-        return Credentials(
-            url=dlt.secrets["destination.bloodhound.url"],
-            token_id=dlt.secrets["destination.bloodhound.token_id"],
-            token_key=dlt.secrets["destination.bloodhound.token_key"],
-        )
 
     @property
     def pipeline(self) -> Pipeline:
