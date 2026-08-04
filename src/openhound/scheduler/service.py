@@ -4,11 +4,19 @@ import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+from pathlib import Path
 
 import openhound.core.logging  # noqa: F401
 from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
-from openhound.core.clients.models.jobs import Job
+from openhound.core.clients.models.jobs import (
+    Job,
+    ManagementOperation,
+    ManagementOperationStatus,
+    ManagementOperationType,
+)
+from openhound.core.logging import CustomLogger
 from openhound.core.manager import CollectorManager
+from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import dataflow
 
 logger = logging.getLogger(__name__)
@@ -70,6 +78,7 @@ class Service:
         token_key: str,
         token_id: str,
         collector_name: str,
+        log_base_path: Path | None = None,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
@@ -79,6 +88,7 @@ class Service:
         )
         # Interval how often to check for a job
         self.interval = POLL_INTERVAL
+        self.log_base_path = log_base_path or CustomLogger.default_platform_path()
 
         # Stores the ID of currently running BHE job
         self.job_running: int | None = None
@@ -135,6 +145,33 @@ class Service:
         #     raise
 
         return None
+
+    def check_management(self) -> ManagementOperation | None:
+        """Return the first pending support-bundle operation, if any."""
+        logger.info("Checking for management operations in BloodHound Enterprise.")
+        for operation in self.client.management_available.data:
+            if operation.type is ManagementOperationType.SUPPORT_BUNDLE:
+                return operation
+        return None
+
+    def _send_support_bundle(self, operation: ManagementOperation) -> None:
+        """Claim, upload, and complete a support-bundle operation."""
+        self.client.start_operation(operation.id)
+        bundle_path: Path | None = None
+        try:
+            bundle_path = create_support_bundle(self.collector_name, self.log_base_path)
+            self.client.upload_support_bundle(bundle_path)
+            self.client.end_operation(operation.id, ManagementOperationStatus.SUCCEEDED)
+        except Exception:
+            logger.exception("Support bundle upload failed for operation %s.", operation.id)
+            try:
+                self.client.end_operation(operation.id, ManagementOperationStatus.FAILED)
+            except Exception:
+                logger.exception("Unable to mark management operation %s as failed.", operation.id)
+            raise
+        finally:
+            if bundle_path is not None:
+                bundle_path.unlink(missing_ok=True)
 
     def _start_job(self, job: Job) -> None:
         """Starts a BloodHound enterprise job by ID and runs the collection process in a subprocess. The results are then used to end the job in BHE with a complete status.
@@ -218,16 +255,27 @@ class Service:
             self.future = None
             self.job_running = None
 
-        # If no job is currently running, check for new jobs available and start the job
-        try:
-            if self.job_running is None:
+        # Management operations have priority over new collections while idle.
+        if self.job_running is None:
+            try:
+                operation = self.check_management()
+                if operation is not None:
+                    self._send_support_bundle(operation)
+                    return
+            except Exception:
+                logger.exception("Error checking or executing management operations.")
+
+            try:
                 available_job = self.check_jobs()
                 if available_job:
                     self._start_job(available_job)
-            else:
+            except Exception:
+                logger.exception("Error checking for or starting jobs.")
+        else:
+            try:
                 self.client.jobs_current
-        except Exception:
-            logger.exception("Error checking for or starting jobs.")
+            except Exception:
+                logger.exception("Error checking in-progress job.")
 
     def start(self) -> None:
         """Start method to initiate the process of checking for jobs and running them. This method will run indefinitely until an exit signal is received"""

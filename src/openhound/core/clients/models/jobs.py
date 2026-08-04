@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Union
+from enum import StrEnum
 
 
 class Job(BaseModel):
@@ -29,9 +29,9 @@ class DateAt(BaseModel):
 class JobStartData(Job):
     start_time: datetime
     end_time: datetime
-    created_at: Union[datetime, DateAt]
-    updated_at: Union[datetime, DateAt]
-    deleted_at: Union[datetime, DateAt]
+    created_at: datetime | DateAt
+    updated_at: datetime | DateAt
+    deleted_at: datetime | DateAt
     log_path: str | None
     event_title: str
     last_ingest: datetime
@@ -51,3 +51,34 @@ class JobsCurrent(BaseModel):
 
 class JobsEnd(BaseModel):
     data: Job
+
+
+class ManagementOperationType(StrEnum):
+    SUPPORT_BUNDLE = "support_bundle"
+
+
+class ManagementOperationStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
+class ManagementOperation(BaseModel):
+    id: str
+    type: ManagementOperationType
+    status: ManagementOperationStatus
+    created_at: datetime
+    requested_by_user_id: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    execution_time: datetime | None = None
+
+
+class ManagementAvailable(BaseModel):
+    data: list[ManagementOperation]
+
+
+class ManagementOperationResult(BaseModel):
+    data: ManagementOperation

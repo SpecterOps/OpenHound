@@ -11,6 +11,11 @@ from fastapi.testclient import TestClient
 
 from openhound.core.clients import bloodhound, bloodhound_enterprise
 from openhound.core.clients.bloodhound_enterprise import JobStatus
+from openhound.core.clients.models.jobs import (
+    ManagementOperation,
+    ManagementOperationStatus,
+    ManagementOperationType,
+)
 from openhound.core.models.graph import Graph
 from openhound.scheduler import service as scheduler_service
 from openhound.scheduler.service import (
@@ -21,6 +26,7 @@ from openhound.scheduler.service import (
 )
 
 TEST_DATA_DIR = Path(__file__).parent / "test_data" / "api" / "jobs"
+MANAGEMENT_DATA_DIR = Path(__file__).parent / "test_data" / "api" / "management"
 
 
 def load_json(filename: str) -> dict:
@@ -43,6 +49,12 @@ def mock_bloodhound_api():
     app.state.start_payload = None
     app.state.client_update_payload = None
     app.state.ingested_edges = 0
+    app.state.management_operations = []
+    app.state.operation_started = False
+    app.state.operation_ended = False
+    app.state.operation_start_payload = None
+    app.state.operation_end_payload = None
+    app.state.bundle_content = None
     app.state.ingested_nodes = 0
 
     @app.get("/api/v2/jobs/available")
@@ -80,6 +92,27 @@ def mock_bloodhound_api():
     async def update_client(body: dict):
         app.state.client_update_payload = body
         return {"status": "success"}
+
+    @app.get("/api/v2/clients/management/available")
+    async def management_available():
+        return {"data": app.state.management_operations}
+
+    @app.post("/api/v2/clients/management/start")
+    async def start_operation(body: dict):
+        app.state.operation_started = True
+        app.state.operation_start_payload = body
+        return {"data": {**body, "type": "support_bundle", "status": "running", "created_at": "2026-01-01T00:00:00Z"}}
+
+    @app.post("/api/v2/clients/management/artifacts")
+    async def upload_artifact(request: Request):
+        app.state.bundle_content = await request.body()
+        return Response(status_code=202)
+
+    @app.post("/api/v2/clients/management/end")
+    async def end_operation(body: dict):
+        app.state.operation_ended = True
+        app.state.operation_end_payload = body
+        return {"data": {**body, "type": "support_bundle", "created_at": "2026-01-01T00:00:00Z"}}
 
     return TestClient(app)
 
@@ -385,3 +418,87 @@ def test_scheduler_ingest_opengraph(mock_service, mock_bloodhound_api, monkeypat
     assert result.job_id == 123
     assert mock_bloodhound_api.app.state.ingested_nodes == 1000
     assert mock_bloodhound_api.app.state.ingested_edges == 10000
+
+
+def _support_bundle_operation() -> dict:
+    return json.loads(
+        (MANAGEMENT_DATA_DIR / "management_available_with_operation.json").read_text()
+    )["data"][0]
+
+
+def test_check_management_returns_support_bundle_operation(
+    mock_service, mock_bloodhound_api
+):
+    mock_bloodhound_api.app.state.management_operations = [_support_bundle_operation()]
+
+    operation = mock_service.check_management()
+
+    assert operation is not None
+    assert operation.type is ManagementOperationType.SUPPORT_BUNDLE
+
+
+def test_poll_prioritizes_management_over_a_new_job(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    mock_bloodhound_api.app.state.management_operations = [_support_bundle_operation()]
+    sent = []
+    monkeypatch.setattr(mock_service, "_send_support_bundle", sent.append)
+
+    mock_service._poll()
+
+    assert len(sent) == 1
+    assert mock_bloodhound_api.app.state.job_started is False
+
+
+def test_poll_starts_job_when_no_management_work(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    submitted = Future()
+    monkeypatch.setattr(mock_service.executor, "submit", lambda *args: submitted)
+
+    mock_service._poll()
+
+    assert mock_bloodhound_api.app.state.job_started is True
+
+
+def test_poll_still_checks_jobs_when_management_endpoint_fails(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    submitted = Future()
+    monkeypatch.setattr(mock_service, "check_management", lambda: 1 / 0)
+    monkeypatch.setattr(mock_service.executor, "submit", lambda *args: submitted)
+
+    mock_service._poll()
+
+    assert mock_bloodhound_api.app.state.job_started is True
+
+
+def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
+    mock_service, mock_bloodhound_api, tmp_path, monkeypatch
+):
+    log = tmp_path / "openhound.log"
+    log.write_text("support log")
+    mock_service.log_base_path = tmp_path
+    created = []
+
+    from openhound.scheduler import service as scheduler_service
+
+    original_create = scheduler_service.create_support_bundle
+
+    def capture_bundle(*args):
+        bundle = original_create(*args)
+        created.append(bundle)
+        return bundle
+
+    monkeypatch.setattr(scheduler_service, "create_support_bundle", capture_bundle)
+    operation = ManagementOperation.model_validate(_support_bundle_operation())
+
+    mock_service._send_support_bundle(operation)
+
+    assert mock_bloodhound_api.app.state.operation_start_payload == {"id": operation.id}
+    assert mock_bloodhound_api.app.state.operation_end_payload == {
+        "id": operation.id,
+        "status": ManagementOperationStatus.SUCCEEDED.value,
+    }
+    assert mock_bloodhound_api.app.state.bundle_content
+    assert created and not created[0].exists()

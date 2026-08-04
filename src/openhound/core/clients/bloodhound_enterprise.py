@@ -2,6 +2,7 @@ import gzip
 import json
 import socket
 from enum import Enum
+from pathlib import Path
 
 from openhound.core.clients.bloodhound import BloodHound
 from openhound.core.clients.models.jobs import (
@@ -9,6 +10,9 @@ from openhound.core.clients.models.jobs import (
     JobsCurrent,
     JobsEnd,
     JobStart,
+    ManagementAvailable,
+    ManagementOperationResult,
+    ManagementOperationStatus,
 )
 
 
@@ -53,6 +57,40 @@ class BloodHoundEnterprise(BloodHound):
         self.request(
             method="POST", path=path, body=compressed_data, extra_headers=headers
         )
+
+    @property
+    def management_available(self) -> ManagementAvailable:
+        response = self.request(
+            method="GET", path="/api/v2/clients/management/available"
+        )
+        return ManagementAvailable.model_validate(response.json())
+
+    def start_operation(self, operation_id: str) -> ManagementOperationResult:
+        response = self.request(
+            method="POST",
+            path="/api/v2/clients/management/start",
+            body=json.dumps({"id": operation_id}).encode(),
+        )
+        return ManagementOperationResult.model_validate(response.json())
+
+    def end_operation(
+        self, operation_id: str, status: ManagementOperationStatus
+    ) -> ManagementOperationResult:
+        response = self.request(
+            method="POST",
+            path="/api/v2/clients/management/end",
+            body=json.dumps({"id": operation_id, "status": status}).encode(),
+        )
+        return ManagementOperationResult.model_validate(response.json())
+
+    def upload_support_bundle(self, bundle_path: Path) -> None:
+        with bundle_path.open("rb") as bundle:
+            self.request(
+                method="POST",
+                path="/api/v2/clients/management/artifacts",
+                body=bundle.read(),
+                extra_headers={"Content-Type": "application/zip"},
+            )
 
     def update_client_metadata(self) -> None:
         path = "/api/v2/clients/update"
