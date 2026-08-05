@@ -1,24 +1,41 @@
 import gzip
+import hashlib
 import json
+import logging
+import math
 import socket
+import time
 from enum import Enum
 from pathlib import Path
+from typing import Callable, TypeVar
 
-from openhound.core.clients.bloodhound import BloodHound
+import openhound
+import requests
+from openhound.core.clients.bloodhound import BloodHound, BloodHoundHTTPError
 from openhound.core.clients.models.jobs import (
     JobsAvailable,
     JobsCurrent,
     JobsEnd,
     JobStart,
+    ArtifactUploadSession,
     ManagementAvailable,
     ManagementOperationResult,
     ManagementOperationStatus,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class JobStatus(str, Enum):
     COMPLETE = "complete"
     FAILED = "failed"
+
+
+SUPPORT_BUNDLE_PART_SIZE = 5 * 1024 * 1024
+SUPPORT_BUNDLE_MAX_RETRIES = 3
+SUPPORT_BUNDLE_RETRY_DELAY_SECONDS = 2
+
+T = TypeVar("T")
 
 
 class BloodHoundEnterprise(BloodHound):
@@ -66,31 +83,145 @@ class BloodHoundEnterprise(BloodHound):
         return ManagementAvailable.model_validate(response.json())
 
     def start_operation(self, operation_id: str) -> ManagementOperationResult:
-        response = self.request(
-            method="POST",
-            path="/api/v2/clients/management/start",
-            body=json.dumps({"id": operation_id}).encode(),
+        response = self._retry_support_bundle_request(
+            "start management operation",
+            lambda: self.request(
+                method="POST",
+                path="/api/v2/clients/management/start",
+                body=json.dumps({"operation_id": operation_id}).encode(),
+            ),
         )
         return ManagementOperationResult.model_validate(response.json())
 
     def end_operation(
         self, operation_id: str, status: ManagementOperationStatus
     ) -> ManagementOperationResult:
-        response = self.request(
-            method="POST",
-            path="/api/v2/clients/management/end",
-            body=json.dumps({"id": operation_id, "status": status}).encode(),
+        response = self._retry_support_bundle_request(
+            "end management operation",
+            lambda: self.request(
+                method="POST",
+                path="/api/v2/clients/management/end",
+                body=json.dumps(
+                    {"operation_id": operation_id, "status": status}
+                ).encode(),
+            ),
         )
         return ManagementOperationResult.model_validate(response.json())
 
-    def upload_support_bundle(self, bundle_path: Path) -> None:
-        with bundle_path.open("rb") as bundle:
-            self.request(
+    def create_artifact_upload(
+        self, operation_id: str, bundle_path: Path
+    ) -> ArtifactUploadSession:
+        total_size = bundle_path.stat().st_size
+        if total_size <= 0:
+            raise ValueError("Support bundle must not be empty.")
+
+        part_size = min(SUPPORT_BUNDLE_PART_SIZE, total_size)
+        checksum = self._file_checksum(bundle_path)
+        response = self._retry_support_bundle_request(
+            "create support bundle upload",
+            lambda: self.request(
                 method="POST",
                 path="/api/v2/clients/management/artifacts",
-                body=bundle.read(),
-                extra_headers={"Content-Type": "application/zip"},
-            )
+                body=json.dumps(
+                    {
+                        "operation_id": operation_id,
+                        "artifact_type": "support_bundle",
+                        "total_size": total_size,
+                        "part_size": part_size,
+                        "part_count": math.ceil(total_size / part_size),
+                        "content_type": "application/zip",
+                        "checksum_algorithm": "sha256",
+                        "checksum": checksum,
+                    }
+                ).encode(),
+            ),
+        )
+        return ArtifactUploadSession.model_validate(response.json())
+
+    def upload_artifact_part(
+        self, artifact_id: str, part_number: int, content: bytes
+    ) -> None:
+        checksum = hashlib.sha256(content).hexdigest()
+        self._retry_support_bundle_request(
+            f"upload support bundle part {part_number}",
+            lambda: self.request(
+                method="POST",
+                path=f"/api/v2/clients/management/artifacts/{artifact_id}/parts/{part_number}",
+                body=content,
+                extra_headers={
+                    "Content-Length": str(len(content)),
+                    "Content-Type": "application/zip",
+                    "Content-Digest": checksum,
+                },
+            ),
+        )
+
+    def complete_artifact_upload(self, artifact_id: str, operation_id: str) -> None:
+        self._retry_support_bundle_request(
+            "complete support bundle upload",
+            lambda: self.request(
+                method="POST",
+                path=f"/api/v2/clients/management/artifacts/{artifact_id}/complete",
+                body=json.dumps({"operation_id": operation_id}).encode(),
+            ),
+        )
+
+    def upload_support_bundle(self, operation_id: str, bundle_path: Path) -> None:
+        """Create an upload session, transfer every ZIP part, then complete it."""
+        session = self.create_artifact_upload(operation_id, bundle_path)
+        with bundle_path.open("rb") as bundle:
+            for part_number in range(1, session.part_count + 1):
+                part = bundle.read(session.part_size)
+                if not part:
+                    raise ValueError(f"Support bundle ended before part {part_number}.")
+                self.upload_artifact_part(session.id, part_number, part)
+            if bundle.read(1):
+                raise ValueError("Support bundle grew while it was being uploaded.")
+        self.complete_artifact_upload(session.id, operation_id)
+
+    @staticmethod
+    def _file_checksum(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as bundle:
+            for chunk in iter(lambda: bundle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _is_transient_support_bundle_error(error: Exception) -> bool:
+        if isinstance(error, requests.RequestException):
+            return True
+        return isinstance(error, BloodHoundHTTPError) and error.code in {
+            408,
+            429,
+            500,
+            502,
+            503,
+            504,
+        }
+
+    def _retry_support_bundle_request(
+        self, description: str, request: Callable[[], T]
+    ) -> T:
+        for retry in range(SUPPORT_BUNDLE_MAX_RETRIES + 1):
+            try:
+                return request()
+            except Exception as error:
+                if not self._is_transient_support_bundle_error(error):
+                    raise
+                if retry == SUPPORT_BUNDLE_MAX_RETRIES:
+                    raise
+                logger.warning(
+                    "%s failed transiently; retrying in %s seconds (%s/%s).",
+                    description,
+                    SUPPORT_BUNDLE_RETRY_DELAY_SECONDS,
+                    retry + 1,
+                    SUPPORT_BUNDLE_MAX_RETRIES,
+                    exc_info=True,
+                )
+                time.sleep(SUPPORT_BUNDLE_RETRY_DELAY_SECONDS)
+
+        raise AssertionError("Support bundle retry loop exited unexpectedly.")
 
     def update_client_metadata(self) -> None:
         path = "/api/v2/clients/update"

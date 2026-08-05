@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
 
 from openhound.core.clients import bloodhound, bloodhound_enterprise
+from openhound.core.clients.bloodhound import BloodHoundHTTPError
 from openhound.core.clients.bloodhound_enterprise import JobStatus
 from openhound.core.clients.models.jobs import (
     ManagementOperation,
@@ -55,6 +56,9 @@ def mock_bloodhound_api():
     app.state.operation_start_payload = None
     app.state.operation_end_payload = None
     app.state.bundle_content = None
+    app.state.artifact_create_payload = None
+    app.state.uploaded_parts = []
+    app.state.artifact_completed = False
     app.state.ingested_nodes = 0
 
     @app.get("/api/v2/jobs/available")
@@ -101,18 +105,66 @@ def mock_bloodhound_api():
     async def start_operation(body: dict):
         app.state.operation_started = True
         app.state.operation_start_payload = body
-        return {"data": {**body, "type": "support_bundle", "status": "running", "created_at": "2026-01-01T00:00:00Z"}}
+        return {
+            "data": {
+                "id": body["operation_id"],
+                "client_id": "client-123",
+                "artifact_id": None,
+                "type": "support_bundle",
+                "status": "running",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        }
 
     @app.post("/api/v2/clients/management/artifacts")
-    async def upload_artifact(request: Request):
-        app.state.bundle_content = await request.body()
-        return Response(status_code=202)
+    async def create_artifact_upload(body: dict):
+        app.state.artifact_create_payload = body
+        return {
+            "id": "artifact-123",
+            "storage_key": "client-123/support_bundle/artifact-123.zip",
+            "content_type": body["content_type"],
+            "status": "pending",
+            "total_size": body["total_size"],
+            "part_size": body["part_size"],
+            "part_count": body["part_count"],
+            "checksum_algorithm": body["checksum_algorithm"],
+            "checksum": body["checksum"],
+            "uploaded_parts": [],
+            "missing_parts": list(range(1, body["part_count"] + 1)),
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "expires_at": None,
+            "completed_at": None,
+        }
+
+    @app.post("/api/v2/clients/management/artifacts/{artifact_id}/parts/{part_number}")
+    async def upload_artifact_part(
+        artifact_id: str, part_number: int, request: Request
+    ):
+        app.state.uploaded_parts.append(
+            (artifact_id, part_number, await request.body())
+        )
+        return Response(status_code=200)
+
+    @app.post("/api/v2/clients/management/artifacts/{artifact_id}/complete")
+    async def complete_artifact_upload(artifact_id: str, body: dict):
+        app.state.artifact_completed = body["operation_id"] is not None
+        return Response(status_code=200)
 
     @app.post("/api/v2/clients/management/end")
     async def end_operation(body: dict):
         app.state.operation_ended = True
         app.state.operation_end_payload = body
-        return {"data": {**body, "type": "support_bundle", "created_at": "2026-01-01T00:00:00Z"}}
+        return {
+            "data": {
+                "id": body["operation_id"],
+                "client_id": "client-123",
+                "artifact_id": "artifact-123",
+                "type": "support_bundle",
+                "status": body["status"],
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        }
 
     return TestClient(app)
 
@@ -437,6 +489,16 @@ def test_check_management_returns_support_bundle_operation(
     assert operation.type is ManagementOperationType.SUPPORT_BUNDLE
 
 
+def test_check_management_ignores_non_queued_operations(
+    mock_service, mock_bloodhound_api
+):
+    operation = _support_bundle_operation()
+    operation["status"] = ManagementOperationStatus.RUNNING.value
+    mock_bloodhound_api.app.state.management_operations = [operation]
+
+    assert mock_service.check_management() is None
+
+
 def test_poll_prioritizes_management_over_a_new_job(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
@@ -495,10 +557,120 @@ def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
 
     mock_service._send_support_bundle(operation)
 
-    assert mock_bloodhound_api.app.state.operation_start_payload == {"id": operation.id}
+    assert mock_bloodhound_api.app.state.operation_start_payload == {
+        "operation_id": operation.id
+    }
     assert mock_bloodhound_api.app.state.operation_end_payload == {
-        "id": operation.id,
+        "operation_id": operation.id,
         "status": ManagementOperationStatus.SUCCEEDED.value,
     }
-    assert mock_bloodhound_api.app.state.bundle_content
+    assert (
+        mock_bloodhound_api.app.state.artifact_create_payload["operation_id"]
+        == operation.id
+    )
+    assert mock_bloodhound_api.app.state.uploaded_parts
+    assert mock_bloodhound_api.app.state.artifact_completed is True
     assert created and not created[0].exists()
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "start_operation",
+        "create_support_bundle",
+        "create_artifact_upload",
+        "upload_artifact_part",
+        "complete_artifact_upload",
+        "end_succeeded",
+    ],
+)
+def test_send_support_bundle_marks_operation_failed_for_each_lifecycle_failure(
+    mock_service, mock_bloodhound_api, monkeypatch, caplog, failure_point
+):
+    operation = ManagementOperation.model_validate(_support_bundle_operation())
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"{failure_point} failed")
+
+    if failure_point == "create_support_bundle":
+        monkeypatch.setattr(scheduler_service, "create_support_bundle", fail)
+    elif failure_point == "end_succeeded":
+        original_end_operation = mock_service.client.end_operation
+
+        def fail_succeeded_end(operation_id, status):
+            if status is ManagementOperationStatus.SUCCEEDED:
+                fail()
+            return original_end_operation(operation_id, status)
+
+        monkeypatch.setattr(mock_service.client, "end_operation", fail_succeeded_end)
+    else:
+        monkeypatch.setattr(mock_service.client, failure_point, fail)
+
+    with pytest.raises(RuntimeError, match=f"{failure_point} failed"):
+        mock_service._send_support_bundle(operation)
+
+    assert mock_bloodhound_api.app.state.operation_end_payload == {
+        "operation_id": operation.id,
+        "status": ManagementOperationStatus.FAILED.value,
+    }
+    assert "Support bundle operation" in caplog.text
+
+
+def test_send_support_bundle_retries_transient_part_upload_failure(
+    mock_service, monkeypatch, tmp_path
+):
+    log = tmp_path / "openhound.log"
+    log.write_text("support log")
+    mock_service.log_base_path = tmp_path
+    operation = ManagementOperation.model_validate(_support_bundle_operation())
+    original_request = mock_service.client.request
+    attempts = 0
+    delays = []
+
+    def flaky_request(method, path, **kwargs):
+        nonlocal attempts
+        if "/parts/" in path:
+            attempts += 1
+            if attempts < 3:
+                raise BloodHoundHTTPError("temporary failure", 503)
+        return original_request(method, path, **kwargs)
+
+    monkeypatch.setattr(mock_service.client, "request", flaky_request)
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    mock_service._send_support_bundle(operation)
+
+    assert attempts == 3
+    assert delays == [2, 2]
+
+
+def test_send_support_bundle_fails_after_transient_retries_are_exhausted(
+    mock_service, mock_bloodhound_api, monkeypatch, tmp_path
+):
+    log = tmp_path / "openhound.log"
+    log.write_text("support log")
+    mock_service.log_base_path = tmp_path
+    operation = ManagementOperation.model_validate(_support_bundle_operation())
+    original_request = mock_service.client.request
+    attempts = 0
+    delays = []
+
+    def unavailable_part_upload(method, path, **kwargs):
+        nonlocal attempts
+        if "/parts/" in path:
+            attempts += 1
+            raise BloodHoundHTTPError("temporarily unavailable", 503)
+        return original_request(method, path, **kwargs)
+
+    monkeypatch.setattr(mock_service.client, "request", unavailable_part_upload)
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    with pytest.raises(BloodHoundHTTPError):
+        mock_service._send_support_bundle(operation)
+
+    assert attempts == 4
+    assert delays == [2, 2, 2]
+    assert mock_bloodhound_api.app.state.operation_end_payload == {
+        "operation_id": operation.id,
+        "status": ManagementOperationStatus.FAILED.value,
+    }

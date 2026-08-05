@@ -150,20 +150,23 @@ class Service:
         """Return the first pending support-bundle operation, if any."""
         logger.info("Checking for management operations in BloodHound Enterprise.")
         for operation in self.client.management_available.data:
-            if operation.type is ManagementOperationType.SUPPORT_BUNDLE:
+            if (
+                operation.type is ManagementOperationType.SUPPORT_BUNDLE
+                and operation.status is ManagementOperationStatus.QUEUED
+            ):
                 return operation
         return None
 
     def _send_support_bundle(self, operation: ManagementOperation) -> None:
         """Claim, upload, and complete a support-bundle operation."""
-        self.client.start_operation(operation.id)
         bundle_path: Path | None = None
         try:
+            self.client.start_operation(operation.id)
             bundle_path = create_support_bundle(self.collector_name, self.log_base_path)
-            self.client.upload_support_bundle(bundle_path)
+            self.client.upload_support_bundle(operation.id, bundle_path)
             self.client.end_operation(operation.id, ManagementOperationStatus.SUCCEEDED)
         except Exception:
-            logger.exception("Support bundle upload failed for operation %s.", operation.id)
+            logger.exception("Support bundle operation %s failed.", operation.id)
             try:
                 self.client.end_operation(operation.id, ManagementOperationStatus.FAILED)
             except Exception:
@@ -171,7 +174,12 @@ class Service:
             raise
         finally:
             if bundle_path is not None:
-                bundle_path.unlink(missing_ok=True)
+                try:
+                    bundle_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.exception(
+                        "Unable to remove support bundle for operation %s.", operation.id
+                    )
 
     def _start_job(self, job: Job) -> None:
         """Starts a BloodHound enterprise job by ID and runs the collection process in a subprocess. The results are then used to end the job in BHE with a complete status.

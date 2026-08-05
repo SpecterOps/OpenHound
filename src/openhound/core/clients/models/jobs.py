@@ -67,9 +67,12 @@ class ManagementOperationStatus(StrEnum):
 
 class ManagementOperation(BaseModel):
     id: str
+    client_id: str
+    artifact_id: str | None = None
     type: ManagementOperationType
     status: ManagementOperationStatus
     created_at: datetime
+    updated_at: datetime | None = None
     requested_by_user_id: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -82,3 +85,31 @@ class ManagementAvailable(BaseModel):
 
 class ManagementOperationResult(BaseModel):
     data: ManagementOperation
+
+
+class ArtifactPart(BaseModel):
+    part_number: int
+    size: int
+    checksum: str
+    offset_start: int
+    storage_key: str
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class ArtifactUploadSession(BaseModel):
+    id: str
+    storage_key: str
+    content_type: str
+    status: str
+    total_size: int
+    part_size: int
+    part_count: int
+    checksum_algorithm: str
+    checksum: str
+    uploaded_parts: list[ArtifactPart] = []
+    missing_parts: list[int] = []
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime | None = None
+    completed_at: datetime | None = None

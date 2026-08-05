@@ -2,6 +2,8 @@
   "data": [
     {
       "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "client_id": "client-123",
+      "artifact_id": null,
       "type": "support_bundle",
       "status": "queued",
       "created_at": "2026-01-01T00:00:00Z"
