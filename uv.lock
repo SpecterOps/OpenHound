@@ -1327,12 +1327,12 @@ requires-dist = [
     { name = "griffe-fieldz", specifier = ">=0.5.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "mkdocstrings", extras = ["python"], specifier = ">=1.0.0" },
-    { name = "openhound-github", marker = "extra == 'all'", specifier = "==0.4.0" },
-    { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.4.0" },
-    { name = "openhound-jamf", marker = "extra == 'all'", specifier = "==0.2.3" },
-    { name = "openhound-jamf", marker = "extra == 'jamf'", specifier = "==0.2.3" },
-    { name = "openhound-okta", marker = "extra == 'all'", specifier = "==0.2.1" },
-    { name = "openhound-okta", marker = "extra == 'okta'", specifier = "==0.2.1" },
+    { name = "openhound-github", marker = "extra == 'all'", specifier = "==0.5.0" },
+    { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.5.0" },
+    { name = "openhound-jamf", marker = "extra == 'all'", specifier = "==0.3.0" },
+    { name = "openhound-jamf", marker = "extra == 'jamf'", specifier = "==0.3.0" },
+    { name = "openhound-okta", marker = "extra == 'all'", specifier = "==0.2.4" },
+    { name = "openhound-okta", marker = "extra == 'okta'", specifier = "==0.2.4" },
     { name = "psutil", specifier = ">=7.2.1" },
     { name = "pydantic", specifier = "==2.13.3" },
     { name = "pydantic-extra-types", specifier = ">=2.11.1" },
@@ -1373,38 +1373,38 @@ wheels = [
 
 [[package]]
 name = "openhound-github"
-version = "0.4.0"
+version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "joserfc" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5a/f4/ff29e41b1a7962eb45e722eb642dceae26de4e5e89fd7754f799d23fdc03/openhound_github-0.4.0.tar.gz", hash = "sha256:92bb0faed6918cb2418573686f037a8416ec6c2a9183b46dd57224b924b29407", size = 3597035, upload-time = "2026-08-04T17:41:19.628Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/5e/2f7a7ccd24eabe6eb462a9a271f3c54ad76ff2bdf0c9bba401e374ab213f/openhound_github-0.5.0.tar.gz", hash = "sha256:7fc91c26fa01cac0c5fef7b0726f182e7bd8e14777ac1e7e0071365a404eee90", size = 3605950, upload-time = "2026-08-11T17:30:30.434Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2a/06/5fbb535705ecd9722fa0eee37abef62a7d2e11299d9bd8147cfe8be75f1b/openhound_github-0.4.0-py3-none-any.whl", hash = "sha256:6e9d724aaea26e9f12a13d5a2cc1f78161e7ae886ab39d62464c183812c35682", size = 136486, upload-time = "2026-08-04T17:41:17.921Z" },
+    { url = "https://files.pythonhosted.org/packages/00/01/fb85f95484a9d85ba4754f792878376d78df3f6ead2a7313a9ce1d1e6940/openhound_github-0.5.0-py3-none-any.whl", hash = "sha256:8798c602a8a57a48e645ea25c44fd4c4460120c4f047f69e6c0a739c0e44b662", size = 139962, upload-time = "2026-08-11T17:30:28.837Z" },
 ]
 
 [[package]]
 name = "openhound-jamf"
-version = "0.2.3"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/b3/fe/8eb116995c48dbb27cc48780b172c15a4c7d344cdac871c35a30074af7a1/openhound_jamf-0.2.3.tar.gz", hash = "sha256:e549a9ac49eaa56a4d83fda105b056b291cb9017da4c852c3788d629ece66211", size = 3487290, upload-time = "2026-06-29T19:37:16.568Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/dd/81/ed62844fbabe20a464dc220ba953e137cab8306c6e352581ac8b92f2ed97/openhound_jamf-0.3.0.tar.gz", hash = "sha256:3b6ef9b7db4f33603f1816c84cea94349474aa445d616564dd6cec13b15ac347", size = 3488138, upload-time = "2026-08-07T22:20:50.08Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a1/0f/a8a18b925e965127543eca5afb1dbdd6d2bea39e1d88010f5d79e8d77df3/openhound_jamf-0.2.3-py3-none-any.whl", hash = "sha256:8483b92de0a8faa0d70fd6cdb9f33cc139fecfe585cfce01e97d4c1d94072b46", size = 32892, upload-time = "2026-06-29T19:37:15.276Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/f6/850d1406f270a92a5007bb30f802a3a69e833eeb72580079c83633e78764/openhound_jamf-0.3.0-py3-none-any.whl", hash = "sha256:792267655615d5f2f62aa28f16bbc8374d7aeca0a852ab9d8d16ed4537f20d4f", size = 32904, upload-time = "2026-08-07T22:20:48.701Z" },
 ]
 
 [[package]]
 name = "openhound-okta"
-version = "0.2.1"
+version = "0.2.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "defusedxml" },
     { name = "joserfc" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/99/88/14dc7a4ac1cfbab4b1ae1303a0341c3d024c0236e679aa7b1cfe7f676152/openhound_okta-0.2.1.tar.gz", hash = "sha256:968ae6ed6b43e64a29baa6fe20042c9bdfa83ee18cd05747d23388c4b59afffa", size = 3588481, upload-time = "2026-08-04T18:37:58.58Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e1/a0/891ef30e1608b4adcbe88a7aa3382a7e3ecb19aedc4864d3bd1f9add8b0b/openhound_okta-0.2.4.tar.gz", hash = "sha256:d5bc74bc08aa91e1d0cb7d5a8efd740665a7830c3a3d10355be186aa5be2430e", size = 3597654, upload-time = "2026-08-11T19:15:14.041Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ec/b3/a9c330e588a3f50a536bc6beda5dac02d687870e4905b24843a8226b49c9/openhound_okta-0.2.1-py3-none-any.whl", hash = "sha256:893deb64691102f67e8bec791b8cc80493367bcc5ab943c4248d404baa6f5827", size = 101179, upload-time = "2026-08-04T18:37:57.175Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/b8/34e6c6763645861f42768c3f8cae7e583628251904ced2a403b08aa9ff0e/openhound_okta-0.2.4-py3-none-any.whl", hash = "sha256:5b49c89cf14efb4aeafb63d88aaf44349c555271a665d559ca350053a4c3fd2b", size = 104866, upload-time = "2026-08-11T19:15:12.172Z" },
 ]
 
 [[package]]
@@ -1882,7 +1882,7 @@ name = "pyzmq"
 version = "27.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "python_full_version < '3.15' and implementation_name == 'pypy'" },
+    { name = "cffi", marker = "implementation_name == 'pypy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/04/0b/3c9baedbdf613ecaa7aa07027780b8867f57b6293b6ee50de316c9f3222b/pyzmq-27.1.0.tar.gz", hash = "sha256:ac0765e3d44455adb6ddbf4417dcce460fc40a05978c08efdf2948072f6db540", size = 281750, upload-time = "2025-09-08T23:10:18.157Z" }
 wheels = [
