@@ -5,7 +5,7 @@ _BHE_PACKAGE_VERSION = re.compile(
     r"\.(?P<minor>0|[1-9]\d*)"
     r"\.(?P<patch>0|[1-9]\d*)"
     r"(?:rc(?P<rc>0|[1-9]\d*))?"
-    r"(?:\.dev(?P<dev>0|[1-9]\d*))?$"
+    r"(?:\.?dev(?P<dev>0|[1-9]\d*))?$"
 )
 
 
@@ -20,7 +20,8 @@ def render_bhe_version(package_version: str) -> str:
         raise UnsupportedBHEVersion(
             "OpenHound package version "
             f"{package_version!r} cannot be reported to BloodHound Enterprise; "
-            "supported forms are MAJOR.MINOR.PATCH[rcN][.devN]"
+            "supported forms are MAJOR.MINOR.PATCH[rcN], optionally followed "
+            "by devN or .devN"
         )
 
     release = f"v{match.group('major')}.{match.group('minor')}.{match.group('patch')}"
