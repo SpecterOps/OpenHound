@@ -11,8 +11,8 @@ from dlt.common import json
 from dlt.common.exceptions import DltException
 
 import openhound
-from .bhe_version import render_bhe_version
 
+from .bhe_version import render_bhe_version
 from .models import (
     AssetGroupsTags,
     CustomNodes,
@@ -199,8 +199,6 @@ class BloodHoundJWT(BloodHoundClient):
     def __init__(self, token: str, base_uri: str = "http://localhost:8000"):
         super().__init__(base_uri=base_uri)
         self.token = token
-        self.bhe_version = render_bhe_version(openhound.__version__)
-        self.user_agent = f"openhound/{self.bhe_version}"
 
     def request(
         self,

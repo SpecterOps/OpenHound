@@ -129,7 +129,9 @@ def mock_service(mock_bloodhound_api, monkeypatch):
 
 
 def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeypatch):
-    monkeypatch.setattr(bloodhound_enterprise.socket, "gethostname", lambda: "test-host")
+    monkeypatch.setattr(
+        bloodhound_enterprise.socket, "gethostname", lambda: "test-host"
+    )
     monkeypatch.setattr(
         bloodhound_enterprise.socket,
         "gethostbyname",
@@ -165,7 +167,9 @@ def test_client_update_uses_unknown_when_hostname_lookup_fails(
 def test_client_update_uses_unknown_when_ip_lookup_fails(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
-    monkeypatch.setattr(bloodhound_enterprise.socket, "gethostname", lambda: "test-host")
+    monkeypatch.setattr(
+        bloodhound_enterprise.socket, "gethostname", lambda: "test-host"
+    )
 
     def raise_error(hostname: str):
         raise OSError(f"{hostname} unavailable")
