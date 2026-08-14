@@ -20,15 +20,12 @@ def render_bhe_version(package_version: str) -> str:
         raise UnsupportedBHEVersion(
             "OpenHound package version "
             f"{package_version!r} cannot be reported to BloodHound Enterprise; "
-            "supported forms are MAJOR.MINOR.PATCH[rcN], optionally followed "
-            "by devN or .devN"
+            "supported forms are MAJOR.MINOR.PATCH[rcN]"
         )
 
     release = f"v{match.group('major')}.{match.group('minor')}.{match.group('patch')}"
     prerelease = []
     if (rc := match.group("rc")) is not None:
         prerelease.append(f"rc{rc}")
-    if (dev := match.group("dev")) is not None:
-        prerelease.append(f"dev{dev}")
 
     return f"{release}-{'.'.join(prerelease)}" if prerelease else release
