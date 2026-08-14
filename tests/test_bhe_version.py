@@ -15,6 +15,7 @@ from openhound.core.clients.bloodhound import BloodHound, BloodHoundJWT
     [
         ("0.3.0", "v0.3.0"),
         ("0.3.0rc1", "v0.3.0-rc1"),
+        ("0.3.0.rc1", "v0.3.0-rc1"),
         ("0.3.0dev1", "v0.3.0-dev1"),
         ("0.3.0.dev0", "v0.3.0-dev0"),
         ("0.3.0rc2.dev3", "v0.3.0-rc2.dev3"),

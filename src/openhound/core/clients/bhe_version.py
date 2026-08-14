@@ -4,7 +4,7 @@ _BHE_PACKAGE_VERSION = re.compile(
     r"^(?P<major>0|[1-9]\d*)"
     r"\.(?P<minor>0|[1-9]\d*)"
     r"\.(?P<patch>0|[1-9]\d*)"
-    r"(?:rc(?P<rc>0|[1-9]\d*))?"
+    r"(?:\.?rc(?P<rc>0|[1-9]\d*))?"
     r"(?:\.?dev(?P<dev>0|[1-9]\d*))?$"
 )
 
