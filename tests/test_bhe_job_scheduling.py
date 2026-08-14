@@ -9,7 +9,7 @@ import pytest
 from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
 
-from openhound.core.clients import bloodhound_enterprise
+from openhound.core.clients import bloodhound, bloodhound_enterprise
 from openhound.core.clients.bloodhound_enterprise import JobStatus
 from openhound.core.models.graph import Graph
 from openhound.scheduler import service as scheduler_service
@@ -86,6 +86,7 @@ def mock_bloodhound_api():
 
 @pytest.fixture
 def mock_service(mock_bloodhound_api, monkeypatch):
+    monkeypatch.setattr(bloodhound.openhound, "__version__", "0.3.0rc1")
     """Patches requests.requests so that our mocked BloodHound API will be used for testing the service.
 
     Args:
@@ -128,8 +129,9 @@ def mock_service(mock_bloodhound_api, monkeypatch):
 
 
 def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeypatch):
-    monkeypatch.setattr(bloodhound_enterprise.openhound, "__version__", "1.2.3")
-    monkeypatch.setattr(bloodhound_enterprise.socket, "gethostname", lambda: "test-host")
+    monkeypatch.setattr(
+        bloodhound_enterprise.socket, "gethostname", lambda: "test-host"
+    )
     monkeypatch.setattr(
         bloodhound_enterprise.socket,
         "gethostbyname",
@@ -141,15 +143,13 @@ def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeyp
     assert mock_bloodhound_api.app.state.client_update_payload == {
         "Address": "192.0.2.10",
         "Hostname": "test-host",
-        "Version": "1.2.3",
+        "Version": "v0.3.0-rc1",
     }
 
 
 def test_client_update_uses_unknown_when_hostname_lookup_fails(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
-    monkeypatch.setattr(bloodhound_enterprise.openhound, "__version__", "1.2.3")
-
     def raise_error():
         raise OSError("hostname unavailable")
 
@@ -160,15 +160,16 @@ def test_client_update_uses_unknown_when_hostname_lookup_fails(
     assert mock_bloodhound_api.app.state.client_update_payload == {
         "Address": "unknown",
         "Hostname": "unknown",
-        "Version": "1.2.3",
+        "Version": "v0.3.0-rc1",
     }
 
 
 def test_client_update_uses_unknown_when_ip_lookup_fails(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
-    monkeypatch.setattr(bloodhound_enterprise.openhound, "__version__", "1.2.3")
-    monkeypatch.setattr(bloodhound_enterprise.socket, "gethostname", lambda: "test-host")
+    monkeypatch.setattr(
+        bloodhound_enterprise.socket, "gethostname", lambda: "test-host"
+    )
 
     def raise_error(hostname: str):
         raise OSError(f"{hostname} unavailable")
@@ -180,7 +181,7 @@ def test_client_update_uses_unknown_when_ip_lookup_fails(
     assert mock_bloodhound_api.app.state.client_update_payload == {
         "Address": "unknown",
         "Hostname": "test-host",
-        "Version": "1.2.3",
+        "Version": "v0.3.0-rc1",
     }
 
 

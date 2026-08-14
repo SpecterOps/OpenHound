@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up python
         uses: actions/setup-python@v5
@@ -55,6 +57,10 @@ jobs:
       - name: Run extension validation tests
         run: |
           .venv/bin/pytest tests/test_extensions_format.py -v
+
+      - name: Run BHE version boundary tests
+        run: |
+          .venv/bin/pytest tests/test_bhe_version.py -v
 
       - name: Run BHE job scheduling test
         run: |
