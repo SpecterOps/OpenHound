@@ -3,7 +3,6 @@ import json
 import socket
 from enum import Enum
 
-import openhound
 from openhound.core.clients.bloodhound import BloodHound
 from openhound.core.clients.models.jobs import (
     JobsAvailable,
@@ -73,7 +72,7 @@ class BloodHoundEnterprise(BloodHound):
         payload = {
             "Address": ip_address,
             "Hostname": hostname,
-            "Version": openhound.__version__,
+            "Version": self.bhe_version,
         }
         body = json.dumps(payload)
 

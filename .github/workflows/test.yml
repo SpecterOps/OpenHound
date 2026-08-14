@@ -56,6 +56,10 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_extensions_format.py -v
 
+      - name: Run BHE version boundary tests
+        run: |
+          .venv/bin/pytest tests/test_bhe_version.py -v
+
       - name: Run BHE job scheduling test
         run: |
           .venv/bin/pytest tests/test_bhe_job_scheduling.py -v

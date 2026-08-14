@@ -11,6 +11,7 @@ from dlt.common import json
 from dlt.common.exceptions import DltException
 
 import openhound
+from .bhe_version import render_bhe_version
 
 from .models import (
     AssetGroupsTags,
@@ -36,6 +37,8 @@ class BloodHoundHTTPError(DltException):
 class BloodHoundClient(ABC):
     def __init__(self, base_uri: str = "http://localhost:8000"):
         self.base_uri = base_uri
+        self.bhe_version = render_bhe_version(openhound.__version__)
+        self.user_agent = f"openhound/{self.bhe_version}"
 
     @abstractmethod
     def request(
@@ -177,7 +180,7 @@ class BloodHound(BloodHoundClient):
 
         sig = base64.b64encode(digester.digest()).decode()
         headers = {
-            "User-Agent": f"openhound/{openhound.__version__}",
+            "User-Agent": self.user_agent,
             "Authorization": f"bhesignature {self.token_id}",
             "RequestDate": datetime_formatted,
             "Signature": sig,
@@ -196,6 +199,8 @@ class BloodHoundJWT(BloodHoundClient):
     def __init__(self, token: str, base_uri: str = "http://localhost:8000"):
         super().__init__(base_uri=base_uri)
         self.token = token
+        self.bhe_version = render_bhe_version(openhound.__version__)
+        self.user_agent = f"openhound/{self.bhe_version}"
 
     def request(
         self,
@@ -205,7 +210,7 @@ class BloodHoundJWT(BloodHoundClient):
         extra_headers: dict[str, str] | None = None,
     ):
         headers = {
-            "User-Agent": f"openhound/{openhound.__version__}",
+            "User-Agent": self.user_agent,
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.token}",
         }
