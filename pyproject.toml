@@ -51,6 +51,11 @@ dotenv = [".env"]
 [tool.ruff]
 exclude = ["src/openhound/cookiecutter-templates/*"]
 
+[tool.ruff.lint.per-file-ignores]
+# Harness sets env vars / sys.path before its imports and uses broad guards
+# around DLT's trace/LoadInfo shapes.
+"benchmarks/*" = ["E402", "I001", "BLE001", "PERF102", "PLR1730", "RUF100"]
+
 [tool.mypy]
 exclude = ["src/openhound/cookiecutter-templates/*"]
 disable_error_code = ["import-untyped"]
