@@ -88,12 +88,25 @@ class NodeAndEdgeAsset(BaseAsset):
         return [_edge(self.idx)]
 
 
+def _single_edge_row(idx: int, epr: int) -> dict:
+    """Row builder for shapes that emit exactly one edge per row.
+
+    These shapes cannot vary the edge count, so reject any edges_per_row other
+    than 1 rather than silently discarding it.
+    """
+    if epr != 1:
+        raise ValueError(
+            f"edges_per_row={epr} is unsupported for single-edge shapes; use 1"
+        )
+    return {"idx": idx}
+
+
 # Maps a shape name to (asset model, row builder). The row builder returns the
 # raw dict that read_jsonl will feed back into the model.
 ASSET_SHAPES: dict[str, tuple[type[BaseAsset], object]] = {
-    "one_edge": (OneEdgeAsset, lambda idx, epr: {"idx": idx}),
+    "one_edge": (OneEdgeAsset, _single_edge_row),
     "multi_edge": (MultiEdgeAsset, lambda idx, epr: {"idx": idx, "n": epr}),
-    "node_and_edge": (NodeAndEdgeAsset, lambda idx, epr: {"idx": idx}),
+    "node_and_edge": (NodeAndEdgeAsset, _single_edge_row),
 }
 
 

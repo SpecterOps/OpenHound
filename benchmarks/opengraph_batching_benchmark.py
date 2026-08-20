@@ -44,6 +44,7 @@ class BenchConfig:
     baseline: bool
     keep_output: bool
     output_root: Path
+    owns_output_root: bool
     quiet: bool = False
 
 
@@ -102,6 +103,7 @@ def _parse_args(argv: list[str] | None = None) -> BenchConfig:
     if ns.files < 1:
         p.error("--files must be >= 1")
 
+    owns_output_root = ns.output_root is None
     root = ns.output_root or Path(
         __import__("tempfile").mkdtemp(prefix="openhound-bench-")
     )
@@ -114,6 +116,7 @@ def _parse_args(argv: list[str] | None = None) -> BenchConfig:
         baseline=ns.baseline,
         keep_output=ns.keep_output,
         output_root=root,
+        owns_output_root=owns_output_root,
         quiet=ns.quiet,
     )
 
@@ -175,7 +178,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     _print_report(cfg, metrics)
 
-    if not cfg.keep_output:
+    if not cfg.keep_output and cfg.owns_output_root:
         import shutil
 
         shutil.rmtree(cfg.output_root, ignore_errors=True)
