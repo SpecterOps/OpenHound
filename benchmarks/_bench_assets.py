@@ -85,7 +85,13 @@ class NodeAndEdgeAsset(BaseAsset):
 
     @property
     def edges(self):
-        return [_edge(self.idx)]
+        return [
+            Edge(
+                kind="BENCH_Relationship",
+                start=EdgePath(match_by="id", value=f"node-n{self.idx}"),
+                end=EdgePath(match_by="id", value=f"end-{self.idx}-0"),
+            )
+        ]
 
 
 def _single_edge_row(idx: int, epr: int) -> dict:

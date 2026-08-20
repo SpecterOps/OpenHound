@@ -163,25 +163,26 @@ def main(argv: list[str] | None = None) -> None:
     output_dir = cfg.output_root / "output"
     work_dir = cfg.output_root / "dlt_work"
 
-    table = write_synthetic_input(
-        input_dir, cfg.shape, cfg.rows, cfg.edges_per_row, cfg.files
-    )
+    try:
+        table = write_synthetic_input(
+            input_dir, cfg.shape, cfg.rows, cfg.edges_per_row, cfg.files
+        )
 
-    metrics = run_pipeline(
-        input_dir=input_dir,
-        output_dir=output_dir,
-        table=table,
-        shape=cfg.shape,
-        batch_size=cfg.batch_size,
-        lookup=_in_memory_lookup(),
-        work_dir=work_dir,
-    )
-    _print_report(cfg, metrics)
+        metrics = run_pipeline(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            table=table,
+            shape=cfg.shape,
+            batch_size=cfg.batch_size,
+            lookup=_in_memory_lookup(),
+            work_dir=work_dir,
+        )
+        _print_report(cfg, metrics)
+    finally:
+        if not cfg.keep_output and cfg.owns_output_root:
+            import shutil
 
-    if not cfg.keep_output and cfg.owns_output_root:
-        import shutil
-
-        shutil.rmtree(cfg.output_root, ignore_errors=True)
+            shutil.rmtree(cfg.output_root, ignore_errors=True)
 
 
 if __name__ == "__main__":
