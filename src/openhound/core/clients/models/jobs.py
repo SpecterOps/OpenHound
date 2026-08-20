@@ -97,19 +97,29 @@ class ArtifactPart(BaseModel):
     completed_at: datetime | None = None
 
 
+class ArtifactStatus(StrEnum):
+    PENDING = "pending"
+    UPLOADING = "uploading"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
 class ArtifactUploadSession(BaseModel):
-    id: str
+    """Response data from creating a management artifact upload session.
+
+    This models every field returned by
+    ``POST /api/v2/clients/management/artifacts``. The upload flow currently
+    needs only ``artifact_id``, ``part_size``, and ``part_count``, but callers
+    can use the remaining session and operation metadata without consulting
+    the API implementation.
+    """
+
+    artifact_id: str
+    client_id: str
     storage_key: str
-    content_type: str
-    status: str
-    total_size: int
+    status: ArtifactStatus
     part_size: int
     part_count: int
-    checksum_algorithm: str
-    checksum: str
-    uploaded_parts: list[ArtifactPart] = []
-    missing_parts: list[int] = []
-    created_at: datetime
-    updated_at: datetime
-    expires_at: datetime | None = None
-    completed_at: datetime | None = None
+    missing_parts: list[int]
+    management_operation: ManagementOperation

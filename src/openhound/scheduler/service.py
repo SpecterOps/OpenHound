@@ -164,7 +164,6 @@ class Service:
             self.client.start_operation(operation.id)
             bundle_path = create_support_bundle(self.collector_name, self.log_base_path)
             self.client.upload_support_bundle(operation.id, bundle_path)
-            self.client.end_operation(operation.id, ManagementOperationStatus.SUCCEEDED)
         except Exception:
             logger.exception("Support bundle operation %s failed.", operation.id)
             try:

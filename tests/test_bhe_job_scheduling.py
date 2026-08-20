@@ -1,4 +1,6 @@
+import base64
 import gzip
+import hashlib
 import json
 from concurrent.futures import Future
 from concurrent.futures.process import BrokenProcessPool
@@ -55,6 +57,7 @@ def mock_bloodhound_api():
     app.state.operation_ended = False
     app.state.operation_start_payload = None
     app.state.operation_end_payload = None
+    app.state.operation_completed_by_artifact_upload = False
     app.state.bundle_content = None
     app.state.artifact_create_payload = None
     app.state.uploaded_parts = []
@@ -120,36 +123,46 @@ def mock_bloodhound_api():
     async def create_artifact_upload(body: dict):
         app.state.artifact_create_payload = body
         return {
-            "id": "artifact-123",
-            "storage_key": "client-123/support_bundle/artifact-123.zip",
-            "content_type": body["content_type"],
-            "status": "pending",
-            "total_size": body["total_size"],
-            "part_size": body["part_size"],
-            "part_count": body["part_count"],
-            "checksum_algorithm": body["checksum_algorithm"],
-            "checksum": body["checksum"],
-            "uploaded_parts": [],
-            "missing_parts": list(range(1, body["part_count"] + 1)),
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z",
-            "expires_at": None,
-            "completed_at": None,
+            "data": {
+                "artifact_id": "artifact-123",
+                "client_id": "client-123",
+                "storage_key": "client-123--openhound-faker_support_bundle_2026-01-01_00-00-00.zip",
+                "status": "pending",
+                "part_size": body["part_size"],
+                "part_count": body["part_count"],
+                "missing_parts": list(range(1, body["part_count"] + 1)),
+                "management_operation": {
+                    "id": body["operation_id"],
+                    "client_id": "client-123",
+                    "artifact_id": "artifact-123",
+                    "type": "support_bundle",
+                    "status": "running",
+                    "requested_by_user_id": None,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "completed_at": None,
+                    "execution_time": "2026-01-01T00:00:00Z",
+                },
+            }
         }
 
     @app.post("/api/v2/clients/management/artifacts/{artifact_id}/parts/{part_number}")
     async def upload_artifact_part(
         artifact_id: str, part_number: int, request: Request
     ):
-        app.state.uploaded_parts.append(
-            (artifact_id, part_number, await request.body())
-        )
+        content = await request.body()
+        checksum = base64.b64encode(hashlib.sha256(content).digest()).decode("ascii")
+        assert request.headers["content-digest"] == f"sha-256=:{checksum}:"
+        app.state.uploaded_parts.append((artifact_id, part_number, content))
         return Response(status_code=200)
 
     @app.post("/api/v2/clients/management/artifacts/{artifact_id}/complete")
     async def complete_artifact_upload(artifact_id: str, body: dict):
         app.state.artifact_completed = body["operation_id"] is not None
-        return Response(status_code=200)
+        # BHE completes the associated management operation as part of this endpoint.
+        app.state.operation_completed_by_artifact_upload = True
+        return Response(status_code=204)
 
     @app.post("/api/v2/clients/management/end")
     async def end_operation(body: dict):
@@ -560,17 +573,32 @@ def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
     assert mock_bloodhound_api.app.state.operation_start_payload == {
         "operation_id": operation.id
     }
-    assert mock_bloodhound_api.app.state.operation_end_payload == {
-        "operation_id": operation.id,
-        "status": ManagementOperationStatus.SUCCEEDED.value,
-    }
     assert (
         mock_bloodhound_api.app.state.artifact_create_payload["operation_id"]
         == operation.id
     )
     assert mock_bloodhound_api.app.state.uploaded_parts
     assert mock_bloodhound_api.app.state.artifact_completed is True
+    assert mock_bloodhound_api.app.state.operation_completed_by_artifact_upload is True
+    assert mock_bloodhound_api.app.state.operation_end_payload is None
     assert created and not created[0].exists()
+
+
+def test_create_artifact_upload_preserves_entire_create_response(
+    mock_service, tmp_path
+):
+    bundle = tmp_path / "support-bundle.zip"
+    bundle.write_bytes(b"support bundle")
+
+    session = mock_service.client.create_artifact_upload("operation-123", bundle)
+
+    assert session.artifact_id == "artifact-123"
+    assert session.client_id == "client-123"
+    assert session.storage_key.endswith("support_bundle_2026-01-01_00-00-00.zip")
+    assert session.status == "pending"
+    assert session.missing_parts == [1]
+    assert session.management_operation.id == "operation-123"
+    assert session.management_operation.artifact_id == session.artifact_id
 
 
 @pytest.mark.parametrize(
@@ -581,7 +609,6 @@ def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
         "create_artifact_upload",
         "upload_artifact_part",
         "complete_artifact_upload",
-        "end_succeeded",
     ],
 )
 def test_send_support_bundle_marks_operation_failed_for_each_lifecycle_failure(
@@ -594,15 +621,6 @@ def test_send_support_bundle_marks_operation_failed_for_each_lifecycle_failure(
 
     if failure_point == "create_support_bundle":
         monkeypatch.setattr(scheduler_service, "create_support_bundle", fail)
-    elif failure_point == "end_succeeded":
-        original_end_operation = mock_service.client.end_operation
-
-        def fail_succeeded_end(operation_id, status):
-            if status is ManagementOperationStatus.SUCCEEDED:
-                fail()
-            return original_end_operation(operation_id, status)
-
-        monkeypatch.setattr(mock_service.client, "end_operation", fail_succeeded_end)
     else:
         monkeypatch.setattr(mock_service.client, failure_point, fail)
 

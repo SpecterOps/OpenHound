@@ -35,13 +35,13 @@ def create_support_bundle(collector_name: str, log_base_path: Path) -> Path:
     """Archive logs in a temporary ZIP; the caller must remove the returned file."""
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d-%H-%M-%S")
     bundle_path = (
-        Path(tempfile.mkdtemp())
-        / f"{collector_name}_support_bundle_{timestamp}.zip"
+        Path(tempfile.mkdtemp()) / f"{collector_name}_support_bundle_{timestamp}.zip"
     )
 
     with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for log_file in collect_log_files(log_base_path):
             archive.write(log_file, arcname=log_file.name)
 
+    logger.info("Support Bundle size: %s", bundle_path.stat().st_size)
     logger.info("Created support bundle at %s", bundle_path)
     return bundle_path

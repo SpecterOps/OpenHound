@@ -1,3 +1,4 @@
+import base64
 import gzip
 import hashlib
 import json
@@ -31,7 +32,7 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
-SUPPORT_BUNDLE_PART_SIZE = 5 * 1024 * 1024
+SUPPORT_BUNDLE_PART_SIZE = 8 * 1024 * 1024  # 8 MiB
 SUPPORT_BUNDLE_MAX_RETRIES = 3
 SUPPORT_BUNDLE_RETRY_DELAY_SECONDS = 2
 
@@ -112,10 +113,12 @@ class BloodHoundEnterprise(BloodHound):
         self, operation_id: str, bundle_path: Path
     ) -> ArtifactUploadSession:
         total_size = bundle_path.stat().st_size
+
+        logger.info("Total size of the support bundle: %s", total_size)
         if total_size <= 0:
             raise ValueError("Support bundle must not be empty.")
 
-        part_size = min(SUPPORT_BUNDLE_PART_SIZE, total_size)
+        part_size = SUPPORT_BUNDLE_PART_SIZE
         checksum = self._file_checksum(bundle_path)
         response = self._retry_support_bundle_request(
             "create support bundle upload",
@@ -136,12 +139,12 @@ class BloodHoundEnterprise(BloodHound):
                 ).encode(),
             ),
         )
-        return ArtifactUploadSession.model_validate(response.json())
+        return ArtifactUploadSession.model_validate(response.json()["data"])
 
     def upload_artifact_part(
         self, artifact_id: str, part_number: int, content: bytes
     ) -> None:
-        checksum = hashlib.sha256(content).hexdigest()
+        checksum = base64.b64encode(hashlib.sha256(content).digest()).decode("ascii")
         self._retry_support_bundle_request(
             f"upload support bundle part {part_number}",
             lambda: self.request(
@@ -151,7 +154,7 @@ class BloodHoundEnterprise(BloodHound):
                 extra_headers={
                     "Content-Length": str(len(content)),
                     "Content-Type": "application/zip",
-                    "Content-Digest": checksum,
+                    "Content-Digest": f"sha-256=:{checksum}:",
                 },
             ),
         )
@@ -174,10 +177,10 @@ class BloodHoundEnterprise(BloodHound):
                 part = bundle.read(session.part_size)
                 if not part:
                     raise ValueError(f"Support bundle ended before part {part_number}.")
-                self.upload_artifact_part(session.id, part_number, part)
+                self.upload_artifact_part(session.artifact_id, part_number, part)
             if bundle.read(1):
                 raise ValueError("Support bundle grew while it was being uploaded.")
-        self.complete_artifact_upload(session.id, operation_id)
+        self.complete_artifact_upload(session.artifact_id, operation_id)
 
     @staticmethod
     def _file_checksum(path: Path) -> str:
