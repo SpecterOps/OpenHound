@@ -6,7 +6,7 @@ from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 
-import openhound.core.logging  # noqa: F401
+import openhound.core.logging as openhound_logging
 from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
 from openhound.core.clients.models.jobs import (
     Job,
@@ -14,7 +14,6 @@ from openhound.core.clients.models.jobs import (
     ManagementOperationStatus,
     ManagementOperationType,
 )
-from openhound.core.logging import CustomLogger
 from openhound.core.manager import CollectorManager
 from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import dataflow
@@ -88,7 +87,7 @@ class Service:
         )
         # Interval how often to check for a job
         self.interval = POLL_INTERVAL
-        self.log_base_path = log_base_path or CustomLogger.default_platform_path()
+        self.log_base_path = log_base_path or openhound_logging.logger_override.base_path
 
         # Stores the ID of currently running BHE job
         self.job_running: int | None = None
@@ -175,6 +174,7 @@ class Service:
             if bundle_path is not None:
                 try:
                     bundle_path.unlink(missing_ok=True)
+                    bundle_path.parent.rmdir()
                 except OSError:
                     logger.exception(
                         "Unable to remove support bundle for operation %s.", operation.id
@@ -266,11 +266,16 @@ class Service:
         if self.job_running is None:
             try:
                 operation = self.check_management()
-                if operation is not None:
-                    self._send_support_bundle(operation)
-                    return
             except Exception:
-                logger.exception("Error checking or executing management operations.")
+                logger.exception("Error checking management operations.")
+                operation = None
+
+            if operation is not None:
+                try:
+                    self._send_support_bundle(operation)
+                except Exception:
+                    logger.exception("Error executing management operation.")
+                return
 
             try:
                 available_job = self.check_jobs()

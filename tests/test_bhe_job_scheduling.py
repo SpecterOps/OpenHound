@@ -548,6 +548,21 @@ def test_poll_still_checks_jobs_when_management_endpoint_fails(
     assert mock_bloodhound_api.app.state.job_started is True
 
 
+def test_poll_does_not_start_a_job_when_management_work_fails(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    mock_bloodhound_api.app.state.management_operations = [_support_bundle_operation()]
+
+    def fail(operation):
+        raise RuntimeError("upload failed")
+
+    monkeypatch.setattr(mock_service, "_send_support_bundle", fail)
+
+    mock_service._poll()
+
+    assert mock_bloodhound_api.app.state.job_started is False
+
+
 def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
     mock_service, mock_bloodhound_api, tmp_path, monkeypatch
 ):
@@ -582,6 +597,7 @@ def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
     assert mock_bloodhound_api.app.state.operation_completed_by_artifact_upload is True
     assert mock_bloodhound_api.app.state.operation_end_payload is None
     assert created and not created[0].exists()
+    assert not created[0].parent.exists()
 
 
 def test_create_artifact_upload_preserves_entire_create_response(
