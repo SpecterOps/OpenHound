@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -16,7 +17,12 @@ from openhound.core.pipeline import BasePipeline
 from openhound.core.progress import Progress
 from openhound.destinations.bloodhound_enterprise.destination import ingest
 from openhound.destinations.opengraph.destination import opengraph_file
-from openhound.sources.opengraph.source import GraphResource, opengraph
+from openhound.sources.opengraph.source import (
+    DEFAULT_EDGE_BATCH_SIZE,
+    GraphResource,
+    opengraph,
+    writer_buffer_max_items,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,7 @@ class Converter(BasePipeline):
 
     @property
     def pipeline(self) -> Pipeline:
+        self._coordinate_writer_buffer()
         if self.method == Method.ingest:
             logger.debug(
                 "Initializing BloodHound Enterprise client for converter ingest method"
@@ -66,6 +73,13 @@ class Converter(BasePipeline):
             progress=self.progress.value,
         )
         return pipeline
+
+    @staticmethod
+    def _coordinate_writer_buffer() -> None:
+        # setdefault keeps any explicit DATA_WRITER__BUFFER_MAX_ITEMS override.
+        os.environ.setdefault(
+            "DATA_WRITER__BUFFER_MAX_ITEMS", str(writer_buffer_max_items())
+        )
 
     def run(
         self,
@@ -99,6 +113,7 @@ class Converter(BasePipeline):
                 lookup=self.lookup,
                 bucket_url=str(self.input_path),
                 extras=extra_context,
+                batch_size=DEFAULT_EDGE_BATCH_SIZE,
             )
         )
 

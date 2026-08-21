@@ -22,7 +22,11 @@ import psutil  # noqa: E402
 from dlt.common import json as dlt_json  # noqa: E402
 
 from openhound.core.lookup import LookupManager  # noqa: E402
-from openhound.sources.opengraph.source import GraphResource, opengraph  # noqa: E402
+from openhound.sources.opengraph.source import (  # noqa: E402
+    GraphResource,
+    opengraph,
+    writer_buffer_max_items,
+)
 
 from _bench_assets import model_for_shape  # noqa: E402
 from _peak_rss import PeakRSSSampler  # noqa: E402
@@ -51,7 +55,14 @@ class BenchMetrics:
     max_bytes_per_callback: int = 0
     max_relationships_per_part: int = 0
     max_bytes_per_part: int = 0
+    writer_buffer_max_items: int = 0
+    peak_rss_per_edge: float = 0.0
     warnings: list[str] = field(default_factory=list)
+
+
+# RSS guard band: fail if peak RSS exceeds floor + per-edge allowance.
+RSS_FLOOR_BYTES = 300 * 1024 * 1024
+RSS_PER_EDGE_ALLOWANCE = 512
 
 
 def _instrumented_destination(real_output_dir: str, metrics: BenchMetrics):
@@ -154,6 +165,15 @@ def run_pipeline(
     work_dir.mkdir(parents=True, exist_ok=True)
     metrics = BenchMetrics()
 
+    # Mirror the Converter's writer-buffer coordination (setdefault lets an
+    # explicit override win).
+    os.environ.setdefault(
+        "DATA_WRITER__BUFFER_MAX_ITEMS", str(writer_buffer_max_items(batch_size))
+    )
+    metrics.writer_buffer_max_items = int(
+        os.environ.get("DATA_WRITER__BUFFER_MAX_ITEMS", "0")
+    )
+
     metrics.edge_wrappers, metrics.node_wrappers, metrics.inner_relationships = (
         _count_source_wrappers(input_dir, table, shape, batch_size, lookup)
     )
@@ -189,6 +209,16 @@ def run_pipeline(
         cpu_after.system - cpu_before.system
     )
     metrics.peak_rss_bytes = sampler.peak_rss
+    if metrics.inner_relationships > 0:
+        metrics.peak_rss_per_edge = metrics.peak_rss_bytes / metrics.inner_relationships
+        rss_band = RSS_FLOOR_BYTES + RSS_PER_EDGE_ALLOWANCE * metrics.inner_relationships
+        if metrics.peak_rss_bytes > rss_band:
+            metrics.warnings.append(
+                f"peak RSS {metrics.peak_rss_bytes} exceeds guard band "
+                f"{rss_band} (floor {RSS_FLOOR_BYTES} + "
+                f"{RSS_PER_EDGE_ALLOWANCE} B/edge); staging memory may be "
+                "scaling with table cardinality"
+            )
     _measure_output_parts(output_dir, metrics)
     _collect_dlt_metrics(pipeline, load_info, metrics)
     return metrics

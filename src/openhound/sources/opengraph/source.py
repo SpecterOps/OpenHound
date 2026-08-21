@@ -17,13 +17,28 @@ class GraphResource:
     model: BaseAsset
 
 
+DEFAULT_EDGE_BATCH_SIZE = 150
+
+# Each wrapper holds up to batch_size edges; scale DLT's item-count writer
+# buffer so buffered edges stay bounded regardless of batch size.
+DLT_BUFFERED_EDGE_BUDGET = 50_000
+DLT_DEFAULT_BUFFER_MAX_ITEMS = 5_000
+
+
+def writer_buffer_max_items(batch_size: int = DEFAULT_EDGE_BATCH_SIZE) -> int:
+    return min(
+        DLT_DEFAULT_BUFFER_MAX_ITEMS,
+        max(1, DLT_BUFFERED_EDGE_BUDGET // batch_size),
+    )
+
+
 @dlt.source(name="opengraph", max_table_nesting=0)
 def opengraph(
     graph_resources: list[GraphResource],
     bucket_url: str,
     lookup: LookupManager,
     extras: dict | None = None,
-    batch_size: int = 150,
+    batch_size: int = DEFAULT_EDGE_BATCH_SIZE,
 ):
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
