@@ -3,6 +3,8 @@
 import inspect
 import math
 
+import pytest
+
 from openhound.core.convert import Converter, Method
 from openhound.sources.opengraph.source import (
     DEFAULT_EDGE_BATCH_SIZE,
@@ -32,6 +34,12 @@ def test_buffer_formula_bounds_buffered_edges():
             writer_buffer_max_items(batch_size) * batch_size
             <= DLT_BUFFERED_EDGE_BUDGET + batch_size
         )
+
+
+def test_buffer_formula_rejects_invalid_batch_size():
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="batch_size must be >= 1"):
+            writer_buffer_max_items(bad)
 
 
 def test_converter_applies_env_default(monkeypatch):

@@ -26,6 +26,8 @@ DLT_DEFAULT_BUFFER_MAX_ITEMS = 5_000
 
 
 def writer_buffer_max_items(batch_size: int = DEFAULT_EDGE_BATCH_SIZE) -> int:
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
     return min(
         DLT_DEFAULT_BUFFER_MAX_ITEMS,
         max(1, DLT_BUFFERED_EDGE_BUDGET // batch_size),

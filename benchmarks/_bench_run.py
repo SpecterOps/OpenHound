@@ -165,62 +165,67 @@ def run_pipeline(
     work_dir.mkdir(parents=True, exist_ok=True)
     metrics = BenchMetrics()
 
-    # Mirror the Converter's writer-buffer coordination (setdefault lets an
-    # explicit override win).
-    os.environ.setdefault(
-        "DATA_WRITER__BUFFER_MAX_ITEMS", str(writer_buffer_max_items(batch_size))
-    )
-    metrics.writer_buffer_max_items = int(
-        os.environ.get("DATA_WRITER__BUFFER_MAX_ITEMS", "0")
-    )
+    # Mirror the Converter's writer-buffer coordination: an explicit override
+    # wins while running; the prior environment is restored afterwards so
+    # repeated in-process runs never inherit a stale buffer.
+    buffer_env = "DATA_WRITER__BUFFER_MAX_ITEMS"
+    prior_buffer = os.environ.get(buffer_env)
+    if prior_buffer is None:
+        os.environ[buffer_env] = str(writer_buffer_max_items(batch_size))
+    metrics.writer_buffer_max_items = int(os.environ[buffer_env])
+    try:
+        metrics.edge_wrappers, metrics.node_wrappers, metrics.inner_relationships = (
+            _count_source_wrappers(input_dir, table, shape, batch_size, lookup)
+        )
 
-    metrics.edge_wrappers, metrics.node_wrappers, metrics.inner_relationships = (
-        _count_source_wrappers(input_dir, table, shape, batch_size, lookup)
-    )
+        model = model_for_shape(shape)
+        source = opengraph(
+            [GraphResource(table=table, model=model)],
+            bucket_url=input_dir.as_uri(),
+            lookup=lookup,
+            extras={},
+            batch_size=batch_size,
+        )
+        dest = _instrumented_destination(str(output_dir), metrics)
+        # Isolate DLT's working dir per run so runs never share load packages/state.
+        pipeline = dlt.pipeline(
+            pipeline_name="bench_opengraph_convert",
+            dataset_name="bench",
+            destination=dest,
+            pipelines_dir=str(work_dir),
+        )
 
-    model = model_for_shape(shape)
-    source = opengraph(
-        [GraphResource(table=table, model=model)],
-        bucket_url=input_dir.as_uri(),
-        lookup=lookup,
-        extras={},
-        batch_size=batch_size,
-    )
-    dest = _instrumented_destination(str(output_dir), metrics)
-    # Isolate DLT's working dir per run so runs never share load packages/state.
-    pipeline = dlt.pipeline(
-        pipeline_name="bench_opengraph_convert",
-        dataset_name="bench",
-        destination=dest,
-        pipelines_dir=str(work_dir),
-    )
+        proc = psutil.Process()
+        cpu_before = proc.cpu_times()
+        sampler = PeakRSSSampler(proc)
+        sampler.start()
+        t0 = time.perf_counter()
+        load_info = pipeline.run(source)
+        metrics.wall_seconds = time.perf_counter() - t0
+        sampler.stop()
+        cpu_after = proc.cpu_times()
 
-    proc = psutil.Process()
-    cpu_before = proc.cpu_times()
-    sampler = PeakRSSSampler(proc)
-    sampler.start()
-    t0 = time.perf_counter()
-    load_info = pipeline.run(source)
-    metrics.wall_seconds = time.perf_counter() - t0
-    sampler.stop()
-    cpu_after = proc.cpu_times()
-
-    metrics.process_cpu_seconds = (cpu_after.user - cpu_before.user) + (
-        cpu_after.system - cpu_before.system
-    )
-    metrics.peak_rss_bytes = sampler.peak_rss
-    if metrics.inner_relationships > 0:
-        metrics.peak_rss_per_edge = metrics.peak_rss_bytes / metrics.inner_relationships
-        rss_band = RSS_FLOOR_BYTES + RSS_PER_EDGE_ALLOWANCE * metrics.inner_relationships
-        if metrics.peak_rss_bytes > rss_band:
-            metrics.warnings.append(
-                f"peak RSS {metrics.peak_rss_bytes} exceeds guard band "
-                f"{rss_band} (floor {RSS_FLOOR_BYTES} + "
-                f"{RSS_PER_EDGE_ALLOWANCE} B/edge); staging memory may be "
-                "scaling with table cardinality"
-            )
-    _measure_output_parts(output_dir, metrics)
-    _collect_dlt_metrics(pipeline, load_info, metrics)
+        metrics.process_cpu_seconds = (cpu_after.user - cpu_before.user) + (
+            cpu_after.system - cpu_before.system
+        )
+        metrics.peak_rss_bytes = sampler.peak_rss
+        if metrics.inner_relationships > 0:
+            metrics.peak_rss_per_edge = metrics.peak_rss_bytes / metrics.inner_relationships
+            rss_band = RSS_FLOOR_BYTES + RSS_PER_EDGE_ALLOWANCE * metrics.inner_relationships
+            if metrics.peak_rss_bytes > rss_band:
+                metrics.warnings.append(
+                    f"peak RSS {metrics.peak_rss_bytes} exceeds guard band "
+                    f"{rss_band} (floor {RSS_FLOOR_BYTES} + "
+                    f"{RSS_PER_EDGE_ALLOWANCE} B/edge); staging memory may be "
+                    "scaling with table cardinality"
+                )
+        _measure_output_parts(output_dir, metrics)
+        _collect_dlt_metrics(pipeline, load_info, metrics)
+    finally:
+        if prior_buffer is None:
+            del os.environ[buffer_env]
+        else:
+            os.environ[buffer_env] = prior_buffer
     return metrics
 
 
