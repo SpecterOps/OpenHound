@@ -1327,12 +1327,12 @@ requires-dist = [
     { name = "griffe-fieldz", specifier = ">=0.5.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "mkdocstrings", extras = ["python"], specifier = ">=1.0.0" },
-    { name = "openhound-github", marker = "extra == 'all'", specifier = "==0.5.1" },
-    { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.5.1" },
+    { name = "openhound-github", marker = "extra == 'all'", specifier = "==0.6.4" },
+    { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.6.4" },
     { name = "openhound-jamf", marker = "extra == 'all'", specifier = "==0.3.0" },
     { name = "openhound-jamf", marker = "extra == 'jamf'", specifier = "==0.3.0" },
-    { name = "openhound-okta", marker = "extra == 'all'", specifier = "==0.2.6" },
-    { name = "openhound-okta", marker = "extra == 'okta'", specifier = "==0.2.6" },
+    { name = "openhound-okta", marker = "extra == 'all'", specifier = "==0.3.0" },
+    { name = "openhound-okta", marker = "extra == 'okta'", specifier = "==0.3.0" },
     { name = "psutil", specifier = ">=7.2.1" },
     { name = "pydantic", specifier = "==2.13.3" },
     { name = "pydantic-extra-types", specifier = ">=2.11.1" },
@@ -1373,15 +1373,15 @@ wheels = [
 
 [[package]]
 name = "openhound-github"
-version = "0.5.1"
+version = "0.6.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "joserfc" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/34/48/44840cfc38a38a4cfd6e006e9fd51e6c5590034ad896c2cd4a020456105f/openhound_github-0.5.1.tar.gz", hash = "sha256:fc55e8de8874ef0325fe5fabae4c73bee7594b01b02d3f2316731b526858898e", size = 3607472, upload-time = "2026-08-12T13:51:19.551Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/30/05/c129e0debe0332f1f0f8940834c5e7924a6bba2b0ccaccd66c2dca646cc5/openhound_github-0.6.4.tar.gz", hash = "sha256:e4ef76c12ff9e86aa51c6f8933bc0156bb7d3af199362ccc6ef75567731d1304", size = 3619229, upload-time = "2026-08-21T15:37:21.101Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/38/48/484fbd2328f177ed138c178f885d1d0162f0a0bcfd389d9221f418056622/openhound_github-0.5.1-py3-none-any.whl", hash = "sha256:1365e52e317e4c4ee0f6d7dd93924c87ae6b6b2ed11611ca565c2647ff027efc", size = 140326, upload-time = "2026-08-12T13:51:17.975Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/22/2f4487a68f95bde9ff58d5ead48ebdc10bff28596938bb33e3c8b69338cc/openhound_github-0.6.4-py3-none-any.whl", hash = "sha256:e950a731296fec67349b7df6c20ab5fc28f943e74326b246917af1d16cf5d149", size = 145126, upload-time = "2026-08-21T15:37:19.553Z" },
 ]
 
 [[package]]
@@ -1395,16 +1395,16 @@ wheels = [
 
 [[package]]
 name = "openhound-okta"
-version = "0.2.6"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "defusedxml" },
     { name = "joserfc" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/19/1f/fed4db15dfa1ebb47b0690b65c1f2fbf7db13633e53525b8cd94ebc47f0b/openhound_okta-0.2.6.tar.gz", hash = "sha256:5edc70e26ec773a38c297dadecdc80baba35161c98073b28285953904118a80c", size = 3598413, upload-time = "2026-08-12T17:04:20.076Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a3/dd/37ccf0bd15b36b948173523134270d9a77a1b2efedcb42d1c9c4c97b8a2a/openhound_okta-0.3.0.tar.gz", hash = "sha256:3a34ea47c6ad7b13238edb466c1655c5361b737f39f8052dc789353c273285c9", size = 3616437, upload-time = "2026-08-20T20:10:37.535Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/56/6d/460a2858c3b642369bad2173c5b6ca9d7b1fda2528d51b1bd094d951b125/openhound_okta-0.2.6-py3-none-any.whl", hash = "sha256:0798104050461d7dc6ecfc002b17e3bbd388f24ad467bf61a89450fabad366d3", size = 105001, upload-time = "2026-08-12T17:04:18.643Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/93/47326555bb9acb377d8750f97fe060316fd86292aafbe53d73ab09b666f3/openhound_okta-0.3.0-py3-none-any.whl", hash = "sha256:1f49ca09c0698e33fc11b6bdbe0a6a211e40076f8a790b1519d348881052b566", size = 115267, upload-time = "2026-08-20T20:10:36.29Z" },
 ]
 
 [[package]]
@@ -1882,7 +1882,7 @@ name = "pyzmq"
 version = "27.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "implementation_name == 'pypy'" },
+    { name = "cffi", marker = "python_full_version < '3.15' and implementation_name == 'pypy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/04/0b/3c9baedbdf613ecaa7aa07027780b8867f57b6293b6ee50de316c9f3222b/pyzmq-27.1.0.tar.gz", hash = "sha256:ac0765e3d44455adb6ddbf4417dcce460fc40a05978c08efdf2948072f6db540", size = 281750, upload-time = "2025-09-08T23:10:18.157Z" }
 wheels = [
