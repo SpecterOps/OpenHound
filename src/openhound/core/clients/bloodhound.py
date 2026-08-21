@@ -72,7 +72,7 @@ class BloodHoundClient(ABC):
             data=body,
         )
 
-        if response.status_code not in [200, 201, 202]:
+        if not 200 <= response.status_code < 300:
             raise BloodHoundHTTPError(code=response.status_code, reason=response.text)
 
         return response
