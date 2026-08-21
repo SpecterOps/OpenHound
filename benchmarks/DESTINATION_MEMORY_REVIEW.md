@@ -9,9 +9,13 @@ unsupported upload artifacts.
 - An earlier revision called peak RSS "orthogonal to the batching fix." Wrong:
   growth was linear (~1.2 KB per relationship) because each wrapper now carries
   up to `batch_size` relationships. Root cause and fix below.
-- The first mitigation attempt (buffer=333, DLT untouched) exposed a DLT 1.26.0
-  defect that silently duplicated delivered items (BHE test: 2,875 nodes vs the
-  expected 1,000). Corrected in-process; all numbers below re-measured after.
+- Causal chain: the batching fix is the feature; the memory fix was required to
+  keep it viable at scale (RSS scaled linearly with cardinality); and the memory
+  fix exposed a latent DLT 1.26.0 data-corruption defect, which required an
+  in-process correction — without it, delivery silently duplicates items.
+- The first mitigation attempt (buffer=333, DLT untouched) demonstrated that
+  defect: the faker BHE scheduler test ingested 2,875 nodes where 1,000 were
+  expected. Corrected in-process; all numbers below re-measured after.
 
 ## Root cause
 

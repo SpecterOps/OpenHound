@@ -21,6 +21,7 @@ import math
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from uuid import uuid4
 
 # Support running as a plain script (python benchmarks/opengraph_batching_benchmark.py)
 # as well as a module (python -m benchmarks.opengraph_batching_benchmark).
@@ -128,7 +129,7 @@ def _in_memory_lookup() -> LookupManager:
     return LookupManager(conn, "main")
 
 
-def _print_report(cfg: BenchConfig, metrics: BenchMetrics) -> None:
+def _print_report(cfg: BenchConfig, metrics: BenchMetrics, run_dir: Path) -> None:
     expected_wrappers = (
         cfg.rows * cfg.edges_per_row
         if cfg.batch_size == 1
@@ -136,6 +137,7 @@ def _print_report(cfg: BenchConfig, metrics: BenchMetrics) -> None:
     )
     report = {
         "config": asdict(cfg) | {"output_root": str(cfg.output_root)},
+        "run_dir": str(run_dir),
         "expected_edge_wrappers_ceiling": expected_wrappers,
         "metrics": asdict(metrics),
     }
@@ -159,9 +161,12 @@ def main(argv: list[str] | None = None) -> None:
     if cfg.quiet:
         _silence_dlt_logging()
     cfg.output_root.mkdir(parents=True, exist_ok=True)
-    input_dir = cfg.output_root / "input"
-    output_dir = cfg.output_root / "output"
-    work_dir = cfg.output_root / "dlt_work"
+    # Fresh run dir per invocation: preserves the caller-supplied root while
+    # isolating table/output/dlt_work children from any stale prior run.
+    run_dir = cfg.output_root / f"run-{uuid4().hex[:8]}"
+    input_dir = run_dir / "input"
+    output_dir = run_dir / "output"
+    work_dir = run_dir / "dlt_work"
 
     try:
         table = write_synthetic_input(
@@ -177,7 +182,7 @@ def main(argv: list[str] | None = None) -> None:
             lookup=_in_memory_lookup(),
             work_dir=work_dir,
         )
-        _print_report(cfg, metrics)
+        _print_report(cfg, metrics, run_dir)
     finally:
         if not cfg.keep_output and cfg.owns_output_root:
             import shutil
