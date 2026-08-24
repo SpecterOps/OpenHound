@@ -53,7 +53,10 @@ user overrides win) in `Converter.pipeline` and the benchmark harness:
     buffer_max_items = min(5000, max(1, 50_000 // batch_size))   # 333 @ 150
 
 More frequent flushes write to the same open file; wall time is unchanged
-within noise. The jsonl batching module above is what makes 333 safe.
+within noise. The jsonl batching module above is what makes 333 safe:
+`writer_buffer_max_items()` only tunes when the correction is active, and
+otherwise returns the stock default (5,000 aligns with the destinations'
+batch size) — degraded memory, never duplication.
 
 ## Method
 
@@ -110,5 +113,8 @@ in 1.27.0; `buffer_max_items` semantics unchanged through 1.30.0, so the
 coordination applies on all versions). If the pin moves past 1.26,
 `ensure_dlt_jsonl_batching` becomes a no-op and upstream's corrected iterator
 takes over — worth reporting upstream with the minimal reproduction above.
+If a future dlt change ever leaves 1.26.x running unpatched,
+`writer_buffer_max_items()` reverts to the stock-aligned buffer — the failure
+mode is memory, not data corruption.
 Future wrapper-width or buffering changes will surface via `peak_rss_per_edge`
 and the warnings list.

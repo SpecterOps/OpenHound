@@ -1,3 +1,4 @@
+import logging
 from dataclasses import asdict, dataclass
 from typing import Callable
 
@@ -6,9 +7,12 @@ from dlt.sources.filesystem import filesystem as filesystemsource
 from dlt.sources.filesystem import read_jsonl
 
 from openhound.core.asset import BaseAsset
+from openhound.core.dlt_jsonl_batching import jsonl_duplication_defect_active
 from openhound.core.lookup import LookupManager
 
 from .entries import GraphContent
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,6 +40,20 @@ def _validate_batch_size(batch_size: int) -> None:
 
 def writer_buffer_max_items(batch_size: int = DEFAULT_EDGE_BATCH_SIZE) -> int:
     _validate_batch_size(batch_size)
+    # Tuned values are safe only under corrected get_batches semantics; if a
+    # defect-carrying 1.26.x runs unpatched, keep the stock default (5,000
+    # aligns with the destinations' batch size) — degraded memory, not
+    # duplicated data.
+    if jsonl_duplication_defect_active():
+        logger.warning(
+            "dlt %s carries the jsonl duplication defect and the batching "
+            "correction is inactive; keeping stock "
+            "DATA_WRITER__BUFFER_MAX_ITEMS=%d and disabling the memory "
+            "mitigation",
+            dlt.__version__,
+            DLT_DEFAULT_BUFFER_MAX_ITEMS,
+        )
+        return DLT_DEFAULT_BUFFER_MAX_ITEMS
     return min(
         DLT_DEFAULT_BUFFER_MAX_ITEMS,
         max(1, DLT_BUFFERED_EDGE_BUDGET // batch_size),

@@ -21,6 +21,14 @@ _AFFECTED_DLT_SERIES = (1, 26)
 _INSTALLED_ATTR = "_openhound_jsonl_batching_installed"
 
 
+def _major_minor(version: str) -> tuple[int, int] | None:
+    parts = version.split(".")[:2]
+    try:
+        return int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return None
+
+
 def _jsonl_get_batches(self: Any, start_index: int) -> Iterable[TDataItems]:
     current_batch: TDataItems = []
 
@@ -52,8 +60,11 @@ def ensure_dlt_jsonl_batching() -> bool:
 
     from dlt.destinations.job_impl import DestinationJsonlLoadJob
 
-    version = tuple(int(part) for part in dlt.__version__.split(".")[:2])
-    if not hasattr(DestinationJsonlLoadJob, "get_batches") or version != _AFFECTED_DLT_SERIES:
+    series = _major_minor(dlt.__version__)
+    if (
+        not hasattr(DestinationJsonlLoadJob, "get_batches")
+        or series != _AFFECTED_DLT_SERIES
+    ):
         logger.debug("dlt %s needs no jsonl batching correction", dlt.__version__)
         return False
 
@@ -65,3 +76,16 @@ def ensure_dlt_jsonl_batching() -> bool:
         dlt.__version__,
     )
     return True
+
+
+def jsonl_duplication_defect_active() -> bool:
+    """Report whether the active dlt's get_batches may re-deliver items.
+
+    True only when a defect-carrying 1.26.x is running AND the in-process
+    correction could not be installed. Callers must treat non-aligned writer
+    buffer values as unsafe (duplicate delivery) while this is true.
+    """
+    ensure_dlt_jsonl_batching()
+    if getattr(dlt, _INSTALLED_ATTR, False):
+        return False
+    return _major_minor(dlt.__version__) == _AFFECTED_DLT_SERIES
