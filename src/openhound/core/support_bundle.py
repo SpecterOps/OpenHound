@@ -1,6 +1,7 @@
 """Create uploadable support bundles from OpenHound logs."""
 
 import logging
+import shutil
 import tempfile
 import zipfile
 from datetime import UTC, datetime
@@ -38,9 +39,15 @@ def create_support_bundle(collector_name: str, log_base_path: Path) -> Path:
         Path(tempfile.mkdtemp()) / f"{collector_name}_support_bundle_{timestamp}.zip"
     )
 
-    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for log_file in collect_log_files(log_base_path):
-            archive.write(log_file, arcname=log_file.name)
+    try:
+        with zipfile.ZipFile(
+            bundle_path, "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            for log_file in collect_log_files(log_base_path):
+                archive.write(log_file, arcname=log_file.name)
+    except Exception:
+        shutil.rmtree(bundle_path.parent, ignore_errors=True)
+        raise
 
     logger.info("Support Bundle size: %s", bundle_path.stat().st_size)
     logger.info("Created support bundle at %s", bundle_path)
