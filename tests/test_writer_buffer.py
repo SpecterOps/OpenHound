@@ -42,6 +42,12 @@ def test_buffer_formula_rejects_invalid_batch_size():
             writer_buffer_max_items(bad)
 
 
+@pytest.mark.parametrize("bad", [1.5, True])
+def test_buffer_formula_rejects_non_integer_batch_size(bad):
+    with pytest.raises(TypeError, match="batch_size must be an integer"):
+        writer_buffer_max_items(bad)
+
+
 def test_converter_applies_env_default(monkeypatch):
     monkeypatch.delenv(ENV_VAR, raising=False)
     converter = Converter(

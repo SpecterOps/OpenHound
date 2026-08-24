@@ -25,9 +25,17 @@ DLT_BUFFERED_EDGE_BUDGET = 50_000
 DLT_DEFAULT_BUFFER_MAX_ITEMS = 5_000
 
 
-def writer_buffer_max_items(batch_size: int = DEFAULT_EDGE_BATCH_SIZE) -> int:
+def _validate_batch_size(batch_size: int) -> None:
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError(
+            f"batch_size must be an integer >= 1, got {batch_size!r}"
+        )
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+
+
+def writer_buffer_max_items(batch_size: int = DEFAULT_EDGE_BATCH_SIZE) -> int:
+    _validate_batch_size(batch_size)
     return min(
         DLT_DEFAULT_BUFFER_MAX_ITEMS,
         max(1, DLT_BUFFERED_EDGE_BUDGET // batch_size),
@@ -42,8 +50,7 @@ def opengraph(
     extras: dict | None = None,
     batch_size: int = DEFAULT_EDGE_BATCH_SIZE,
 ):
-    if batch_size < 1:
-        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    _validate_batch_size(batch_size)
 
     def apply_context(obj):
         obj._lookup = lookup

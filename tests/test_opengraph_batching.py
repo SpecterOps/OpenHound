@@ -235,6 +235,13 @@ def test_batch_size_below_one_rejected(tmp_path, bad):
         _collect(tmp_path, "oneedgeasset", OneEdgeAsset, batch_size=bad)
 
 
+@pytest.mark.parametrize("bad", [1.5, True])
+def test_batch_size_non_integer_rejected(tmp_path, bad):
+    _one_edge_rows(tmp_path, "oneedgeasset", 1)
+    with pytest.raises(TypeError):
+        _collect(tmp_path, "oneedgeasset", OneEdgeAsset, batch_size=bad)
+
+
 def test_exact_batch_size_single_row(tmp_path):
     # One row emitting exactly batch_size edges -> exactly one full wrapper.
     _write_gz(tmp_path / "multiedgeasset" / "p.jsonl.gz", [{"idx": 0, "n": 150}])
