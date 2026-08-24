@@ -35,6 +35,8 @@ class JobStatus(str, Enum):
 SUPPORT_BUNDLE_PART_SIZE = 8 * 1024 * 1024  # 8 MiB
 SUPPORT_BUNDLE_MAX_RETRIES = 3
 SUPPORT_BUNDLE_RETRY_DELAY_SECONDS = 2
+SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS = 10
+SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS = 120
 
 T = TypeVar("T")
 
@@ -156,6 +158,10 @@ class BloodHoundEnterprise(BloodHound):
                     "Content-Type": "application/zip",
                     "Content-Digest": f"sha-256=:{checksum}:",
                 },
+                timeout=(
+                    SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS,
+                    SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS,
+                ),
             ),
         )
 

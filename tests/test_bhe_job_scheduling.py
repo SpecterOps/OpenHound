@@ -245,6 +245,41 @@ def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeyp
     }
 
 
+def test_request_forwards_connect_and_read_timeouts(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 204
+        text = ""
+
+    def mock_request(**kwargs):
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(bloodhound.requests, "request", mock_request)
+    client = bloodhound.BloodHound(token_key="test-key", token_id="test-id")
+
+    client.request(method="POST", path="/test", timeout=(1.5, 3.5))
+
+    assert captured["timeout"] == (1.5, 3.5)
+
+
+def test_upload_artifact_part_uses_bounded_timeouts(mock_service, monkeypatch):
+    captured = {}
+
+    def capture_request(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(mock_service.client, "request", capture_request)
+
+    mock_service.client.upload_artifact_part("artifact-123", 1, b"part")
+
+    assert captured["timeout"] == (
+        bloodhound_enterprise.SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS,
+        bloodhound_enterprise.SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS,
+    )
+
+
 def test_client_update_uses_unknown_when_hostname_lookup_fails(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
