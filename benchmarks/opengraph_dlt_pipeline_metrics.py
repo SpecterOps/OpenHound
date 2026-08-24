@@ -52,6 +52,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix="openhound-dlt-", dir=args.output_dir))
     raw_dir = run_dir / "raw" / "assets"
     raw_dir.mkdir(parents=True)
