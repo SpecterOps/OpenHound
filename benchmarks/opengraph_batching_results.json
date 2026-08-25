@@ -1,0 +1,135 @@
+{
+  "benchmark": "OpenGraph synthetic source batching",
+  "recorded_at": "2026-08-24",
+  "commit": "e343a98e525e4ca8aed8cfbf0b316151abe914e3",
+  "environment": {
+    "os": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.2",
+    "dlt": "1.26.0"
+  },
+  "configuration": {
+    "edges_per_row": 1,
+    "source_batch_size": 150,
+    "source_page_size": 1000,
+    "destination_item_batch_size": 1000
+  },
+  "runs": [
+    {
+      "rows": 100000,
+      "mode": "per-row",
+      "wrappers": 100000,
+      "relationships": 100000,
+      "destination_callbacks": 1,
+      "destination_parts": 100,
+      "maximum_relationships_per_part": 1000,
+      "maximum_part_bytes": 184071,
+      "normalized_compressed_bytes": 603508,
+      "destination_uncompressed_bytes": 18384880,
+      "wall_seconds": 6.7765605,
+      "process_cpu_seconds": 6.65625,
+      "peak_rss_bytes": 114798592,
+      "artifact": ".benchmark-results/openhound-batching-20260824T203354Z/metrics.json"
+    },
+    {
+      "rows": 100000,
+      "mode": "page-batched",
+      "wrappers": 700,
+      "relationships": 100000,
+      "destination_callbacks": 1,
+      "destination_parts": 1,
+      "maximum_relationships_per_part": 100000,
+      "maximum_part_bytes": 18377851,
+      "normalized_compressed_bytes": 602668,
+      "destination_uncompressed_bytes": 18377851,
+      "wall_seconds": 5.1618227,
+      "process_cpu_seconds": 5.015625,
+      "peak_rss_bytes": 223166464,
+      "artifact": ".benchmark-results/openhound-batching-20260824T203402Z/metrics.json"
+    },
+    {
+      "rows": 1000000,
+      "mode": "per-row",
+      "wrappers": 1000000,
+      "relationships": 1000000,
+      "destination_callbacks": 1,
+      "destination_parts": 1000,
+      "maximum_relationships_per_part": 1000,
+      "maximum_part_bytes": 186071,
+      "normalized_compressed_bytes": 6032827,
+      "destination_uncompressed_bytes": 185848780,
+      "wall_seconds": 92.1498802,
+      "process_cpu_seconds": 89.796875,
+      "peak_rss_bytes": 283844608,
+      "artifact": ".benchmark-results/openhound-batching-20260824T203408Z/metrics.json"
+    },
+    {
+      "rows": 1000000,
+      "mode": "page-batched",
+      "wrappers": 7000,
+      "relationships": 1000000,
+      "destination_callbacks": 1,
+      "destination_parts": 7,
+      "maximum_relationships_per_part": 142900,
+      "maximum_part_bytes": 26570171,
+      "normalized_compressed_bytes": 6023827,
+      "destination_uncompressed_bytes": 185778277,
+      "wall_seconds": 58.9026913,
+      "process_cpu_seconds": 57.390625,
+      "peak_rss_bytes": 306421760,
+      "artifact": ".benchmark-results/openhound-batching-20260824T203639Z/metrics.json"
+    }
+  ],
+  "real_dlt_pipeline_runs": [
+    {
+      "rows": 100000,
+      "dlt_package_files": 2,
+      "destination_callbacks": 1,
+      "maximum_items_per_destination_callback": 700,
+      "maximum_bytes_per_destination_callback": 565874,
+      "destination_parts": 1,
+      "artifact": ".benchmark-results/openhound-dlt-2s2earqb/dlt_metrics.json"
+    },
+    {
+      "rows": 1000000,
+      "dlt_package_files": 2,
+      "destination_callbacks": 1,
+      "maximum_items_per_destination_callback": 7000,
+      "maximum_bytes_per_destination_callback": 5643496,
+      "destination_parts": 7,
+      "artifact": ".benchmark-results/openhound-dlt-tv5d37yc/dlt_metrics.json"
+    }
+  ],
+  "customer_shaped_raw_replay_runs": [
+    {
+      "source": "okta",
+      "table": "application_users",
+      "rows": 10489,
+      "raw_input_files": 1,
+      "lookup_file": "lookup.duckdb",
+      "relationships": 8577,
+      "legacy_per_row_wrappers": 4120,
+      "page_batched_wrappers": 63,
+      "destination_parts": 1,
+      "wall_seconds": 13.68111989996396,
+      "process_cpu_seconds": 13.203125,
+      "peak_rss_bytes": 151158784,
+      "semantic_hashes_match": true,
+      "artifact": ".benchmark-results/openhound-batching-20260824T205713Z/metrics.json"
+    }
+  ],
+  "manual_bloodhound_ingest_validation": {
+    "benchmark_artifact": ".benchmark-results/openhound-dlt-k_ausfim/dlt_metrics.json",
+    "rows": 1000000,
+    "graph_files": 7,
+    "bloodhound_ingest_job_id": 8,
+    "status": "Complete",
+    "failed_files": 0,
+    "partial_failed_files": 0,
+    "ingest_duration_seconds": 144.330721879
+  },
+  "limitations": [
+    "Standalone synthetic runs do not create DLT load packages.",
+    "Real-DLT runs use one synthetic edge per row and do not include extension-model or DuckDB lookup work.",
+    "Customer-shaped raw replay evaluates a saved raw collection through the real model and DuckDB lookup, but does not perform collection API calls or create a DLT package."
+  ]
+}

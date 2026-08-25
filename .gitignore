@@ -8,6 +8,7 @@ collectors/
 notebooks
 
 output
+.benchmark-results/
 graph
 logs
 dbt_packages
