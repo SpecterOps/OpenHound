@@ -165,6 +165,7 @@ class Service:
             self.client.start_operation(operation.id)
             bundle_path = create_support_bundle(self.collector_name, self.log_base_path)
             self.client.upload_support_bundle(operation.id, bundle_path)
+            self.client.end_operation(operation.id, ManagementOperationStatus.SUCCEEDED)
         except Exception:
             logger.exception("Support bundle operation %s failed.", operation.id)
             try:
@@ -186,7 +187,6 @@ class Service:
                         "Unable to remove support bundle for operation %s.",
                         operation.id,
                     )
-            self.client.end_operation(operation.id, ManagementOperationStatus.SUCCEEDED)
 
     def _start_job(self, job: Job) -> None:
         """Starts a BloodHound enterprise job by ID and runs the collection process in a subprocess. The results are then used to end the job in BHE with a complete status.

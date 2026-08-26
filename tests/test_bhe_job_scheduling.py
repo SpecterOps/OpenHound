@@ -116,6 +116,8 @@ def mock_bloodhound_api():
                 "type": "support_bundle",
                 "status": "running",
                 "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "execution_time": "2026-01-01T00:00:00Z",
             }
         }
 
@@ -176,6 +178,8 @@ def mock_bloodhound_api():
                 "type": "support_bundle",
                 "status": body["status"],
                 "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "execution_time": "2026-01-01T00:00:00Z",
             }
         }
 
@@ -630,7 +634,10 @@ def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
     assert mock_bloodhound_api.app.state.uploaded_parts
     assert mock_bloodhound_api.app.state.artifact_completed is True
     assert mock_bloodhound_api.app.state.operation_completed_by_artifact_upload is True
-    assert mock_bloodhound_api.app.state.operation_end_payload is None
+    assert mock_bloodhound_api.app.state.operation_end_payload == {
+        "operation_id": operation.id,
+        "status": ManagementOperationStatus.SUCCEEDED.value,
+    }
     assert created and not created[0].exists()
     assert not created[0].parent.exists()
 
