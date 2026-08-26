@@ -81,7 +81,12 @@ class BloodHoundEnterprise(BloodHound):
     @property
     def management_available(self) -> ManagementAvailable:
         response = self.request(
-            method="GET", path="/api/v2/clients/management/available"
+            method="GET",
+            path="/api/v2/clients/management/available",
+            timeout=(
+                SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS,
+                SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS,
+            ),
         )
         return ManagementAvailable.model_validate(response.json())
 
@@ -107,6 +112,10 @@ class BloodHoundEnterprise(BloodHound):
                 body=json.dumps(
                     {"operation_id": operation_id, "status": status}
                 ).encode(),
+                timeout=(
+                    SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS,
+                    SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS,
+                ),
             ),
         )
         return ManagementOperationResult.model_validate(response.json())
@@ -139,6 +148,10 @@ class BloodHoundEnterprise(BloodHound):
                         "checksum": checksum,
                     }
                 ).encode(),
+                timeout=(
+                    SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS,
+                    SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS,
+                ),
             ),
         )
         return ArtifactUploadSession.model_validate(response.json()["data"])

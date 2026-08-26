@@ -72,11 +72,11 @@ class ManagementOperation(BaseModel):
     type: ManagementOperationType
     status: ManagementOperationStatus
     created_at: datetime
-    updated_at: datetime | None = None
+    updated_at: datetime
     requested_by_user_id: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
-    execution_time: datetime | None = None
+    execution_time: datetime
 
 
 class ManagementAvailable(BaseModel):
@@ -103,6 +103,7 @@ class ArtifactStatus(StrEnum):
     COMPLETE = "complete"
     FAILED = "failed"
     CANCELED = "canceled"
+    FINALIZED = "finalized"
 
 
 class ArtifactUploadSession(BaseModel):

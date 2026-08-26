@@ -87,7 +87,9 @@ class Service:
         )
         # Interval how often to check for a job
         self.interval = POLL_INTERVAL
-        self.log_base_path = log_base_path or openhound_logging.logger_override.base_path
+        self.log_base_path = (
+            log_base_path or openhound_logging.logger_override.base_path
+        )
 
         # Stores the ID of currently running BHE job
         self.job_running: int | None = None
@@ -166,9 +168,13 @@ class Service:
         except Exception:
             logger.exception("Support bundle operation %s failed.", operation.id)
             try:
-                self.client.end_operation(operation.id, ManagementOperationStatus.FAILED)
+                self.client.end_operation(
+                    operation.id, ManagementOperationStatus.FAILED
+                )
             except Exception:
-                logger.exception("Unable to mark management operation %s as failed.", operation.id)
+                logger.exception(
+                    "Unable to mark management operation %s as failed.", operation.id
+                )
             raise
         finally:
             if bundle_path is not None:
@@ -177,8 +183,10 @@ class Service:
                     bundle_path.parent.rmdir()
                 except OSError:
                     logger.exception(
-                        "Unable to remove support bundle for operation %s.", operation.id
+                        "Unable to remove support bundle for operation %s.",
+                        operation.id,
                     )
+            self.client.end_operation(operation.id, ManagementOperationStatus.SUCCEEDED)
 
     def _start_job(self, job: Job) -> None:
         """Starts a BloodHound enterprise job by ID and runs the collection process in a subprocess. The results are then used to end the job in BHE with a complete status.
