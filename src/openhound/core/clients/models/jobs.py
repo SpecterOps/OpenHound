@@ -103,7 +103,7 @@ class ArtifactStatus(StrEnum):
     COMPLETE = "complete"
     FAILED = "failed"
     CANCELED = "canceled"
-    FINALIZED = "finalized"
+    FINALIZING = "finalizing"
 
 
 class ArtifactUploadSession(BaseModel):
