@@ -28,6 +28,14 @@ typecheck:
     @echo "Running type checks"
     uv run mypy src/openhound
 
+# Run one test area, e.g. `just test bhe_job_scheduling`.
+test area:
+    uv run pytest "tests/test_{{area}}.py" -v
+
+# Run every discovered test.
+test-all:
+    uv run pytest
+
 dashboard:
     @echo "Starting marimo openhound dashboard"
     marimo edit notebooks/explore.py --watch

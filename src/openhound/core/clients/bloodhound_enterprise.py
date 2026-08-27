@@ -97,6 +97,10 @@ class BloodHoundEnterprise(BloodHound):
                 method="POST",
                 path="/api/v2/clients/management/start",
                 body=json.dumps({"operation_id": operation_id}).encode(),
+                timeout=(
+                    SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS,
+                    SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS,
+                ),
             ),
         )
         return ManagementOperationResult.model_validate(response.json())
@@ -185,6 +189,10 @@ class BloodHoundEnterprise(BloodHound):
                 method="POST",
                 path=f"/api/v2/clients/management/artifacts/{artifact_id}/complete",
                 body=json.dumps({"operation_id": operation_id}).encode(),
+                timeout=(
+                    SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS,
+                    SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS,
+                ),
             ),
         )
 
