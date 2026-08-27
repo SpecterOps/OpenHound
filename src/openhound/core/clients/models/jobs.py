@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Union
+from enum import StrEnum
 
 
 class Job(BaseModel):
@@ -29,9 +29,9 @@ class DateAt(BaseModel):
 class JobStartData(Job):
     start_time: datetime
     end_time: datetime
-    created_at: Union[datetime, DateAt]
-    updated_at: Union[datetime, DateAt]
-    deleted_at: Union[datetime, DateAt]
+    created_at: datetime | DateAt
+    updated_at: datetime | DateAt
+    deleted_at: datetime | DateAt
     log_path: str | None
     event_title: str
     last_ingest: datetime
@@ -51,3 +51,76 @@ class JobsCurrent(BaseModel):
 
 class JobsEnd(BaseModel):
     data: Job
+
+
+class ManagementOperationType(StrEnum):
+    SUPPORT_BUNDLE = "support_bundle"
+
+
+class ManagementOperationStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
+class ManagementOperation(BaseModel):
+    id: str
+    client_id: str
+    artifact_id: str | None = None
+    type: ManagementOperationType
+    status: ManagementOperationStatus
+    created_at: datetime
+    updated_at: datetime
+    requested_by_user_id: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    execution_time: datetime
+
+
+class ManagementAvailable(BaseModel):
+    data: list[ManagementOperation]
+
+
+class ManagementOperationResult(BaseModel):
+    data: ManagementOperation
+
+
+class ArtifactPart(BaseModel):
+    part_number: int
+    size: int
+    checksum: str
+    offset_start: int
+    storage_key: str
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class ArtifactStatus(StrEnum):
+    PENDING = "pending"
+    UPLOADING = "uploading"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    CANCELED = "canceled"
+    FINALIZING = "finalizing"
+
+
+class ArtifactUploadSession(BaseModel):
+    """Response data from creating a management artifact upload session.
+
+    This models every field returned by
+    ``POST /api/v2/clients/management/artifacts``. The upload flow currently
+    needs only ``artifact_id``, ``part_size``, and ``part_count``, but callers
+    can use the remaining session and operation metadata without consulting
+    the API implementation.
+    """
+
+    artifact_id: str
+    client_id: str
+    storage_key: str
+    status: ArtifactStatus
+    part_size: int
+    part_count: int
+    missing_parts: list[int]
+    management_operation: ManagementOperation

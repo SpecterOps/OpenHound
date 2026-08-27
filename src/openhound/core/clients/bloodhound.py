@@ -47,6 +47,7 @@ class BloodHoundClient(ABC):
         path: str,
         body: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
     ): ...
 
     def _request(
@@ -56,6 +57,7 @@ class BloodHoundClient(ABC):
         headers: dict[str, str],
         body: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
     ):
 
         logger.debug(
@@ -65,14 +67,23 @@ class BloodHoundClient(ABC):
         if extra_headers:
             headers = {**headers, **extra_headers}
 
-        response = requests.request(
-            method=method,
-            url=f"{self.base_uri}{path}",
-            headers=headers,
-            data=body,
-        )
+        if timeout is None:
+            response = requests.request(
+                method=method,
+                url=f"{self.base_uri}{path}",
+                headers=headers,
+                data=body,
+            )
+        else:
+            response = requests.request(
+                method=method,
+                url=f"{self.base_uri}{path}",
+                headers=headers,
+                data=body,
+                timeout=timeout,
+            )
 
-        if response.status_code not in [200, 201, 202]:
+        if not 200 <= response.status_code < 300:
             raise BloodHoundHTTPError(code=response.status_code, reason=response.text)
 
         return response
@@ -160,6 +171,7 @@ class BloodHound(BloodHoundClient):
         path: str,
         body: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
     ):
         # HMAC Part 1
         digester = hmac.new(self.token_key.encode(), None, hashlib.sha256)
@@ -192,6 +204,7 @@ class BloodHound(BloodHoundClient):
             headers=headers,
             body=body,
             extra_headers=extra_headers,
+            timeout=timeout,
         )
 
 
@@ -206,6 +219,7 @@ class BloodHoundJWT(BloodHoundClient):
         path: str,
         body: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
     ):
         headers = {
             "User-Agent": self.user_agent,
@@ -218,4 +232,5 @@ class BloodHoundJWT(BloodHoundClient):
             headers=headers,
             body=body,
             extra_headers=extra_headers,
+            timeout=timeout,
         )

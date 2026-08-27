@@ -1,6 +1,6 @@
 ## Quick-start
 
-   1. Copy `.dlt-example` to `${HOME}/.dlt`and `docker-compose.yml` to `${HOME}`.
+   1. Copy `.dlt-example` to `${HOME}/.dlt`. From the repository root, run `cd example-configurations/bloodhound-enterprise` before the Compose commands below so the configured build context can access the root `Dockerfile`.
    2. Fill in your credentials in the toml files.
    3. Place any required key files (github.pem, okta.json) in `${HOME}/.dlt`.
    4. Pull image from SpecterOps Docker Hub:  `docker pull specterops/openhound:latest-enterprise`

@@ -1,5 +1,8 @@
 x-scheduler: &scheduler
   image: specterops/openhound:${IMAGE_VERSION:-latest-enterprise}
+  build:
+    context: ../..
+    target: enterprise
   restart: unless-stopped
   init: true
   volumes:
@@ -30,6 +33,9 @@ services:
     environment:
       <<: *env
       DESTINATION__BLOODHOUNDENTERPRISE__COLLECTOR_NAME: github
+      # Docker mounts the GitHub App key at this absolute path. Do not use
+      # ~/.dlt/github.pem here: the collector does not expand `~`.
+      SOURCES__SOURCE__GITHUB__CREDENTIALS__KEY_PATH: /app/.dlt/github.pem
     secrets:
       - source: secrets_github
         target: /app/.dlt/secrets.toml
