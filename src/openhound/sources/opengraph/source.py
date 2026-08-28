@@ -7,6 +7,7 @@ from dlt.sources.filesystem import read_jsonl
 
 from openhound.core.asset import BaseAsset
 from openhound.core.lookup import LookupManager
+
 from .entries import GraphContent
 
 # DLT page boundary; partial pages flush per input file.
@@ -20,11 +21,11 @@ class GraphResource:
 
 
 def _generate_graph_content(
-        resources: Iterable[dict],
-        model: type[BaseAsset],
-        batch_size: int,
-        apply_context: Callable | None = None,
-        source_kind: str | None = None
+    resources: Iterable[dict],
+    model: type[BaseAsset],
+    batch_size: int,
+    apply_context: Callable | None = None,
+    source_kind: str | None = None,
 ):
     """Convert one DLT page into bounded OpenGraph batches."""
     edge_parts = []
@@ -62,12 +63,12 @@ def _generate_graph_content(
 
 @dlt.source(name="opengraph", max_table_nesting=0)
 def opengraph(
-        graph_resources: list[GraphResource],
-        bucket_url: str,
-        lookup: LookupManager,
-        extras: dict | None = None,
-        batch_size: int = 150,
-        source_kind: str | None = None
+    graph_resources: list[GraphResource],
+    bucket_url: str,
+    lookup: LookupManager,
+    extras: dict | None = None,
+    batch_size: int = 150,
+    source_kind: str | None = None,
 ):
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
@@ -78,13 +79,10 @@ def opengraph(
 
     for graph_resource in graph_resources:
         table_name = f"{graph_resource.model.__name__.lower()}_fs"
-        reader = (
-                filesystemsource(
-                    bucket_url=bucket_url,
-                    file_glob=f"{graph_resource.table}/**/*.jsonl.gz",
-                )
-                | read_jsonl(chunksize=READ_JSONL_PAGE_SIZE)
-        )
+        reader = filesystemsource(
+            bucket_url=bucket_url,
+            file_glob=f"{graph_resource.table}/**/*.jsonl.gz",
+        ) | read_jsonl(chunksize=READ_JSONL_PAGE_SIZE)
 
         @dlt.transformer(parallelized=False, name=table_name, columns=GraphContent)
         def generate_graph(resources, model, apply_context: Callable | None = None):
