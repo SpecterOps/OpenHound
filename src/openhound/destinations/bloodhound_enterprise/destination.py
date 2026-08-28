@@ -19,9 +19,7 @@ def ingest(
     url: str = dlt.config.value,
     token_id: str = dlt.secrets.value,
     token_key: str = dlt.secrets.value,
-    source_kind: str = dlt.config.value,
 ):
-
     client = BloodHoundEnterprise(token_key=token_key, token_id=token_id, bhe_uri=url)
 
     nodes = []
@@ -34,12 +32,5 @@ def ingest(
         if item["graph"]["entity_type"] == "edge":
             edges.extend(item["graph"]["content"])
 
-    client.ingest(
-        json.dumps(
-            {
-                "graph": {"nodes": nodes, "edges": edges},
-                "metadata": {"source_kind": source_kind},
-            }
-        )
-    )
+    client.ingest(json.dumps({"graph": {"nodes": nodes, "edges": edges}}))
     logger.info("Graph ingested to BloodHound Enterprise")

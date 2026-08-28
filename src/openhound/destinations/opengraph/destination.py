@@ -28,12 +28,11 @@ def _load_items(file_path: str) -> Iterable[dict]:
 
 
 def _write_part(
-    items: list[dict],
-    table_name: str,
-    output_path: str,
-    source_kind: str,
-    part_number: int | None = None,
-    job_file_id: str | None = None,
+        items: list[dict],
+        table_name: str,
+        output_path: str,
+        part_number: int | None = None,
+        job_file_id: str | None = None,
 ) -> None:
     if part_number is None:
         DEST_PART[table_name] += 1
@@ -60,8 +59,7 @@ def _write_part(
         fh.write(
             json.dumps(
                 {
-                    "graph": {"nodes": nodes, "edges": edges},
-                    "metadata": {"source_kind": source_kind},
+                    "graph": {"nodes": nodes, "edges": edges}
                 }
             ),
         )
@@ -98,12 +96,10 @@ def _publish_parts(staging: Path, committed: Path, output_path: str) -> None:
 
 @dlt.destination(skip_dlt_columns_and_tables=True, batch_size=0)
 def opengraph_file(
-    items: str,
-    table: TTableSchema,
-    output_path: str = dlt.config.value,
-    source_kind: str = dlt.config.value,
+        items: str,
+        table: TTableSchema,
+        output_path: str = dlt.config.value,
 ):
-
     table_name = table.get("name") or "opengraph"
     staging, committed, file_id = _job_paths(items, output_path)
     if committed.exists():
@@ -124,7 +120,6 @@ def opengraph_file(
                 batch,
                 table_name,
                 str(staging),
-                source_kind,
                 part_number,
                 file_id,
             )
@@ -135,7 +130,6 @@ def opengraph_file(
             batch,
             table_name,
             str(staging),
-            source_kind,
             part_number,
             file_id,
         )

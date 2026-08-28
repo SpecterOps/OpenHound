@@ -48,7 +48,7 @@ class Asset:
 
 class OpenHound:
     name: str
-    source_kind: str
+    source_kind: str | None = None
     help: str
     metadata: Extension | None
     collector: Callable | None
@@ -65,7 +65,10 @@ class OpenHound:
     edges: list[EdgeDef]
 
     def __init__(
-        self, name: str, source_kind: str, help: str = "OpenGraph collector"
+        self,
+        name: str,
+        source_kind: str | None = None,
+        help: str = "OpenGraph collector",
     ): ...
     def icons(self, color: str, help: str = "BloodHound icons sync"): ...
     def queries(self, help: str = "BloodHound icons sync"): ...

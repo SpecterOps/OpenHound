@@ -64,6 +64,25 @@ def _edges(content):
     ]
 
 
+def test_source_kind_is_appended_to_emitted_node_kinds():
+    content = list(
+        _generate_graph_content(
+            [{"value": 1, "edge_count": 0, "has_node": True}],
+            _Asset,
+            1,
+            source_kind="Test_Source",
+        )
+    )
+
+    node = next(
+        item["graph"]["content"]
+        for item in content
+        if item["graph"]["entity_type"] == "node"
+    )
+
+    assert node["kinds"] == ["Test", "Test_Source"]
+
+
 def test_batches_edges_across_successive_rows_and_preserves_order():
     content = list(_generate_graph_content(_rows(1_001), _Asset, 150))
     wrappers = [item for item in content if item["graph"]["entity_type"] == "edge"]

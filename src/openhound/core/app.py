@@ -1,8 +1,3 @@
-import logging
-from enum import Enum
-from pathlib import Path
-from typing import Annotated, Callable, List
-
 import dlt
 import duckdb
 import typer
@@ -10,7 +5,11 @@ from dlt.common.libs import pydantic as dlt_pydantic
 from dlt.common.pipeline import LoadInfo
 from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
+from enum import Enum
+from pathlib import Path
+from typing import Annotated, Callable, List
 
+import logging
 from openhound.cli.collect import collect
 from openhound.cli.convert import convert
 from openhound.cli.preproc import preprocess
@@ -52,7 +51,7 @@ class Contract(str, Enum):
 
 
 class OpenHound:
-    def __init__(self, name: str, source_kind: str, help: str = "OpenGraph collector"):
+    def __init__(self, name: str, source_kind: str | None = None, help: str = "OpenGraph collector"):
         dlt_pydantic.create_list_model = validate.create_list_model
         dlt_pydantic._classify_validation_errors = validate._classify_validation_errors
 
@@ -78,9 +77,9 @@ class OpenHound:
         self.edges: list[EdgeDef] = []
 
     def collect(
-        self,
-        help: str = "OpenGraph collect pipeline",
-        **kwargs,
+            self,
+            help: str = "OpenGraph collect pipeline",
+            **kwargs,
     ):
         """Register a Typer CLI command that collects resources and stores them (filtered) on disk.
 
@@ -92,29 +91,29 @@ class OpenHound:
 
         def decorator(func: Callable):
             def wrapper(
-                output_path: OutputPath,
-                resources: List[str] = typer.Argument(None),
-                progress: Progress = typer.Option(
-                    Progress.tqdm, help="Select progress tracker option"
-                ),
-                tables_contract: Annotated[
-                    Contract,
-                    typer.Option(
-                        help="DLT contract applied when data contains newly seen resources/tables previously not collected",
+                    output_path: OutputPath,
+                    resources: List[str] = typer.Argument(None),
+                    progress: Progress = typer.Option(
+                        Progress.tqdm, help="Select progress tracker option"
                     ),
-                ] = Contract.evolve,
-                columns_contract: Annotated[
-                    Contract,
-                    typer.Option(
-                        help="DLT contract applied when data contains values/keys not found in the Pydantic model",
-                    ),
-                ] = Contract.evolve,
-                data_type_contract: Annotated[
-                    Contract,
-                    typer.Option(
-                        help="DLT contract applied when fields do not match the data types defined in the Pydantic model",
-                    ),
-                ] = Contract.discard_row,
+                    tables_contract: Annotated[
+                        Contract,
+                        typer.Option(
+                            help="DLT contract applied when data contains newly seen resources/tables previously not collected",
+                        ),
+                    ] = Contract.evolve,
+                    columns_contract: Annotated[
+                        Contract,
+                        typer.Option(
+                            help="DLT contract applied when data contains values/keys not found in the Pydantic model",
+                        ),
+                    ] = Contract.evolve,
+                    data_type_contract: Annotated[
+                        Contract,
+                        typer.Option(
+                            help="DLT contract applied when fields do not match the data types defined in the Pydantic model",
+                        ),
+                    ] = Contract.discard_row,
             ) -> LoadInfo | None:
                 schema_contract = {
                     "tables": tables_contract,
@@ -142,10 +141,10 @@ class OpenHound:
         return decorator
 
     def convert(
-        self,
-        lookup: Callable | None = None,
-        help: str = "OpenGraph convert pipeline",
-        **typer_kwargs,
+            self,
+            lookup: Callable | None = None,
+            help: str = "OpenGraph convert pipeline",
+            **typer_kwargs,
     ):
         """Register a Typer CLI command that converts collected resources to OpenGraph nodes and edges.
 
@@ -158,11 +157,11 @@ class OpenHound:
 
         def decorator(func: Callable):
             def run_convert(
-                input_path: InputPath,
-                output_path: Path = Path("/tmp/openhound"),
-                lookup_file: Path = DEFAULT_LOOKUP_FILE,
-                progress: Progress = Progress.tqdm,
-                method: Method = Method.write,
+                    input_path: InputPath,
+                    output_path: Path = Path("/tmp/openhound"),
+                    lookup_file: Path = DEFAULT_LOOKUP_FILE,
+                    progress: Progress = Progress.tqdm,
+                    method: Method = Method.write,
             ) -> LoadInfo:
                 lookup_session = None
                 if lookup:
@@ -197,31 +196,31 @@ class OpenHound:
                 )
 
             def wrapper(
-                input_path: InputPath,
-                output_path: Annotated[
-                    Path,
-                    typer.Argument(
-                        exists=False,
-                        file_okay=False,
-                        dir_okay=True,
-                        resolve_path=True,
-                        help="Output path to write OpenGraph JSON files",
+                    input_path: InputPath,
+                    output_path: Annotated[
+                        Path,
+                        typer.Argument(
+                            exists=False,
+                            file_okay=False,
+                            dir_okay=True,
+                            resolve_path=True,
+                            help="Output path to write OpenGraph JSON files",
+                        ),
+                    ],
+                    # resources: List[str] = typer.Argument(None),
+                    progress: Progress = typer.Option(
+                        Progress.tqdm, help="Select progress tracker option"
                     ),
-                ],
-                # resources: List[str] = typer.Argument(None),
-                progress: Progress = typer.Option(
-                    Progress.tqdm, help="Select progress tracker option"
-                ),
-                lookup_file: Annotated[
-                    Path,
-                    typer.Option(
-                        file_okay=True,
-                        dir_okay=False,
-                        readable=True,
-                        resolve_path=True,
-                        help="DuckDB lookup file path",
-                    ),
-                ] = DEFAULT_LOOKUP_FILE,
+                    lookup_file: Annotated[
+                        Path,
+                        typer.Option(
+                            file_okay=True,
+                            dir_okay=False,
+                            readable=True,
+                            resolve_path=True,
+                            help="DuckDB lookup file path",
+                        ),
+                    ] = DEFAULT_LOOKUP_FILE,
             ) -> LoadInfo:
                 return run_convert(
                     input_path=input_path,
@@ -241,10 +240,10 @@ class OpenHound:
         return decorator
 
     def preproc(
-        self,
-        transformer: Callable[[any], None] | None = None,
-        help: str = "OpenGraph preprocessing pipeline",
-        **typer_kwargs,
+            self,
+            transformer: Callable[[any], None] | None = None,
+            help: str = "OpenGraph preprocessing pipeline",
+            **typer_kwargs,
     ):
         """Register a Typer CLI command that performs optional preprocessing and builds lookup data for a source.
 
@@ -258,19 +257,19 @@ class OpenHound:
             self.preprocessor = func
 
             def wrapper(
-                input_path: InputPath,
-                output_file: Annotated[
-                    Path,
-                    typer.Argument(
-                        file_okay=True,
-                        dir_okay=False,
-                        readable=True,
-                        resolve_path=True,
+                    input_path: InputPath,
+                    output_file: Annotated[
+                        Path,
+                        typer.Argument(
+                            file_okay=True,
+                            dir_okay=False,
+                            readable=True,
+                            resolve_path=True,
+                        ),
+                    ] = DEFAULT_LOOKUP_FILE,
+                    progress: Progress = typer.Option(
+                        Progress.tqdm, help="Select progress tracker option"
                     ),
-                ] = DEFAULT_LOOKUP_FILE,
-                progress: Progress = typer.Option(
-                    Progress.tqdm, help="Select progress tracker option"
-                ),
             ) -> LoadInfo:
                 preprocessor = PreProcessor(
                     name=self.name,
@@ -299,9 +298,9 @@ class OpenHound:
         return dlt.defer(safe_func)
 
     def transformer(
-        self,
-        *dlt_args,
-        **dlt_kwargs,
+            self,
+            *dlt_args,
+            **dlt_kwargs,
     ):
         """Decorator to register a DLT transformer with added exception handling."""
 
@@ -316,9 +315,9 @@ class OpenHound:
         return decorator
 
     def resource(
-        self,
-        *dlt_args,
-        **dlt_kwargs,
+            self,
+            *dlt_args,
+            **dlt_kwargs,
     ):
         """Decorator to register a DLT resource with added exception handling."""
 
@@ -333,9 +332,9 @@ class OpenHound:
         return decorator
 
     def source(
-        self,
-        *dlt_args,
-        **dlt_kwargs,
+            self,
+            *dlt_args,
+            **dlt_kwargs,
     ):
         """Decorator to register a DLT source with added exception handling.
 
@@ -353,10 +352,10 @@ class OpenHound:
         return decorator
 
     def asset(
-        self,
-        node: NodeDef | None = None,
-        edges: list[EdgeDef] | None = None,
-        description: str = "Resource model for OpenGraph",
+            self,
+            node: NodeDef | None = None,
+            edges: list[EdgeDef] | None = None,
+            description: str = "Resource model for OpenGraph",
     ):
         """Decorator to register a resource class and its graph definitions (nodes/edges). This is used to automatically
         generate documentation for each unique resource and implement rules/warnings when nodes/edges are returned

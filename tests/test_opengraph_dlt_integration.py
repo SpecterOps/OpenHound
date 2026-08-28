@@ -304,9 +304,7 @@ def test_opengraph_file_destination_retries_staged_load_without_duplicates(
     pipeline = dlt.pipeline(
         pipeline_name="opengraph_dlt_restart",
         dataset_name="opengraph_dlt_restart",
-        destination=file_destination.opengraph_file(
-            output_path=str(output_dir), source_kind="test"
-        ),
+        destination=file_destination.opengraph_file(output_path=str(output_dir)),
         pipelines_dir=str(tmp_path / "pipelines"),
     )
     source = opengraph(
@@ -376,7 +374,7 @@ def test_opengraph_file_destination_cold_restart_resumes_pending_job(tmp_path):
                     pipeline_name="opengraph_cold_restart",
                     dataset_name="opengraph_cold_restart",
                     destination=file_destination.opengraph_file(
-                        output_path=os.environ["GRAPH_OUTPUT"], source_kind="test"
+                        output_path=os.environ["GRAPH_OUTPUT"]
                     ),
                     pipelines_dir=os.environ["PIPELINES_DIR"],
                 )

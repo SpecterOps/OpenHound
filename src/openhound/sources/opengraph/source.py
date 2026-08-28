@@ -7,7 +7,6 @@ from dlt.sources.filesystem import read_jsonl
 
 from openhound.core.asset import BaseAsset
 from openhound.core.lookup import LookupManager
-
 from .entries import GraphContent
 
 # DLT page boundary; partial pages flush per input file.
@@ -21,10 +20,11 @@ class GraphResource:
 
 
 def _generate_graph_content(
-    resources: Iterable[dict],
-    model: type[BaseAsset],
-    batch_size: int,
-    apply_context: Callable | None = None,
+        resources: Iterable[dict],
+        model: type[BaseAsset],
+        batch_size: int,
+        apply_context: Callable | None = None,
+        source_kind: str | None = None
 ):
     """Convert one DLT page into bounded OpenGraph batches."""
     edge_parts = []
@@ -41,6 +41,8 @@ def _generate_graph_content(
 
         as_node = parsed_resource.as_node
         if as_node:
+            if source_kind is not None and source_kind not in as_node.kinds:
+                as_node.kinds.append(source_kind)
             yield {
                 "graph": {
                     "content": serialize(as_node),
@@ -60,11 +62,12 @@ def _generate_graph_content(
 
 @dlt.source(name="opengraph", max_table_nesting=0)
 def opengraph(
-    graph_resources: list[GraphResource],
-    bucket_url: str,
-    lookup: LookupManager,
-    extras: dict | None = None,
-    batch_size: int = 150,
+        graph_resources: list[GraphResource],
+        bucket_url: str,
+        lookup: LookupManager,
+        extras: dict | None = None,
+        batch_size: int = 150,
+        source_kind: str | None = None
 ):
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
@@ -76,17 +79,17 @@ def opengraph(
     for graph_resource in graph_resources:
         table_name = f"{graph_resource.model.__name__.lower()}_fs"
         reader = (
-            filesystemsource(
-                bucket_url=bucket_url,
-                file_glob=f"{graph_resource.table}/**/*.jsonl.gz",
-            )
-            | read_jsonl(chunksize=READ_JSONL_PAGE_SIZE)
+                filesystemsource(
+                    bucket_url=bucket_url,
+                    file_glob=f"{graph_resource.table}/**/*.jsonl.gz",
+                )
+                | read_jsonl(chunksize=READ_JSONL_PAGE_SIZE)
         )
 
         @dlt.transformer(parallelized=False, name=table_name, columns=GraphContent)
         def generate_graph(resources, model, apply_context: Callable | None = None):
             yield from _generate_graph_content(
-                resources, model, batch_size, apply_context
+                resources, model, batch_size, apply_context, source_kind=source_kind
             )
 
         yield reader | generate_graph(
