@@ -152,6 +152,9 @@ class CollectorManager:
             is_valid_extension = cls.validate_extension(load_extension, extension.name)
             if is_valid_extension:
                 load_extension.metadata = metadata
+                load_extension.package_version = (
+                    extension.dist.version if extension.dist is not None else None
+                )
                 extensions.append(load_extension)
                 logger.info(
                     f"Loaded extension '{extension.name}' from entry point '{group}'",

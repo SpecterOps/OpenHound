@@ -6,6 +6,7 @@ from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 
+import openhound
 import openhound.core.logging as openhound_logging
 from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
 from openhound.core.clients.models.jobs import (
@@ -51,13 +52,35 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
         ExtensionNotFoundError: If the collector cannot be found via entrypoints.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    logger.info(f"Subprocess running collection '{collector_name}' for job {job_id}")
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
         if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
+            log_fields = {
+                "collector_extension": collector.name,
+                "collector_extension_version": (
+                    collector.package_version
+                    or (
+                        str(collector.metadata.version)
+                        if collector.metadata is not None
+                        else "unknown"
+                    )
+                ),
+                "openhound_version": openhound.__version__,
+                "job_id": job_id,
+            }
+            logger.info(
+                "Subprocess running collection '%s' for job %s",
+                collector_name,
+                job_id,
+                extra=log_fields,
+            )
             results = dataflow.pipeline(extension=collector)
-            logger.info(f"Collection for job {job_id} completed successfully.")
+            logger.info(
+                "Collection for job %s completed successfully.",
+                job_id,
+                extra=log_fields,
+            )
             return Result(results=results, job_id=job_id)
 
     logger.error(f"Collector '{collector_name}' not found in available collectors.")

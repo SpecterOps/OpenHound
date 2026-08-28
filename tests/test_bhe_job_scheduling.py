@@ -2,9 +2,11 @@ import base64
 import gzip
 import hashlib
 import json
+import logging
 from concurrent.futures import Future
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
@@ -750,3 +752,35 @@ def test_send_support_bundle_fails_after_transient_retries_are_exhausted(
         "operation_id": operation.id,
         "status": ManagementOperationStatus.FAILED.value,
     }
+
+
+def test_collection_logs_include_extension_and_openhound_versions(monkeypatch, caplog):
+    collector = SimpleNamespace(
+        name="example",
+        package_version="2.3.4",
+        metadata=SimpleNamespace(version="1.2.3"),
+    )
+    monkeypatch.setattr(
+        scheduler_service.CollectorManager,
+        "from_entrypoint",
+        lambda: SimpleNamespace(collectors=[collector]),
+    )
+    monkeypatch.setattr(
+        scheduler_service.dataflow, "pipeline", lambda extension: {"collect": []}
+    )
+    monkeypatch.setattr(scheduler_service.openhound, "__version__", "4.5.6")
+
+    with caplog.at_level(logging.INFO, logger="openhound.scheduler.service"):
+        _subprocess_collect("example", 42)
+
+    collection_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith(("Subprocess running collection", "Collection for job"))
+    ]
+    assert len(collection_records) == 2
+    for record in collection_records:
+        assert record.collector_extension == "example"
+        assert record.collector_extension_version == "2.3.4"
+        assert record.openhound_version == "4.5.6"
+        assert record.job_id == 42

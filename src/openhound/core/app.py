@@ -62,6 +62,8 @@ class OpenHound:
 
         # Extension metadata is loaded and validated when the extension is loaded in the CollectorManager
         self.metadata: Extension | None = None
+        # The installed distribution version is supplied by the extension entry point.
+        self.package_version: str | None = None
         # Store the collect/convert/preproc methods for this source
         self.collector: Callable | None = None
         self.converter: Callable | None = None
