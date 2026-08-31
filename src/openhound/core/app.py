@@ -52,7 +52,12 @@ class Contract(str, Enum):
 
 
 class OpenHound:
-    def __init__(self, name: str, source_kind: str, help: str = "OpenGraph collector"):
+    def __init__(
+        self,
+        name: str,
+        source_kind: str | None = None,
+        help: str = "OpenGraph collector",
+    ):
         dlt_pydantic.create_list_model = validate.create_list_model
         dlt_pydantic._classify_validation_errors = validate._classify_validation_errors
 

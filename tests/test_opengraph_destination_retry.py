@@ -54,9 +54,7 @@ def test_destination_retry_republishes_no_duplicate_parts(tmp_path, monkeypatch)
     pipeline = dlt.pipeline(
         pipeline_name="destination_retry_validation",
         dataset_name="destination_retry_validation",
-        destination=destination_module.opengraph_file(
-            output_path=str(output_dir), source_kind="test"
-        ),
+        destination=destination_module.opengraph_file(output_path=str(output_dir)),
     )
 
     # DLT retries the transient destination job in this call. The destination

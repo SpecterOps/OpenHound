@@ -33,7 +33,7 @@ class Converter(BasePipeline):
         input_path: Path,
         lookup: LookupManager,
         output_path: Path,
-        source_kind: str,
+        source_kind: str | None = None,
         progress: Progress = Progress.tqdm,
         method: Method = Method.write,
     ):
@@ -51,13 +51,11 @@ class Converter(BasePipeline):
             logger.debug(
                 "Initializing BloodHound Enterprise client for converter ingest method"
             )
-            dest = ingest(source_kind=self.source_kind)
+            dest = ingest()
 
         else:
             logger.debug("Using file output method for converter")
-            dest = opengraph_file(
-                output_path=str(self.output_path), source_kind=self.source_kind
-            )
+            dest = opengraph_file(output_path=str(self.output_path))
 
         pipeline = dlt.pipeline(
             pipeline_name=f"{self.name}_convert",
@@ -99,6 +97,7 @@ class Converter(BasePipeline):
                 lookup=self.lookup,
                 bucket_url=str(self.input_path),
                 extras=extra_context,
+                source_kind=self.source_kind,
             )
         )
 
