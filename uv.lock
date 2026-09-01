@@ -3,8 +3,8 @@ revision = 3
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.15' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
-    "python_full_version == '3.14.*' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
     "(python_full_version >= '3.15' and platform_python_implementation == 'PyPy') or (python_full_version >= '3.15' and sys_platform == 'emscripten')",
+    "python_full_version == '3.14.*' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
     "(python_full_version == '3.14.*' and platform_python_implementation == 'PyPy') or (python_full_version == '3.14.*' and sys_platform == 'emscripten')",
     "python_full_version < '3.14' and platform_python_implementation != 'PyPy' and sys_platform != 'emscripten'",
     "(python_full_version < '3.14' and platform_python_implementation == 'PyPy') or (python_full_version < '3.14' and sys_platform == 'emscripten')",
@@ -1327,8 +1327,8 @@ requires-dist = [
     { name = "griffe-fieldz", specifier = ">=0.5.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "mkdocstrings", extras = ["python"], specifier = ">=1.0.0" },
-    { name = "openhound-github", marker = "extra == 'all'", specifier = "==0.6.4" },
-    { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.6.4" },
+    { name = "openhound-github", marker = "extra == 'all'", specifier = "==0.7.0" },
+    { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.7.0" },
     { name = "openhound-jamf", marker = "extra == 'all'", specifier = "==0.3.0" },
     { name = "openhound-jamf", marker = "extra == 'jamf'", specifier = "==0.3.0" },
     { name = "openhound-okta", marker = "extra == 'all'", specifier = "==0.3.0" },
@@ -1373,15 +1373,15 @@ wheels = [
 
 [[package]]
 name = "openhound-github"
-version = "0.6.4"
+version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "joserfc" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/30/05/c129e0debe0332f1f0f8940834c5e7924a6bba2b0ccaccd66c2dca646cc5/openhound_github-0.6.4.tar.gz", hash = "sha256:e4ef76c12ff9e86aa51c6f8933bc0156bb7d3af199362ccc6ef75567731d1304", size = 3619229, upload-time = "2026-08-21T15:37:21.101Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3d/4f/ab35432751095f66467663da6297bd554959edc55bed4353f684f60897b8/openhound_github-0.7.0.tar.gz", hash = "sha256:c6669d66ebf73b781932b2ffa5d9308544c101ac9512b26852ac40b4622d3eff", size = 3630769, upload-time = "2026-09-01T03:19:41.52Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c5/22/2f4487a68f95bde9ff58d5ead48ebdc10bff28596938bb33e3c8b69338cc/openhound_github-0.6.4-py3-none-any.whl", hash = "sha256:e950a731296fec67349b7df6c20ab5fc28f943e74326b246917af1d16cf5d149", size = 145126, upload-time = "2026-08-21T15:37:19.553Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/0e/e40421c612f38e7755fe1a4548fecdfaf728ca7fcf053c7c82a900fdb2d3/openhound_github-0.7.0-py3-none-any.whl", hash = "sha256:e70572ad9b36a0353bc0340bbdaea5cb341589bd9ade7430aa42b5b4c7fe11a3", size = 152026, upload-time = "2026-09-01T03:19:40.373Z" },
 ]
 
 [[package]]
@@ -1882,7 +1882,7 @@ name = "pyzmq"
 version = "27.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "python_full_version < '3.15' and implementation_name == 'pypy'" },
+    { name = "cffi", marker = "implementation_name == 'pypy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/04/0b/3c9baedbdf613ecaa7aa07027780b8867f57b6293b6ee50de316c9f3222b/pyzmq-27.1.0.tar.gz", hash = "sha256:ac0765e3d44455adb6ddbf4417dcce460fc40a05978c08efdf2948072f6db540", size = 281750, upload-time = "2025-09-08T23:10:18.157Z" }
 wheels = [
