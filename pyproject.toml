@@ -25,7 +25,7 @@ dependencies = [
 all = [
     "openhound-jamf==0.3.0",
     "openhound-github==0.7.0",
-    "openhound-okta==0.3.0",
+    "openhound-okta==0.4.0",
 ]
 jamf = [
     "openhound-jamf==0.3.0",
@@ -35,7 +35,7 @@ github = [
 ]
 
 okta = [
-    "openhound-okta==0.3.0",
+    "openhound-okta==0.4.0",
 ]
 
 [project.scripts]

@@ -1331,8 +1331,8 @@ requires-dist = [
     { name = "openhound-github", marker = "extra == 'github'", specifier = "==0.7.0" },
     { name = "openhound-jamf", marker = "extra == 'all'", specifier = "==0.3.0" },
     { name = "openhound-jamf", marker = "extra == 'jamf'", specifier = "==0.3.0" },
-    { name = "openhound-okta", marker = "extra == 'all'", specifier = "==0.3.0" },
-    { name = "openhound-okta", marker = "extra == 'okta'", specifier = "==0.3.0" },
+    { name = "openhound-okta", marker = "extra == 'all'", specifier = "==0.4.0" },
+    { name = "openhound-okta", marker = "extra == 'okta'", specifier = "==0.4.0" },
     { name = "psutil", specifier = ">=7.2.1" },
     { name = "pydantic", specifier = "==2.13.3" },
     { name = "pydantic-extra-types", specifier = ">=2.11.1" },
@@ -1395,16 +1395,16 @@ wheels = [
 
 [[package]]
 name = "openhound-okta"
-version = "0.3.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "defusedxml" },
     { name = "joserfc" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a3/dd/37ccf0bd15b36b948173523134270d9a77a1b2efedcb42d1c9c4c97b8a2a/openhound_okta-0.3.0.tar.gz", hash = "sha256:3a34ea47c6ad7b13238edb466c1655c5361b737f39f8052dc789353c273285c9", size = 3616437, upload-time = "2026-08-20T20:10:37.535Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ac/d4/641f9a13bac66fb551af6761ebb68b99c5122f072821c0c5a2bae0c629a0/openhound_okta-0.4.0.tar.gz", hash = "sha256:1d89f93bd4e5f7af681906540cc0e5319fe797212d694d8d966e75f082a64276", size = 3622816, upload-time = "2026-09-01T20:45:45.486Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9d/93/47326555bb9acb377d8750f97fe060316fd86292aafbe53d73ab09b666f3/openhound_okta-0.3.0-py3-none-any.whl", hash = "sha256:1f49ca09c0698e33fc11b6bdbe0a6a211e40076f8a790b1519d348881052b566", size = 115267, upload-time = "2026-08-20T20:10:36.29Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/90/5d30019769336b675d0566df1c7ddaf920e8ccf53cb5aaa0f2057d8e364c/openhound_okta-0.4.0-py3-none-any.whl", hash = "sha256:2078e13571b0e945bf3d15590aae31bc09049445d8dab57395a29d3374b2269f", size = 117893, upload-time = "2026-09-01T20:45:43.812Z" },
 ]
 
 [[package]]
