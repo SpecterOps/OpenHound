@@ -1,4 +1,7 @@
 # Example configuration: https://bloodhound.specterops.io/openhound/enterprise#full-configuration-example
+[openhound]
+managed = false
+
 [runtime]
 http_show_error_body = true
 log_cli_level = "WARNING"
