@@ -62,26 +62,38 @@ jobs:
           echo "clean_version=$CLEAN_VERSION" >> "$GITHUB_OUTPUT"
           echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Set image tags
-        id: image-tags
-        run: |
-          TAGS="${{ steps.image-ref.outputs.version_tag }}"
-
-          if [ "${{ inputs.prerelease }}" != "true" ] && [ -n "${{ matrix.latest_tag }}" ]; then
-            TAGS="${TAGS}"$'\n'"${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:${{ matrix.latest_tag }}"
-          fi
-
-          {
-            echo "tags<<EOF"
-            echo "$TAGS"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+      - name: Generate Metadata
+        id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # ratchet:docker/metadata-action@v5
+        with:
+          images: |
+            ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}
+          tags: |
+            # prerelease
+            type=raw,value=${{ steps.image-ref.outputs.clean_version }},suffix=${{ matrix.suffix }},enable=${{ inputs.prerelease }}
+            type=sha,format=short,prefix=prerelease-,suffix=${{ matrix.suffix }},enable=${{ inputs.prerelease }}
+            # release
+            type=raw,value=${{ steps.image-ref.outputs.clean_version }},suffix=${{ matrix.suffix }},enable=${{ ! inputs.prerelease }}
+            type=raw,value=${{ matrix.latest_tag }},enable=${{ ! inputs.prerelease }}
+            type=sha,format=short,prefix=release-,suffix=${{ matrix.suffix }},enable=${{ ! inputs.prerelease }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # ratchet:aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.BHE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.BHE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: 'us-east-1'
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@f2e9fc6c2b355c1890b65e6f6f0e2ac3e6e22f78 # ratchet:aws-actions/amazon-ecr-login@v2
 
       - name: Login to Docker registry
         run: |
@@ -97,7 +109,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           sbom: true
-          tags: ${{ steps.image-tags.outputs.tags }}
+          tags: ${{ steps.metadata.outputs.tags }}
           build-args: |
             OPENHOUND_VERSION=${{ steps.image-ref.outputs.clean_version }}
 
