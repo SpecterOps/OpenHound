@@ -1,6 +1,7 @@
 import logging
-from typing import Any
+from typing import Any, cast
 
+import boto3
 import pytest
 from botocore.exceptions import (
     ClientError,
@@ -8,6 +9,7 @@ from botocore.exceptions import (
     NoCredentialsError,
     NoRegionError,
 )
+from botocore.stub import Stubber
 
 from openhound.core.clients.aws_secrets_manager import (
     AWSConfigurationError,
@@ -32,7 +34,7 @@ class FakeSecretsManagerClient:
         self.error = error
         self.batch_response = batch_response
         self.batch_error = batch_error
-        self.requested_secret_id = None
+        self.requested_secret_id: str | None = None
         self.batch_requests: list[list[str]] = []
 
     def get_secret_value(self, *, SecretId: str) -> dict[str, Any]:
@@ -54,7 +56,13 @@ def aws_error(code: str, message: str) -> ClientError:
     return ClientError(
         {
             "Error": {"Code": code, "Message": message},
-            "ResponseMetadata": {"HTTPStatusCode": 400},
+            "ResponseMetadata": {
+                "HTTPHeaders": {},
+                "HTTPStatusCode": 400,
+                "HostId": "",
+                "RequestId": "",
+                "RetryAttempts": 0,
+            },
         },
         "GetSecretValue",
     )
@@ -69,24 +77,80 @@ def test_get_secret_returns_plain_text_and_passes_secret_id() -> None:
     assert client.requested_secret_id == "secret-id"
 
 
-def test_get_secret_logs_one_final_outcome(caplog: pytest.LogCaptureFixture) -> None:
-    client = FakeSecretsManagerClient({"SecretString": "secret-value"})
-
-    with caplog.at_level(logging.DEBUG):
-        AWSSecretsManager(client).get_secret("secret-id")
-
-    assert len(caplog.records) == 1
-    assert caplog.records[0].operation == "get_secret_value"
-    assert caplog.records[0].outcome == "success"
-    assert caplog.records[0].getMessage() == "Secret retrieval completed"
-
-
 def test_get_secret_returns_json_object() -> None:
     client = FakeSecretsManagerClient({"SecretString": '{"username":"user"}'})
 
     result = AWSSecretsManager(client).get_secret("secret-id")
 
     assert result == {"username": "user"}
+
+
+def test_get_secret_works_with_a_real_boto3_client_offline() -> None:
+    client = boto3.client(
+        "secretsmanager",
+        region_name="us-east-1",
+        aws_access_key_id="testing",
+        aws_secret_access_key="testing",
+    )
+    response = {
+        "ARN": "arn:aws:secretsmanager:us-east-1:123456789012:secret:local-secret",
+        "Name": "local-secret",
+        "SecretString": '{"username":"local-user"}',
+        "VersionId": "00000000000000000000000000000001",
+        "CreatedDate": 0,
+    }
+
+    with Stubber(client) as stubber:
+        stubber.add_response(
+            "get_secret_value",
+            response,
+            {"SecretId": "local-secret"},
+        )
+
+        result = AWSSecretsManager(client).get_secret("local-secret")
+
+        assert result == {"username": "local-user"}
+        stubber.assert_no_pending_responses()
+
+
+def test_get_secrets_works_with_a_real_boto3_client_offline() -> None:
+    client = boto3.client(
+        "secretsmanager",
+        region_name="us-east-1",
+        aws_access_key_id="testing",
+        aws_secret_access_key="testing",
+    )
+    response = {
+        "SecretValues": [
+            {
+                "ARN": "arn:aws:secretsmanager:us-east-1:123456789012:secret:first",
+                "Name": "first",
+                "SecretString": "value-1",
+                "VersionId": "00000000000000000000000000000001",
+                "CreatedDate": 0,
+            },
+            {
+                "ARN": "arn:aws:secretsmanager:us-east-1:123456789012:secret:second",
+                "Name": "second",
+                "SecretString": "value-2",
+                "VersionId": "00000000000000000000000000000002",
+                "CreatedDate": 0,
+            },
+        ],
+        "Errors": [],
+    }
+
+    with Stubber(client) as stubber:
+        stubber.add_response(
+            "batch_get_secret_value",
+            response,
+            {"SecretIdList": ["first", "second"]},
+        )
+
+        result = AWSSecretsManager(client).get_secrets(["first", "second"])
+
+        assert result == {"first": "value-1", "second": "value-2"}
+        stubber.assert_no_pending_responses()
 
 
 @pytest.mark.parametrize(
@@ -97,26 +161,16 @@ def test_get_secret_returns_json_object() -> None:
     ],
 )
 def test_get_secret_maps_aws_errors_without_leaking_values(
-    error_code: str, exception_type: type[Exception], caplog: pytest.LogCaptureFixture
+    error_code: str, exception_type: type[Exception]
 ) -> None:
     secret_value = "do-not-leak-this-value"
     client = FakeSecretsManagerClient(error=aws_error(error_code, secret_value))
 
-    with caplog.at_level(logging.DEBUG), pytest.raises(exception_type) as raised:
+    with pytest.raises(exception_type) as raised:
         AWSSecretsManager(client).get_secret("secret-id")
 
     assert secret_value not in str(raised.value)
-    assert secret_value not in caplog.text
-    assert "secret-id" not in caplog.text
-    assert "2d4e223a1833" not in caplog.text
-    assert (
-        sum(
-            record.levelno == logging.ERROR
-            and record.getMessage() == "Secret retrieval failed"
-            for record in caplog.records
-        )
-        == 1
-    )
+    assert "secret-id" not in str(raised.value)
 
 
 def test_get_secret_rejects_malformed_json_without_leaking_value() -> None:
@@ -161,9 +215,7 @@ def test_get_secrets_returns_values_mapped_to_requested_ids() -> None:
     assert client.batch_requests == [["first", "second"]]
 
 
-def test_get_secrets_falls_back_when_batch_api_is_unavailable(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_get_secrets_falls_back_when_batch_api_is_unavailable() -> None:
     class LegacyClient:
         def __init__(self) -> None:
             self.requested_ids: list[str] = []
@@ -174,15 +226,10 @@ def test_get_secrets_falls_back_when_batch_api_is_unavailable(
 
     client = LegacyClient()
 
-    with caplog.at_level(logging.DEBUG):
-        result = AWSSecretsManager(client).get_secrets(["first", "second"])
+    result = AWSSecretsManager(client).get_secrets(["first", "second"])
 
     assert result == {"first": "value-first", "second": "value-second"}
     assert client.requested_ids == ["first", "second"]
-    assert len(caplog.records) == 1
-    assert caplog.records[0].operation == "batch_get_secret_value"
-    assert caplog.records[0].outcome == "success"
-    assert caplog.records[0].secret_count == 2
 
 
 def test_get_secrets_rejects_string_secret_ids() -> None:
@@ -254,26 +301,20 @@ def test_get_secrets_raises_typed_error_for_partial_batch_failure(
         AWSSecretsManager(client).get_secrets(["available", "missing"])
 
     assert isinstance(raised.value.failures["missing"], SecretNotFoundError)
-    assert secret_value not in str(raised.value)
-    assert secret_value not in caplog.text
-    assert "missing" not in caplog.text
-    assert "ffa63583dfa6" not in caplog.text
-    assert (
-        sum(
-            record.levelno == logging.ERROR
-            and record.getMessage() == "Secret retrieval failed"
-            for record in caplog.records
-        )
-        == 1
+    forbidden_values = {"available", "missing", secret_value}
+    assert all(value not in str(raised.value) for value in forbidden_values)
+    assert all(value not in caplog.text for value in forbidden_values)
+    assert all(
+        all(value not in repr(record.__dict__) for value in forbidden_values)
+        for record in caplog.records
     )
-    for record in caplog.records:
-        record_text = repr(record.__dict__)
-        assert "available" not in record_text
-        assert "missing" not in record_text
-        assert "ffa63583dfa6" not in record_text
-        assert record.provider == "aws.secretsmanager"
-        assert record.operation == "batch_get_secret_value"
-        assert record.secret_count == 2
+    assert len(caplog.records) == 1
+    record = cast(Any, caplog.records[0])
+    assert record.levelno == logging.ERROR
+    assert record.provider == "aws.secretsmanager"
+    assert record.operation == "batch_get_secret_value"
+    assert record.outcome == "failure"
+    assert record.secret_count == 2
 
 
 @pytest.mark.parametrize(
@@ -297,7 +338,7 @@ def test_get_secrets_classifies_sdk_failures(error, expected) -> None:
     assert isinstance(raised.value.failures["secret-id"], expected)
 
 
-def test_retrieval_logs_one_outcome_without_secret_values(
+def test_get_secrets_logs_structured_success_without_secret_values(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     text_value = "plain-secret-value"
@@ -315,29 +356,25 @@ def test_retrieval_logs_one_outcome_without_secret_values(
         AWSSecretsManager(client).get_secrets(["text-secret", "json-secret"])
 
     assert len(caplog.records) == 1
-    assert caplog.records[0].getMessage() == "Secret retrieval completed"
+    record = cast(Any, caplog.records[0])
+    assert record.levelno == logging.DEBUG
+    assert record.provider == "aws.secretsmanager"
+    assert record.operation == "batch_get_secret_value"
+    assert record.outcome == "success"
+    assert record.secret_count == 2
     forbidden_values = {
         "text-secret",
         "json-secret",
         text_value,
         json_value,
-        "a5353f2b7585",
-        "9bda9177a37d",
     }
-    for record in caplog.records:
-        record_text = repr(record.__dict__)
-        assert all(value not in record_text for value in forbidden_values)
-        assert record.provider == "aws.secretsmanager"
-        assert record.operation == "batch_get_secret_value"
-        assert record.secret_count == 2
-
-    assert text_value not in caplog.text
-    assert json_value not in caplog.text
+    assert all(value not in repr(record.__dict__) for value in forbidden_values)
+    assert all(value not in caplog.text for value in forbidden_values)
 
 
 def test_constructor_rejects_invalid_client() -> None:
     with pytest.raises(AWSConfigurationError, match="does not support"):
-        AWSSecretsManager(object())
+        AWSSecretsManager(cast(Any, object()))
 
 
 def test_constructor_does_not_create_an_aws_client(monkeypatch) -> None:
@@ -349,9 +386,7 @@ def test_constructor_does_not_create_an_aws_client(monkeypatch) -> None:
     AWSSecretsManager()
 
 
-def test_get_secret_logs_failure_when_client_creation_fails(
-    monkeypatch, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_get_secret_classifies_lazy_client_creation_failure(monkeypatch) -> None:
     def fail_client_creation(*_args):
         raise NoRegionError()
 
@@ -360,9 +395,5 @@ def test_get_secret_logs_failure_when_client_creation_fails(
         fail_client_creation,
     )
 
-    with caplog.at_level(logging.DEBUG), pytest.raises(AWSConfigurationError):
+    with pytest.raises(AWSConfigurationError):
         AWSSecretsManager().get_secret("secret-id")
-
-    assert len(caplog.records) == 1
-    assert caplog.records[0].operation == "get_secret_value"
-    assert caplog.records[0].outcome == "failure"

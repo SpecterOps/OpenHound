@@ -81,9 +81,7 @@ class AWSSecretsManager:
         """Retrieve one text or JSON-object secret."""
         try:
             client = self._get_client()
-            value = self._retrieve_secret(
-                cast(GetSecretValueClient, client), secret_id
-            )
+            value = self._retrieve_secret(cast(GetSecretValueClient, client), secret_id)
         except SecretRetrievalError:
             _log_result("get_secret_value", "failure")
             raise
@@ -156,7 +154,7 @@ class AWSSecretsManager:
         try:
             return cast(SecretsManagerClient, boto3.client("secretsmanager"))
         except BotoCoreError as error:
-            raise _classify_boto_core_error(error) from None
+            raise _classify_sdk_error(error) from None
 
     def _retrieve_secret(
         self, client: GetSecretValueClient, secret_id: str
@@ -307,11 +305,10 @@ def _matching_requested_id(
     return None
 
 
-def _classify_client_error(error: ClientError) -> SecretRetrievalError:
-    return _classify_error_code(_client_error_code(error))
-
-
-def _classify_boto_core_error(error: BotoCoreError) -> SecretRetrievalError:
+def _classify_sdk_error(error: ClientError | BotoCoreError) -> SecretRetrievalError:
+    """Map a raised boto or SDK error to the public retrieval exception."""
+    if isinstance(error, ClientError):
+        return _classify_error_code(error.response.get("Error", {}).get("Code"))
     if isinstance(error, (NoCredentialsError, NoRegionError)):
         return AWSConfigurationError(
             "AWS Secrets Manager client configuration is invalid"
@@ -319,16 +316,9 @@ def _classify_boto_core_error(error: BotoCoreError) -> SecretRetrievalError:
     return SecretRequestError("AWS Secrets Manager request could not be completed")
 
 
-def _classify_sdk_error(
-    error: ClientError | BotoCoreError,
-) -> SecretRetrievalError:
-    if isinstance(error, ClientError):
-        return _classify_client_error(error)
-    return _classify_boto_core_error(error)
-
-
 def _is_batch_fallback_error(error: ClientError) -> bool:
-    return _client_error_code(error) in {
+    """Return whether a batch-only failure should fall back to individual reads."""
+    return error.response.get("Error", {}).get("Code") in {
         "AccessDenied",
         "AccessDeniedException",
         "UnauthorizedOperation",
@@ -338,6 +328,7 @@ def _is_batch_fallback_error(error: ClientError) -> bool:
 
 
 def _classify_error_code(error_code: Any) -> SecretRetrievalError:
+    """Map an AWS error code to its public retrieval exception."""
     if error_code == "ResourceNotFoundException":
         return SecretNotFoundError("AWS secret was not found")
     if error_code in {
@@ -349,10 +340,6 @@ def _classify_error_code(error_code: Any) -> SecretRetrievalError:
     }:
         return SecretPermissionError("AWS Secrets Manager denied access to the secret")
     return SecretRequestError("AWS Secrets Manager request could not be completed")
-
-
-def _client_error_code(error: ClientError) -> Any:
-    return error.response.get("Error", {}).get("Code")
 
 
 def _log_result(operation: str, outcome: str, secret_count: int | None = None) -> None:
