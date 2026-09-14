@@ -71,7 +71,6 @@ dev = [
     "ipython>=9.13.0",
     "pre-commit>=4.5.1",
     "pytest>=9.0.1",
-    "boto3-stubs~=1.43.90",
     "marimo>=0.23.5",
     "altair>=6.1.0",
     "fastapi>=0.136.1",
