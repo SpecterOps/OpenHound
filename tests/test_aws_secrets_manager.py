@@ -69,6 +69,18 @@ def test_get_secret_returns_plain_text_and_passes_secret_id() -> None:
     assert client.requested_secret_id == "secret-id"
 
 
+def test_get_secret_logs_one_final_outcome(caplog: pytest.LogCaptureFixture) -> None:
+    client = FakeSecretsManagerClient({"SecretString": "secret-value"})
+
+    with caplog.at_level(logging.DEBUG):
+        AWSSecretsManager(client).get_secret("secret-id")
+
+    assert len(caplog.records) == 1
+    assert caplog.records[0].operation == "get_secret_value"
+    assert caplog.records[0].outcome == "success"
+    assert caplog.records[0].getMessage() == "Secret retrieval completed"
+
+
 def test_get_secret_returns_json_object() -> None:
     client = FakeSecretsManagerClient({"SecretString": '{"username":"user"}'})
 
@@ -100,14 +112,11 @@ def test_get_secret_maps_aws_errors_without_leaking_values(
     assert (
         sum(
             record.levelno == logging.ERROR
-            and record.getMessage() == "Failure to retrieve secret"
+            and record.getMessage() == "Secret retrieval failed"
             for record in caplog.records
         )
         == 1
     )
-    messages = [record.getMessage() for record in caplog.records]
-    assert "Secret retrieval attempt" in messages
-    assert "Secret retrieval result" in messages
 
 
 def test_get_secret_rejects_malformed_json_without_leaking_value() -> None:
@@ -152,7 +161,9 @@ def test_get_secrets_returns_values_mapped_to_requested_ids() -> None:
     assert client.batch_requests == [["first", "second"]]
 
 
-def test_get_secrets_falls_back_when_batch_api_is_unavailable() -> None:
+def test_get_secrets_falls_back_when_batch_api_is_unavailable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class LegacyClient:
         def __init__(self) -> None:
             self.requested_ids: list[str] = []
@@ -163,10 +174,22 @@ def test_get_secrets_falls_back_when_batch_api_is_unavailable() -> None:
 
     client = LegacyClient()
 
-    result = AWSSecretsManager(client).get_secrets(["first", "second"])
+    with caplog.at_level(logging.DEBUG):
+        result = AWSSecretsManager(client).get_secrets(["first", "second"])
 
     assert result == {"first": "value-first", "second": "value-second"}
     assert client.requested_ids == ["first", "second"]
+    assert len(caplog.records) == 1
+    assert caplog.records[0].operation == "batch_get_secret_value"
+    assert caplog.records[0].outcome == "success"
+    assert caplog.records[0].secret_count == 2
+
+
+def test_get_secrets_rejects_string_secret_ids() -> None:
+    client = FakeSecretsManagerClient(batch_response={"SecretValues": []})
+
+    with pytest.raises(TypeError, match="iterable of secret identifiers"):
+        AWSSecretsManager(client).get_secrets("secret-id")
 
 
 def test_get_secrets_falls_back_when_batch_permission_is_missing() -> None:
@@ -238,7 +261,7 @@ def test_get_secrets_raises_typed_error_for_partial_batch_failure(
     assert (
         sum(
             record.levelno == logging.ERROR
-            and record.getMessage() == "Failure to retrieve secret"
+            and record.getMessage() == "Secret retrieval failed"
             for record in caplog.records
         )
         == 1
@@ -274,7 +297,7 @@ def test_get_secrets_classifies_sdk_failures(error, expected) -> None:
     assert isinstance(raised.value.failures["secret-id"], expected)
 
 
-def test_retrieval_logs_attempt_and_result_without_secret_values(
+def test_retrieval_logs_one_outcome_without_secret_values(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     text_value = "plain-secret-value"
@@ -291,9 +314,8 @@ def test_retrieval_logs_attempt_and_result_without_secret_values(
     with caplog.at_level(logging.DEBUG):
         AWSSecretsManager(client).get_secrets(["text-secret", "json-secret"])
 
-    messages = [record.getMessage() for record in caplog.records]
-    assert "Secret retrieval attempt" in messages
-    assert "Secret retrieval result" in messages
+    assert len(caplog.records) == 1
+    assert caplog.records[0].getMessage() == "Secret retrieval completed"
     forbidden_values = {
         "text-secret",
         "json-secret",
@@ -311,8 +333,6 @@ def test_retrieval_logs_attempt_and_result_without_secret_values(
 
     assert text_value not in caplog.text
     assert json_value not in caplog.text
-    assert "Secret retrieval attempt" in messages
-    assert "Secret retrieval result" in messages
 
 
 def test_constructor_rejects_invalid_client() -> None:
@@ -327,3 +347,22 @@ def test_constructor_does_not_create_an_aws_client(monkeypatch) -> None:
     )
 
     AWSSecretsManager()
+
+
+def test_get_secret_logs_failure_when_client_creation_fails(
+    monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fail_client_creation(*_args):
+        raise NoRegionError()
+
+    monkeypatch.setattr(
+        "openhound.core.clients.aws_secrets_manager.boto3.client",
+        fail_client_creation,
+    )
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(AWSConfigurationError):
+        AWSSecretsManager().get_secret("secret-id")
+
+    assert len(caplog.records) == 1
+    assert caplog.records[0].operation == "get_secret_value"
+    assert caplog.records[0].outcome == "failure"

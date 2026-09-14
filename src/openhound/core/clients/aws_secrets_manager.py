@@ -17,12 +17,17 @@ MAX_BATCH_SIZE = 20
 _PROVIDER = "aws.secretsmanager"
 
 
-class SecretsManagerClient(Protocol):
+class GetSecretValueClient(Protocol):
     def get_secret_value(self, *, SecretId: str) -> Mapping[str, Any]: ...
 
+
+class BatchGetSecretValueClient(Protocol):
     def batch_get_secret_value(
         self, *, SecretIdList: list[str]
     ) -> Mapping[str, Any]: ...
+
+
+SecretsManagerClient = GetSecretValueClient | BatchGetSecretValueClient
 
 
 class SecretRetrievalError(Exception):
@@ -74,17 +79,21 @@ class AWSSecretsManager:
 
     def get_secret(self, secret_id: str) -> SecretValue:
         """Retrieve one text or JSON-object secret."""
-        _log_attempt("get_secret_value")
         try:
             client = self._get_client()
+            value = self._retrieve_secret(
+                cast(GetSecretValueClient, client), secret_id
+            )
         except SecretRetrievalError:
-            _log_failure("get_secret_value")
             _log_result("get_secret_value", "failure")
             raise
-        return self._retrieve_secret(client, secret_id)
+        _log_result("get_secret_value", "success")
+        return value
 
     def get_secrets(self, secret_ids: Iterable[str]) -> dict[str, SecretValue]:
         """Retrieve any number of secrets in AWS-supported batch sizes."""
+        if isinstance(secret_ids, str):
+            raise TypeError("secret_ids must be an iterable of secret identifiers")
         requested_ids = list(secret_ids)
         if not requested_ids:
             return {}
@@ -92,56 +101,52 @@ class AWSSecretsManager:
         try:
             client = self._get_client()
         except SecretRetrievalError as error:
-            _log_attempt("batch_get_secret_value", len(requested_ids))
-            _log_failure("batch_get_secret_value", len(requested_ids))
-            _log_result("batch_get_secret_value", "failure", len(requested_ids))
             failures = {secret_id: error for secret_id in requested_ids}
+            _log_result("batch_get_secret_value", "failure", len(requested_ids))
             raise SecretBatchError(failures) from None
-        if not callable(getattr(client, "batch_get_secret_value", None)):
-            _log_attempt("batch_get_secret_value", len(requested_ids))
-            _log_result("batch_get_secret_value", "fallback", len(requested_ids))
-            return self._get_secrets_individually(client, requested_ids)
+        try:
+            if not callable(getattr(client, "batch_get_secret_value", None)):
+                values = self._get_secrets_individually(
+                    cast(GetSecretValueClient, client), requested_ids
+                )
+            else:
+                values = self._get_secrets_in_batches(client, requested_ids)
+        except SecretBatchError:
+            _log_result("batch_get_secret_value", "failure", len(requested_ids))
+            raise
+        _log_result("batch_get_secret_value", "success", len(requested_ids))
+        return values
 
+    def _get_secrets_in_batches(
+        self, client: SecretsManagerClient, secret_ids: list[str]
+    ) -> dict[str, SecretValue]:
         values: dict[str, SecretValue] = {}
-        for chunk_index, chunk in enumerate(_chunks(requested_ids, MAX_BATCH_SIZE)):
-            secret_count = len(chunk)
-            _log_attempt("batch_get_secret_value", secret_count)
-
+        for chunk_index, chunk in enumerate(_chunks(secret_ids, MAX_BATCH_SIZE)):
             try:
-                response = client.batch_get_secret_value(SecretIdList=chunk)
-            except ClientError as error:
-                if _is_batch_fallback_error(error):
-                    _log_result("batch_get_secret_value", "fallback", secret_count)
+                response = cast(
+                    BatchGetSecretValueClient, client
+                ).batch_get_secret_value(SecretIdList=chunk)
+            except (ClientError, BotoCoreError) as error:
+                if isinstance(error, ClientError) and _is_batch_fallback_error(error):
                     values.update(
                         self._get_secrets_individually(
-                            client,
-                            requested_ids[chunk_index * MAX_BATCH_SIZE :],
+                            cast(GetSecretValueClient, client),
+                            secret_ids[chunk_index * MAX_BATCH_SIZE :],
                         )
                     )
-                    return values
-                classified = _classify_client_error(error)
-                failures = {secret_id: classified for secret_id in chunk}
-                _log_failure("batch_get_secret_value", secret_count)
-                _log_result("batch_get_secret_value", "failure", secret_count)
-                raise SecretBatchError(failures) from None
-            except BotoCoreError as error:
-                classified = _classify_boto_core_error(error)
-                failures = {secret_id: classified for secret_id in chunk}
-                _log_failure("batch_get_secret_value", secret_count)
-                _log_result("batch_get_secret_value", "failure", secret_count)
-                raise SecretBatchError(failures) from None
+                    break
+                classified = _classify_sdk_error(error)
+                raise SecretBatchError(
+                    {secret_id: classified for secret_id in chunk}
+                ) from None
 
             failures = _batch_response_failures(response, chunk)
             chunk_values, value_failures = _parse_batch_values(response, chunk)
             for secret_id, value_error in value_failures.items():
                 failures.setdefault(secret_id, value_error)
             if failures:
-                _log_failure("batch_get_secret_value", secret_count)
-                _log_result("batch_get_secret_value", "failure", secret_count)
                 raise SecretBatchError(failures) from None
-
             values.update({secret_id: chunk_values[secret_id] for secret_id in chunk})
-            _log_result("batch_get_secret_value", "success", secret_count)
 
         return values
 
@@ -154,9 +159,8 @@ class AWSSecretsManager:
             raise _classify_boto_core_error(error) from None
 
     def _retrieve_secret(
-        self, client: SecretsManagerClient, secret_id: str
+        self, client: GetSecretValueClient, secret_id: str
     ) -> SecretValue:
-        _log_attempt("get_secret_value")
         try:
             if not callable(getattr(client, "get_secret_value", None)):
                 raise AWSConfigurationError(
@@ -164,26 +168,12 @@ class AWSSecretsManager:
                 )
             response = client.get_secret_value(SecretId=secret_id)
             value = _parse_secret_value(response)
-        except SecretRetrievalError:
-            _log_failure("get_secret_value")
-            _log_result("get_secret_value", "failure")
-            raise
-        except ClientError as error:
-            classified = _classify_client_error(error)
-            _log_failure("get_secret_value")
-            _log_result("get_secret_value", "failure")
-            raise classified from None
-        except BotoCoreError as error:
-            classified = _classify_boto_core_error(error)
-            _log_failure("get_secret_value")
-            _log_result("get_secret_value", "failure")
-            raise classified from None
-
-        _log_result("get_secret_value", "success")
+        except (ClientError, BotoCoreError) as error:
+            raise _classify_sdk_error(error) from None
         return value
 
     def _get_secrets_individually(
-        self, client: SecretsManagerClient, secret_ids: list[str]
+        self, client: GetSecretValueClient, secret_ids: list[str]
     ) -> dict[str, SecretValue]:
         values: dict[str, SecretValue] = {}
         failures: dict[str, SecretRetrievalError] = {}
@@ -329,6 +319,14 @@ def _classify_boto_core_error(error: BotoCoreError) -> SecretRetrievalError:
     return SecretRequestError("AWS Secrets Manager request could not be completed")
 
 
+def _classify_sdk_error(
+    error: ClientError | BotoCoreError,
+) -> SecretRetrievalError:
+    if isinstance(error, ClientError):
+        return _classify_client_error(error)
+    return _classify_boto_core_error(error)
+
+
 def _is_batch_fallback_error(error: ClientError) -> bool:
     return _client_error_code(error) in {
         "AccessDenied",
@@ -357,20 +355,6 @@ def _client_error_code(error: ClientError) -> Any:
     return error.response.get("Error", {}).get("Code")
 
 
-def _log_attempt(operation: str, secret_count: int | None = None) -> None:
-    extra: dict[str, str | int] = {
-        "provider": _PROVIDER,
-        "operation": operation,
-        "outcome": "attempt",
-    }
-    if secret_count is not None:
-        extra["secret_count"] = secret_count
-    logger.debug(
-        "Secret retrieval attempt",
-        extra=extra,
-    )
-
-
 def _log_result(operation: str, outcome: str, secret_count: int | None = None) -> None:
     extra: dict[str, str | int] = {
         "provider": _PROVIDER,
@@ -379,18 +363,7 @@ def _log_result(operation: str, outcome: str, secret_count: int | None = None) -
     }
     if secret_count is not None:
         extra["secret_count"] = secret_count
-    logger.debug(
-        "Secret retrieval result",
-        extra=extra,
-    )
-
-
-def _log_failure(operation: str, secret_count: int | None = None) -> None:
-    extra: dict[str, str | int] = {
-        "provider": _PROVIDER,
-        "operation": operation,
-        "outcome": "failure",
-    }
-    if secret_count is not None:
-        extra["secret_count"] = secret_count
-    logger.error("Failure to retrieve secret", extra=extra)
+    if outcome == "failure":
+        logger.error("Secret retrieval failed", extra=extra)
+    else:
+        logger.debug("Secret retrieval completed", extra=extra)
