@@ -30,8 +30,8 @@ jobs:
           images: |
             ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}
           tags: |
-            type=raw,prefix=ecr-,value=${{ inputs.tag }},enable=true
-            type=sha,format=short,prefix=ecr-,enable=true
+            type=raw,prefix=ecr-${{ inputs.target }},value=${{ inputs.tag }},enable=true
+            type=sha,format=short,prefix=ecr-${{ inputs.target }},enable=true
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
