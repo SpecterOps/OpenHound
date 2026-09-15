@@ -79,10 +79,9 @@ def test_log_routing_content(tmp_path, caplog, monkeypatch):
     root_logger = logging.getLogger()
     dlt_logger = logging.getLogger("dlt")
 
-    with caplog.at_level(logging.INFO):
-        with caplog.at_level(logging.INFO, logger="dlt"):
-            root_logger.info("Core openhound log")
-            dlt_logger.info("Extension DLT log")
+    with caplog.at_level(logging.INFO), caplog.at_level(logging.INFO, logger="dlt"):
+        root_logger.info("Core openhound log")
+        dlt_logger.info("Extension DLT log")
 
     assert (tmp_path / "openhound.log").exists(), (
         "The 'openhound.log' file should exist for the core logs"
@@ -125,6 +124,95 @@ def test_file_formatter_selection():
     assert isinstance(text_logger._file_formatter(), OpenHoundTextFormatter), (
         "log_format 'text' should produce a plain-text formatter"
     )
+
+
+def test_managed_mode_writes_structured_file_logs(tmp_path, monkeypatch):
+    """Managed mode should default rotating file logs to newline-delimited JSON."""
+    monkeypatch.setenv("OPENHOUND__MANAGED", "true")
+    monkeypatch.delenv("RUNTIME__LOG_FORMAT", raising=False)
+    monkeypatch.setenv("RUNTIME__LOG_PATH", str(tmp_path))
+    custom_logger = CustomLogger("managed.log", base_path=str(tmp_path))
+    # Keep this setup isolated from the process-wide loggers used by other tests.
+    custom_logger.root_logger = logging.getLogger("managed-test")
+    custom_logger.dlt_logger = logging.getLogger("managed-test-dlt")
+    custom_logger.root_logger.propagate = False
+    custom_logger.dlt_logger.propagate = False
+
+    try:
+        custom_logger.setup()
+        custom_logger.root_logger.info(
+            "Collection started", extra={"job_id": 42, "collector": "aws"}
+        )
+
+        log_record = json.loads((tmp_path / "managed.log").read_text())
+        assert log_record["message"] == "Collection started"
+        assert log_record["job_id"] == 42
+        assert log_record["collector"] == "aws"
+        assert isinstance(
+            custom_logger.root_logger.handlers[0].formatter,
+            OpenHoundJSONFormatter,
+        )
+    finally:
+        for handler in custom_logger._file_handlers.values():
+            handler.close()
+        custom_logger.root_logger.handlers.clear()
+        custom_logger.dlt_logger.handlers.clear()
+
+
+def test_explicit_log_format_overrides_managed_default(tmp_path, monkeypatch):
+    """Operators can retain the existing runtime override in managed mode."""
+    monkeypatch.setenv("OPENHOUND__MANAGED", "true")
+    monkeypatch.setenv("RUNTIME__LOG_FORMAT", "text")
+    monkeypatch.setenv("RUNTIME__LOG_PATH", str(tmp_path))
+    custom_logger = CustomLogger("managed.log", base_path=str(tmp_path))
+    custom_logger.root_logger = logging.getLogger("managed-override-test")
+    custom_logger.dlt_logger = logging.getLogger("managed-override-test-dlt")
+    custom_logger.root_logger.propagate = False
+    custom_logger.dlt_logger.propagate = False
+
+    try:
+        custom_logger.setup()
+
+        assert isinstance(
+            custom_logger.root_logger.handlers[0].formatter,
+            OpenHoundTextFormatter,
+        )
+    finally:
+        for handler in custom_logger._file_handlers.values():
+            handler.close()
+        custom_logger.root_logger.handlers.clear()
+        custom_logger.dlt_logger.handlers.clear()
+
+
+def test_mode_change_refreshes_cached_file_handler(tmp_path, monkeypatch):
+    """Re-running setup should apply a changed mode to an existing log file."""
+    monkeypatch.setenv("RUNTIME__LOG_PATH", str(tmp_path))
+    monkeypatch.delenv("RUNTIME__LOG_FORMAT", raising=False)
+    custom_logger = CustomLogger("mode-change.log", base_path=str(tmp_path))
+    custom_logger.root_logger = logging.getLogger("mode-change-test")
+    custom_logger.dlt_logger = logging.getLogger("mode-change-test-dlt")
+    custom_logger.root_logger.propagate = False
+    custom_logger.dlt_logger.propagate = False
+
+    try:
+        monkeypatch.setenv("OPENHOUND__MANAGED", "false")
+        custom_logger.setup()
+        file_handler = custom_logger._get_file_handler(tmp_path / "mode-change.log")
+        assert isinstance(file_handler.formatter, OpenHoundTextFormatter)
+
+        monkeypatch.setenv("OPENHOUND__MANAGED", "true")
+        custom_logger.setup()
+
+        assert (
+            custom_logger._get_file_handler(tmp_path / "mode-change.log")
+            is file_handler
+        )
+        assert isinstance(file_handler.formatter, OpenHoundJSONFormatter)
+    finally:
+        for handler in custom_logger._file_handlers.values():
+            handler.close()
+        custom_logger.root_logger.handlers.clear()
+        custom_logger.dlt_logger.handlers.clear()
 
 
 def test_text_formatter_produces_plain_text():
