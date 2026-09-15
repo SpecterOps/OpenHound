@@ -31,7 +31,7 @@ def test_is_managed_rejects_invalid_boolean(monkeypatch):
         is_managed()
 
 
-def test_get_mode_defaults_selects_distinct_empty_profiles(monkeypatch):
+def test_get_mode_defaults_selects_mode_specific_log_formats(monkeypatch):
     monkeypatch.setattr("openhound.config.is_managed", lambda: False)
     unmanaged = get_mode_defaults()
 
@@ -41,5 +41,5 @@ def test_get_mode_defaults_selects_distinct_empty_profiles(monkeypatch):
     assert isinstance(unmanaged, ModeDefaults)
     assert isinstance(managed, ModeDefaults)
     assert unmanaged is not managed
-    assert vars(unmanaged) == {}
-    assert vars(managed) == {}
+    assert unmanaged.log_format == "text"
+    assert managed.log_format == "json"
