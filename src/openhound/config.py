@@ -7,11 +7,13 @@ import dlt
 
 @dataclass(frozen=True)
 class ModeDefaults:
-    """Placeholder for defaults that differ between OpenHound modes."""
+    """Configuration defaults that differ between OpenHound modes."""
+
+    log_format: str
 
 
-_UNMANAGED_DEFAULTS = ModeDefaults()
-_MANAGED_DEFAULTS = ModeDefaults()
+_UNMANAGED_DEFAULTS = ModeDefaults(log_format="text")
+_MANAGED_DEFAULTS = ModeDefaults(log_format="json")
 
 
 def is_managed() -> bool:
