@@ -6,6 +6,10 @@ on:
         description: "Tag to use for building container image"
         required: true
         type: string
+      target:
+        description: "Dockerfile target for building (enterprise, cli, base)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,7 +17,7 @@ permissions:
 
 jobs:
   push-to-ECR-registry:
-    name: Push Image to Docker Registry (${{ matrix.target }})
+    name: Push Image to Docker Registry (${{ inputs.target }})
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -52,22 +56,10 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          target: ${{ matrix.target }}
+          target: ${{ inputs.target }}
           platforms: linux/amd64,linux/arm64
           push: true
           sbom: true
           tags: ${{ steps.metadata.outputs.tags }}
           build-args: |
-            OPENHOUND_VERSION=${{ steps.image-ref.outputs.clean_version }}
-
-      - name: Persist digest
-        run: |
-          echo "${{ steps.push.outputs.digest }}" > "${{ runner.temp }}/digest-${{ matrix.target }}.txt"
-
-      - name: Upload digest artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-digest-${{ matrix.target }}
-          path: ${{ runner.temp }}/digest-${{ matrix.target }}.txt
-          if-no-files-found: error
-          retention-days: 7
+            OPENHOUND_VERSION=${{ inputs.target }}
