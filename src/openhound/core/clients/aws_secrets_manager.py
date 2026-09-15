@@ -131,7 +131,11 @@ class AWSSecretsManager:
         if failures:
             raise SecretBatchError(failures) from None
 
-        return values
+        return {
+            secret_id: values[secret_id]
+            for secret_id in secret_ids
+            if secret_id in values
+        }
 
     def _get_client(self) -> SecretsManagerClient:
         if self._client is not None:

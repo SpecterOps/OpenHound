@@ -123,8 +123,8 @@ def test_get_secrets_returns_text_and_json_objects_from_batch_values() -> None:
         batch_responses=[
             {
                 "SecretValues": [
-                    {"Name": "text-secret", "SecretString": "value-1"},
                     {"ARN": json_secret, "SecretString": '{"value": 2}'},
+                    {"Name": "text-secret", "SecretString": "value-1"},
                 ],
                 "Errors": [],
             }
@@ -134,6 +134,7 @@ def test_get_secrets_returns_text_and_json_objects_from_batch_values() -> None:
     result = AWSSecretsManager(client).get_secrets(["text-secret", json_secret])
 
     assert result == {"text-secret": "value-1", json_secret: {"value": 2}}
+    assert list(result) == ["text-secret", json_secret]
     assert client.batch_requests == [["text-secret", json_secret]]
     assert client.get_requests == []
 
@@ -144,7 +145,7 @@ def test_get_secrets_splits_requests_into_chunks_of_20_and_merges_values() -> No
         {
             "SecretValues": [
                 {"Name": secret_id, "SecretString": f"value-{secret_id}"}
-                for secret_id in secret_ids[start : start + 20]
+                for secret_id in reversed(secret_ids[start : start + 20])
             ]
         }
         for start in range(0, len(secret_ids), 20)
@@ -154,6 +155,7 @@ def test_get_secrets_splits_requests_into_chunks_of_20_and_merges_values() -> No
     result = AWSSecretsManager(client).get_secrets(secret_ids)
 
     assert result == {secret_id: f"value-{secret_id}" for secret_id in secret_ids}
+    assert list(result) == secret_ids
     assert [len(request) for request in client.batch_requests] == [20, 20, 1]
     assert client.batch_requests == [
         secret_ids[:20],
