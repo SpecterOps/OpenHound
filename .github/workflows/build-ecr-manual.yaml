@@ -1,0 +1,73 @@
+name: Build image for ECR
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to use for building container image"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  push-to-ECR-registry:
+    name: Push Image to Docker Registry (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Generate Metadata
+        id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # ratchet:docker/metadata-action@v5
+        with:
+          images: |
+            ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}
+          tags: |
+            type=raw,prefix=ecr-,value=${{ inputs.tag }},enable=true
+            type=sha,format=short,prefix=ecr-,enable=true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # ratchet:aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.BHE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.BHE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: 'us-east-1'
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@f2e9fc6c2b355c1890b65e6f6f0e2ac3e6e22f78 # ratchet:aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push multi-arch image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          build-args: |
+            OPENHOUND_VERSION=${{ steps.image-ref.outputs.clean_version }}
+
+      - name: Persist digest
+        run: |
+          echo "${{ steps.push.outputs.digest }}" > "${{ runner.temp }}/digest-${{ matrix.target }}.txt"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-${{ matrix.target }}
+          path: ${{ runner.temp }}/digest-${{ matrix.target }}.txt
+          if-no-files-found: error
+          retention-days: 7
