@@ -13,9 +13,11 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import dlt
-import openhound
 from rich.console import Console
 from rich.logging import RichHandler
+
+import openhound
+from openhound.config import get_mode_defaults
 
 VALID_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -226,7 +228,7 @@ class CustomLogger:
         interval: int = 1,
         cli_level: str = "ERROR",
         base_path: str | None = None,
-        log_format: str = "text",
+        log_format: str | None = None,
     ):
         self.level = level
         self.name = name
@@ -237,14 +239,15 @@ class CustomLogger:
         self.backup_count = backup_count
         self.interval = interval
         self.cli_level = cli_level
-        self.log_format = log_format
+        self._log_format_override = log_format
+        self.log_format = self._validate_format(log_format or "text")
 
         self.base_path = Path(base_path) if base_path else self.default_platform_path()
         self.log_file_path: Path | None = None
 
         # Share one rotating handler per file across loggers; opening the same file
         # with multiple handlers breaks rotation on Windows (WinError 32).
-        self._file_handlers: dict[Path, "RotatingFileHandler"] = {}
+        self._file_handlers: dict[Path, RotatingFileHandler] = {}
 
         self.handlers = {
             LogMode.CLI: self.cli_handlers,
@@ -342,8 +345,10 @@ class CustomLogger:
         self.cli_level = self._validate_level(
             dlt_cli_level or self.cli_level, default="ERROR"
         )
+        mode_log_format = get_mode_defaults().log_format
         self.log_format = self._validate_format(
-            dlt_log_format or self.log_format, default="text"
+            dlt_log_format or self._log_format_override or mode_log_format,
+            default=mode_log_format,
         )
 
         # Override the base path if log_path is set in DLT config, otherwise use the default platform path
@@ -402,6 +407,10 @@ class CustomLogger:
         if handler is None:
             handler = self._build_file_handler(file_path)
             self._file_handlers[key] = handler
+        else:
+            # setup() may be called again after configuration changes. Keep a
+            # cached handler's formatter aligned with the newly resolved mode.
+            handler.setFormatter(self._file_formatter())
         return handler
 
     def container_handlers(self, logger: logging.Logger, file_path: Path) -> None:
