@@ -62,4 +62,4 @@ jobs:
           sbom: true
           tags: ${{ steps.metadata.outputs.tags }}
           build-args: |
-            OPENHOUND_VERSION=${{ inputs.target }}
+            OPENHOUND_VERSION=${{ inputs.tag }}
