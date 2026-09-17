@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import openhound
+import openhound.config as config
 import openhound.core.logging as openhound_logging
 from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
 from openhound.core.clients.models.jobs import (
+    CollectorJob,
     Job,
     ManagementOperation,
     ManagementOperationStatus,
@@ -90,8 +92,8 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
 class Service:
     """Base scheduler service that checks for available jobs in BloodHound Enterprise.
 
-    Runs on a simple loop every X seconds and checks for available jobs. If a job is available,
-    a subprocess is started for the configured collector to run the DLT/OpenHound pipeline.
+    Runs on a simple loop every X seconds and checks for available jobs. In unmanaged mode (default),
+    an available job starts a subprocess for the configured collector to run the DLT/OpenHound pipeline.
     """
 
     def __init__(
@@ -143,13 +145,23 @@ class Service:
             logger.exception("Error shutting down broken executor.")
         self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
 
-    def check_jobs(self) -> Job | None:
+    def check_jobs(self) -> Job | CollectorJob | None:
         """Checks BloodHound enterprise for available jobs. These can either be new jobs or jobs currently started and not finished/stopped.
 
         Returns:
-            Job | None: Returns a Job object if there is a new or existing job available, otherwise returns None.
+            Job | CollectorJob | None: Returns the first available job, otherwise returns None.
         """
         logger.info("Checking for new jobs in BloodHound Enterprise.")
+
+        if config.is_managed():
+            available_jobs = self.client.available_collector_jobs(self.collector_name)
+            if available_jobs.data.jobs:
+                logger.info(
+                    "Managed queue job available: %s", available_jobs.data.jobs[0].id
+                )
+                return available_jobs.data.jobs[0]
+            return None
+
         new_jobs = self.client.jobs_available
         if new_jobs.data:
             logger.info(f"New job available: {new_jobs.data[0].id}")
@@ -309,9 +321,13 @@ class Service:
                 return
 
             try:
-                available_job = self.check_jobs()
-                if available_job:
-                    self._start_job(available_job)
+                if config.is_managed():
+                    # Queue jobs are returned for the later claim/validation handoff.
+                    self.check_jobs()
+                else:
+                    available_job = self.check_jobs()
+                    if available_job:
+                        self._start_job(available_job)
             except Exception:
                 logger.exception("Error checking for or starting jobs.")
         else:

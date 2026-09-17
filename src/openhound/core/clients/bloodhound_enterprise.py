@@ -10,12 +10,14 @@ from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import quote
 
 import requests
 
 from openhound.core.clients.bloodhound import BloodHound, BloodHoundHTTPError
 from openhound.core.clients.models.jobs import (
     ArtifactUploadSession,
+    CollectorJobsAvailable,
     JobsAvailable,
     JobsCurrent,
     JobsEnd,
@@ -63,6 +65,26 @@ class BloodHoundEnterprise(BloodHound):
         path = "/api/v2/jobs/current"
         response = self.request(method="GET", path=path)
         return JobsCurrent.model_validate(response.json())
+
+    def available_collector_jobs(self, job_key: str) -> CollectorJobsAvailable:
+        encoded_job_key = quote(f"eq:{job_key}", safe="")
+        path = (
+            "/api/v2/collector-job-queue/available?limit=1&job_key="
+            f"{encoded_job_key}"
+        )
+        logger.debug(
+            "Polling managed collector job queue.",
+            extra={"endpoint": path, "job_key": job_key},
+        )
+        try:
+            response = self.request(method="GET", path=path)
+        except (BloodHoundHTTPError, requests.RequestException):
+            logger.exception(
+                "Managed collector job queue request failed.",
+                extra={"endpoint": path, "job_key": job_key},
+            )
+            raise
+        return CollectorJobsAvailable.model_validate(response.json())
 
     def start_job(self, job_id: int) -> JobStart:
         path = "/api/v2/jobs/start"
