@@ -49,6 +49,8 @@ SUPPORT_BUNDLE_MAX_RETRIES = 3
 SUPPORT_BUNDLE_RETRY_DELAY_SECONDS = 2
 SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS = 10
 SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS = 120
+MANAGED_COLLECTOR_JOB_AVAILABLE_CONNECT_TIMEOUT_SECONDS = 10
+MANAGED_COLLECTOR_JOB_AVAILABLE_READ_TIMEOUT_SECONDS = 20
 
 T = TypeVar("T")
 
@@ -77,7 +79,14 @@ class BloodHoundEnterprise(BloodHound):
             extra={"endpoint": path, "job_key": job_key},
         )
         try:
-            response = self.request(method="GET", path=path)
+            response = self.request(
+                method="GET",
+                path=path,
+                timeout=(
+                    MANAGED_COLLECTOR_JOB_AVAILABLE_CONNECT_TIMEOUT_SECONDS,
+                    MANAGED_COLLECTOR_JOB_AVAILABLE_READ_TIMEOUT_SECONDS,
+                ),
+            )
         except (BloodHoundHTTPError, requests.RequestException):
             logger.exception(
                 "Managed collector job queue request failed.",
