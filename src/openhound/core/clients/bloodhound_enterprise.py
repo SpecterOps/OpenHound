@@ -69,6 +69,11 @@ class BloodHoundEnterprise(BloodHound):
         return JobsCurrent.model_validate(response.json())
 
     def available_collector_jobs(self, job_key: str) -> CollectorJobsAvailable:
+        """Return the next job from BHE's managed collector queue.
+
+        This endpoint is used only by managed OpenHound deployments and is not
+        part of the standard open-source/self-hosted collector workflow.
+        """
         encoded_job_key = quote(f"eq:{job_key}", safe="")
         path = (
             "/api/v2/collector-job-queue/available?limit=1&job_key="

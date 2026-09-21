@@ -153,11 +153,12 @@ class Service:
         """
         logger.info("Checking for new jobs in BloodHound Enterprise.")
 
+        # This 'managed' flow only applies to OpenHound deployments that are hosted by SpecterOps.
         if config.is_managed():
             available_jobs = self.client.available_collector_jobs(self.collector_name)
             if available_jobs.data.jobs:
                 logger.info(
-                    "Managed queue job available: %s", available_jobs.data.jobs[0].id
+                    "New managed queue job available: %s", available_jobs.data.jobs[0].id
                 )
                 return available_jobs.data.jobs[0]
             return None
