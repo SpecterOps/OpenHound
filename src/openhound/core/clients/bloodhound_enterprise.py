@@ -218,7 +218,7 @@ class BloodHoundEnterprise(BloodHound):
         return digest.hexdigest()
 
     @staticmethod
-    def _is_transient_support_bundle_error(error: Exception) -> bool:
+    def _is_transient_request_error(error: Exception) -> bool:
         if isinstance(error, requests.RequestException):
             return True
         return isinstance(error, BloodHoundHTTPError) and error.code in {
@@ -237,7 +237,7 @@ class BloodHoundEnterprise(BloodHound):
             try:
                 return request()
             except Exception as error:
-                if not self._is_transient_support_bundle_error(error):
+                if not self._is_transient_request_error(error):
                     raise
                 if retry == SUPPORT_BUNDLE_MAX_RETRIES:
                     raise
