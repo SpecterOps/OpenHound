@@ -400,8 +400,9 @@ def test_end_managed_job_uses_bounded_timeouts(mock_service, monkeypatch):
     [
         BloodHoundHTTPError("server error", 500),
         requests.ConnectionError("connection failed"),
+        requests.Timeout("request timed out"),
     ],
-    ids=["http-500", "connection-error"],
+    ids=["http-500", "connection-error", "timeout"],
 )
 def test_end_managed_job_retries_transient_errors(
     mock_service, monkeypatch, caplog, transient_error
@@ -493,6 +494,37 @@ def test_end_managed_job_does_not_retry_non_transient_client_error(
         )
 
     assert error.value.code == 400
+    assert attempts == 1
+    assert delays == []
+
+
+@pytest.mark.parametrize(
+    "request_error",
+    [
+        requests.exceptions.InvalidURL("invalid URL"),
+        requests.exceptions.TooManyRedirects("too many redirects"),
+    ],
+    ids=["invalid-url", "too-many-redirects"],
+)
+def test_end_managed_job_does_not_retry_non_transient_request_error(
+    mock_service, monkeypatch, request_error
+):
+    attempts = 0
+    delays = []
+
+    def invalid_request(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise request_error
+
+    monkeypatch.setattr(mock_service.client, "request", invalid_request)
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    with pytest.raises(type(request_error)):
+        mock_service.client.end_managed_job(
+            "collector-job-123", ManagedJobOutcome.FAILED
+        )
+
     assert attempts == 1
     assert delays == []
 
@@ -893,6 +925,30 @@ def test_send_support_bundle_retries_transient_part_upload_failure(
 
     assert attempts == 3
     assert delays == [2, 2]
+
+
+def test_support_bundle_retry_preserves_broad_request_exception_policy(
+    mock_service, monkeypatch
+):
+    attempts = 0
+    delays = []
+
+    def request():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise requests.exceptions.InvalidURL("invalid URL")
+        return "ok"
+
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    result = mock_service.client._retry_support_bundle_request(
+        "test support bundle request", request
+    )
+
+    assert result == "ok"
+    assert attempts == 2
+    assert delays == [bloodhound_enterprise.SUPPORT_BUNDLE_RETRY_DELAY_SECONDS]
 
 
 def test_send_support_bundle_fails_after_transient_retries_are_exhausted(
