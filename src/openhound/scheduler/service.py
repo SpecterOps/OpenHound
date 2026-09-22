@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import openhound
-import openhound.config as config
 import openhound.core.logging as openhound_logging
 from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
 from openhound.core.clients.models.jobs import (
