@@ -591,14 +591,14 @@ def test_jobs_no_jobs_available(mock_service, mock_bloodhound_api):
     assert mock_service.check_jobs() is None
 
 
-def test_managed_mode_polls_collector_job_queue(
+def test_managed_collector_job_check_polls_queue(
     mock_service, mock_bloodhound_api, managed_mode
 ):
     mock_bloodhound_api.app.state.collector_job_queue_response = load_json(
         "collector_jobs_available_with_job.json"
     )
 
-    job = mock_service.check_jobs()
+    job = mock_service.check_managed_collector_jobs()
 
     assert job is not None
     assert job.id == "11111111-1111-1111-1111-111111111111"
@@ -622,7 +622,7 @@ def test_unmanaged_mode_never_polls_collector_job_queue(
 def test_managed_queue_request_uses_collector_key_and_first_page(
     mock_service, mock_bloodhound_api, managed_mode
 ):
-    mock_service.check_jobs()
+    mock_service.check_managed_collector_jobs()
 
     assert mock_bloodhound_api.app.state.collector_job_queue_requests == [
         {"limit": "1", "job_key": "eq:openhound-faker"}
@@ -676,7 +676,7 @@ def test_managed_mode_selects_first_queue_job_unchanged(
         lambda job_key: available_jobs,
     )
 
-    selected = mock_service.check_jobs()
+    selected = mock_service.check_managed_collector_jobs()
 
     assert selected == CollectorJob.model_validate(payload["data"]["jobs"][0])
     assert selected != CollectorJob.model_validate(payload["data"]["jobs"][1])
@@ -685,7 +685,7 @@ def test_managed_mode_selects_first_queue_job_unchanged(
 def test_managed_mode_returns_no_job_for_empty_queue(
     mock_service, mock_bloodhound_api, managed_mode
 ):
-    assert mock_service.check_jobs() is None
+    assert mock_service.check_managed_collector_jobs() is None
     assert len(mock_bloodhound_api.app.state.collector_job_queue_requests) == 1
 
 
@@ -700,13 +700,13 @@ def test_running_job_prevents_managed_queue_poll(
     assert mock_bloodhound_api.app.state.jobs_current_requests == 1
 
 
-def test_queue_http_error_is_logged_and_next_poll_continues(
+def test_queue_http_error_is_logged_and_next_check_continues(
     mock_service, mock_bloodhound_api, managed_mode, caplog
 ):
     mock_bloodhound_api.app.state.collector_job_queue_error_status = 503
 
-    with caplog.at_level(logging.ERROR):
-        mock_service._poll()
+    with caplog.at_level(logging.ERROR), pytest.raises(BloodHoundHTTPError):
+        mock_service.check_managed_collector_jobs()
 
     queue_errors = [
         record
@@ -718,7 +718,7 @@ def test_queue_http_error_is_logged_and_next_poll_continues(
     assert len(queue_errors) == 1
 
     mock_bloodhound_api.app.state.collector_job_queue_error_status = None
-    mock_service._poll()
+    mock_service.check_managed_collector_jobs()
 
     assert len(mock_bloodhound_api.app.state.collector_job_queue_requests) == 2
 

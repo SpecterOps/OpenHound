@@ -92,8 +92,8 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
 class Service:
     """Base scheduler service that checks for available jobs in BloodHound Enterprise.
 
-    Runs on a simple loop every X seconds and checks for available jobs. In unmanaged mode (default),
-    an available job starts a subprocess for the configured collector to run the DLT/OpenHound pipeline.
+    Runs on a simple loop every X seconds and checks for available jobs. If a job is available,
+    a subprocess is started for the configured collector to run the DLT/OpenHound pipeline.
     """
 
     def __init__(
@@ -145,24 +145,13 @@ class Service:
             logger.exception("Error shutting down broken executor.")
         self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
 
-    def check_jobs(self) -> Job | CollectorJob | None:
+    def check_jobs(self) -> Job | None:
         """Checks BloodHound enterprise for available jobs. These can either be new jobs or jobs currently started and not finished/stopped.
 
         Returns:
-            Job | CollectorJob | None: Returns the first available job, otherwise returns None.
+            Job | None: Returns a Job object if there is a new or existing job available, otherwise returns None.
         """
         logger.info("Checking for new jobs in BloodHound Enterprise.")
-
-        # This 'managed' flow only applies to OpenHound deployments that are hosted by SpecterOps.
-        if config.is_managed():
-            available_jobs = self.client.available_collector_jobs(self.collector_name)
-            if available_jobs.data.jobs:
-                logger.info(
-                    "New managed queue job available: %s", available_jobs.data.jobs[0].id
-                )
-                return available_jobs.data.jobs[0]
-            return None
-
         new_jobs = self.client.jobs_available
         if new_jobs.data:
             logger.info(f"New job available: {new_jobs.data[0].id}")
@@ -181,6 +170,17 @@ class Service:
         #         return None
         #     raise
 
+        return None
+
+    def check_managed_collector_jobs(self) -> CollectorJob | None:
+        """Return the first available job from the managed collector queue."""
+        logger.info("Checking for new managed collector jobs in BloodHound Enterprise.")
+        available_jobs = self.client.available_collector_jobs(self.collector_name)
+        if available_jobs.data.jobs:
+            logger.info(
+                "New managed queue job available: %s", available_jobs.data.jobs[0].id
+            )
+            return available_jobs.data.jobs[0]
         return None
 
     def check_management(self) -> ManagementOperation | None:
@@ -322,13 +322,9 @@ class Service:
                 return
 
             try:
-                if config.is_managed():
-                    # Queue jobs are returned for the later claim/validation handoff.
-                    self.check_jobs()
-                else:
-                    available_job = self.check_jobs()
-                    if available_job:
-                        self._start_job(available_job)
+                available_job = self.check_jobs()
+                if available_job:
+                    self._start_job(available_job)
             except Exception:
                 logger.exception("Error checking for or starting jobs.")
         else:
