@@ -6,19 +6,20 @@ import logging
 import math
 import socket
 import time
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Any, TypeVar
 
-import openhound
 import requests
+
 from openhound.core.clients.bloodhound import BloodHound, BloodHoundHTTPError
 from openhound.core.clients.models.jobs import (
+    ArtifactUploadSession,
     JobsAvailable,
     JobsCurrent,
     JobsEnd,
     JobStart,
-    ArtifactUploadSession,
     ManagementAvailable,
     ManagementOperationResult,
     ManagementOperationStatus,
@@ -32,6 +33,15 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+class ManagedJobOutcome(str, Enum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+MANAGED_JOB_END_MAX_RETRIES = 3
+MANAGED_JOB_END_RETRY_DELAY_SECONDS = 2
+MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS = 10
+MANAGED_JOB_END_READ_TIMEOUT_SECONDS = 120
 SUPPORT_BUNDLE_PART_SIZE = 8 * 1024 * 1024  # 8 MiB
 SUPPORT_BUNDLE_MAX_RETRIES = 3
 SUPPORT_BUNDLE_RETRY_DELAY_SECONDS = 2
@@ -66,6 +76,93 @@ class BloodHoundEnterprise(BloodHound):
         job_content = json.dumps(payload)
         response = self.request(method="POST", path=path, body=job_content.encode())
         return JobsEnd.model_validate(response.json())
+
+    def end_managed_job(
+        self,
+        job_id: str,
+        outcome: ManagedJobOutcome,
+        failure_message: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """End a claimed managed collector job."""
+        path = f"/api/v2/collector-jobs/{job_id}/end"
+        payload: dict[str, Any] = {"outcome": outcome.value}
+        if failure_message is not None:
+            payload["failure_message"] = failure_message
+        if metadata is not None:
+            payload["metadata"] = metadata
+        body = json.dumps(payload).encode()
+        max_attempts = MANAGED_JOB_END_MAX_RETRIES + 1
+
+        for attempt in range(1, max_attempts + 1):
+            log_context = {
+                "job_id": job_id,
+                "outcome": outcome.value,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+            }
+            logger.info(
+                "Attempting to end managed collector job %s (%s/%s).",
+                job_id,
+                attempt,
+                max_attempts,
+                extra=log_context,
+            )
+            logger.debug(
+                "Sending managed collector end-job request.",
+                extra={
+                    **log_context,
+                    "endpoint": path,
+                    "has_failure_message": failure_message is not None,
+                    "has_metadata": metadata is not None,
+                },
+            )
+
+            try:
+                self.request(
+                    method="POST",
+                    path=path,
+                    body=body,
+                    timeout=(
+                        MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS,
+                        MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
+                    ),
+                )
+            except Exception as error:
+                retryable = self._is_transient_request_error(
+                    error,
+                    (requests.ConnectionError, requests.Timeout),
+                )
+                logger.info(
+                    "Managed collector job %s end attempt failed.",
+                    job_id,
+                    extra={**log_context, "retryable": retryable},
+                )
+                logger.debug(
+                    "Managed collector job end request failed.",
+                    extra={**log_context, "retryable": retryable},
+                    exc_info=True,
+                )
+
+                if not retryable or attempt == max_attempts:
+                    raise
+
+                logger.debug(
+                    "Retrying managed collector job end request in %s seconds.",
+                    MANAGED_JOB_END_RETRY_DELAY_SECONDS,
+                    extra={
+                        **log_context,
+                        "retry_delay_seconds": MANAGED_JOB_END_RETRY_DELAY_SECONDS,
+                    },
+                )
+                time.sleep(MANAGED_JOB_END_RETRY_DELAY_SECONDS)
+            else:
+                logger.info(
+                    "Managed collector job %s ended successfully.",
+                    job_id,
+                    extra=log_context,
+                )
+                return
 
     def ingest(self, data: str) -> None:
         path = "/api/v2/ingest"
@@ -218,8 +315,11 @@ class BloodHoundEnterprise(BloodHound):
         return digest.hexdigest()
 
     @staticmethod
-    def _is_transient_support_bundle_error(error: Exception) -> bool:
-        if isinstance(error, requests.RequestException):
+    def _is_transient_request_error(
+        error: Exception,
+        retryable_request_errors: tuple[type[requests.RequestException], ...],
+    ) -> bool:
+        if isinstance(error, retryable_request_errors):
             return True
         return isinstance(error, BloodHoundHTTPError) and error.code in {
             408,
@@ -237,7 +337,10 @@ class BloodHoundEnterprise(BloodHound):
             try:
                 return request()
             except Exception as error:
-                if not self._is_transient_support_bundle_error(error):
+                if not self._is_transient_request_error(
+                    error,
+                    (requests.RequestException,),
+                ):
                     raise
                 if retry == SUPPORT_BUNDLE_MAX_RETRIES:
                     raise
