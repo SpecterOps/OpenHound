@@ -129,7 +129,10 @@ class BloodHoundEnterprise(BloodHound):
                     ),
                 )
             except Exception as error:
-                retryable = self._is_transient_request_error(error)
+                retryable = self._is_transient_request_error(
+                    error,
+                    (requests.ConnectionError, requests.Timeout),
+                )
                 logger.info(
                     "Managed collector job %s end attempt failed.",
                     job_id,
@@ -312,8 +315,11 @@ class BloodHoundEnterprise(BloodHound):
         return digest.hexdigest()
 
     @staticmethod
-    def _is_transient_request_error(error: Exception) -> bool:
-        if isinstance(error, requests.RequestException):
+    def _is_transient_request_error(
+        error: Exception,
+        retryable_request_errors: tuple[type[requests.RequestException], ...],
+    ) -> bool:
+        if isinstance(error, retryable_request_errors):
             return True
         return isinstance(error, BloodHoundHTTPError) and error.code in {
             408,
@@ -331,7 +337,10 @@ class BloodHoundEnterprise(BloodHound):
             try:
                 return request()
             except Exception as error:
-                if not self._is_transient_request_error(error):
+                if not self._is_transient_request_error(
+                    error,
+                    (requests.RequestException,),
+                ):
                     raise
                 if retry == SUPPORT_BUNDLE_MAX_RETRIES:
                     raise
