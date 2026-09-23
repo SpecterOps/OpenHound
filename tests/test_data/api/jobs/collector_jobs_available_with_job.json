@@ -19,7 +19,7 @@
         "scope_client_id": null,
         "secret_key_id": null,
         "priority": 10,
-        "status": "running",
+        "status": "ready",
         "run_at": "2026-02-20T10:00:00Z",
         "unclaimed_deadline_at": "2026-02-20T10:05:00Z",
         "attempts": 0,

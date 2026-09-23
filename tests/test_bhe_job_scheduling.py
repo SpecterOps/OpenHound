@@ -8,6 +8,7 @@ from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import pytest
 import requests
@@ -256,7 +257,6 @@ def mock_service(mock_bloodhound_api, monkeypatch):
 
     monkeypatch.setattr("requests.request", mock_request)
     monkeypatch.setattr(scheduler_service, "ProcessPoolExecutor", DummyExecutor)
-    monkeypatch.setattr(scheduler_service.config, "is_managed", lambda: False)
 
     return Service(
         bhe_uri="http://localhost:8000",
@@ -264,13 +264,6 @@ def mock_service(mock_bloodhound_api, monkeypatch):
         token_id="test-id",
         collector_name="openhound-faker",
     )
-
-
-@pytest.fixture
-def managed_mode(mock_service, monkeypatch):
-    monkeypatch.setattr(scheduler_service.config, "is_managed", lambda: True)
-
-
 def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeypatch):
     monkeypatch.setattr(
         bloodhound_enterprise.socket, "gethostname", lambda: "test-host"
@@ -591,8 +584,8 @@ def test_jobs_no_jobs_available(mock_service, mock_bloodhound_api):
     assert mock_service.check_jobs() is None
 
 
-def test_managed_collector_job_check_polls_queue(
-    mock_service, mock_bloodhound_api, managed_mode
+def test_managed_collector_job_check_requests_first_queue_job(
+    mock_service, mock_bloodhound_api
 ):
     mock_bloodhound_api.app.state.collector_job_queue_response = load_json(
         "collector_jobs_available_with_job.json"
@@ -601,32 +594,11 @@ def test_managed_collector_job_check_polls_queue(
     job = mock_service.check_managed_collector_jobs()
 
     assert job is not None
-    assert job.id == "11111111-1111-1111-1111-111111111111"
-    assert mock_bloodhound_api.app.state.collector_job_queue_requests
-    assert mock_bloodhound_api.app.state.jobs_available_requests == 0
-
-
-def test_unmanaged_mode_never_polls_collector_job_queue(
-    mock_service, mock_bloodhound_api, monkeypatch
-):
-    monkeypatch.setattr(scheduler_service.config, "is_managed", lambda: False)
-
-    job = mock_service.check_jobs()
-
-    assert job is not None
-    assert job.id == 123
-    assert mock_bloodhound_api.app.state.collector_job_queue_requests == []
-    assert mock_bloodhound_api.app.state.jobs_available_requests == 1
-
-
-def test_managed_queue_request_uses_collector_key_and_first_page(
-    mock_service, mock_bloodhound_api, managed_mode
-):
-    mock_service.check_managed_collector_jobs()
-
+    assert job.id == UUID("11111111-1111-1111-1111-111111111111")
     assert mock_bloodhound_api.app.state.collector_job_queue_requests == [
         {"limit": "1", "job_key": "eq:openhound-faker"}
     ]
+    assert mock_bloodhound_api.app.state.jobs_available_requests == 0
 
 
 def test_collector_job_queue_response_parses_contract_fields():
@@ -638,7 +610,7 @@ def test_collector_job_queue_response_parses_contract_fields():
     assert response.skip == 0
     assert response.limit == 2
     assert job == CollectorJob.model_validate(payload["data"]["jobs"][0])
-    assert job.id == "11111111-1111-1111-1111-111111111111"
+    assert job.id == UUID("11111111-1111-1111-1111-111111111111")
     assert job.job_schedule_id is None
     assert job.job_profile_id is None
     assert job.job_type_id == 7
@@ -652,7 +624,7 @@ def test_collector_job_queue_response_parses_contract_fields():
     assert job.scope_client_id is None
     assert job.secret_key_id is None
     assert job.priority == 10
-    assert job.status == "running"
+    assert job.status == "ready"
     assert job.run_at.isoformat() == "2026-02-20T10:00:00+00:00"
     assert job.unclaimed_deadline_at.isoformat() == "2026-02-20T10:05:00+00:00"
     assert job.attempts == 0
@@ -665,43 +637,35 @@ def test_collector_job_queue_response_parses_contract_fields():
     assert job.updated_at.isoformat() == "2026-02-20T09:30:00+00:00"
 
 
-def test_managed_mode_selects_first_queue_job_unchanged(
-    mock_service, managed_mode, monkeypatch
-):
+@pytest.mark.parametrize("field", ["id", "scope_client_id", "claimed_by"])
+def test_collector_job_queue_response_rejects_invalid_uuids(field):
     payload = load_json("collector_jobs_available_with_jobs.json")
-    available_jobs = CollectorJobsAvailable.model_validate(payload)
-    monkeypatch.setattr(
-        mock_service.client,
-        "available_collector_jobs",
-        lambda job_key: available_jobs,
-    )
 
-    selected = mock_service.check_managed_collector_jobs()
+    payload["data"]["jobs"][1][field] = "not-a-uuid"
 
-    assert selected == CollectorJob.model_validate(payload["data"]["jobs"][0])
-    assert selected != CollectorJob.model_validate(payload["data"]["jobs"][1])
+    with pytest.raises(ValueError):
+        CollectorJobsAvailable.model_validate(payload)
 
 
-def test_managed_mode_returns_no_job_for_empty_queue(
-    mock_service, mock_bloodhound_api, managed_mode
+@pytest.mark.parametrize("field", ["scope_client_id", "claimed_by"])
+def test_collector_job_queue_response_requires_nullable_uuid_fields(field):
+    payload = load_json("collector_jobs_available_with_jobs.json")
+
+    del payload["data"]["jobs"][0][field]
+
+    with pytest.raises(ValueError):
+        CollectorJobsAvailable.model_validate(payload)
+
+
+def test_managed_collector_job_check_returns_no_job_for_empty_queue(
+    mock_service, mock_bloodhound_api
 ):
     assert mock_service.check_managed_collector_jobs() is None
     assert len(mock_bloodhound_api.app.state.collector_job_queue_requests) == 1
 
 
-def test_running_job_prevents_managed_queue_poll(
-    mock_service, mock_bloodhound_api, managed_mode
-):
-    mock_service.job_running = 123
-
-    mock_service._poll()
-
-    assert mock_bloodhound_api.app.state.collector_job_queue_requests == []
-    assert mock_bloodhound_api.app.state.jobs_current_requests == 1
-
-
-def test_queue_http_error_is_logged_and_next_check_continues(
-    mock_service, mock_bloodhound_api, managed_mode, caplog
+def test_queue_http_error_is_logged_and_re_raised(
+    mock_service, mock_bloodhound_api, caplog
 ):
     mock_bloodhound_api.app.state.collector_job_queue_error_status = 503
 
@@ -716,30 +680,6 @@ def test_queue_http_error_is_logged_and_next_check_continues(
         and record.getMessage() == "Managed collector job queue request failed."
     ]
     assert len(queue_errors) == 1
-
-    mock_bloodhound_api.app.state.collector_job_queue_error_status = None
-    mock_service.check_managed_collector_jobs()
-
-    assert len(mock_bloodhound_api.app.state.collector_job_queue_requests) == 2
-
-
-def test_each_queue_request_is_logged(
-    mock_service, mock_bloodhound_api, managed_mode, caplog
-):
-    with caplog.at_level(
-        logging.DEBUG, logger="openhound.core.clients.bloodhound_enterprise"
-    ):
-        mock_service.client.available_collector_jobs("openhound-faker")
-        mock_service.client.available_collector_jobs("openhound-faker")
-
-    queue_polls = [
-        record
-        for record in caplog.records
-        if record.name == "openhound.core.clients.bloodhound_enterprise"
-        and record.getMessage() == "Polling managed collector job queue."
-    ]
-    assert len(queue_polls) == 2
-    assert all(record.levelno == logging.DEBUG for record in queue_polls)
 
 
 def test_poll_starts_new_job(mock_service, mock_bloodhound_api, monkeypatch):
