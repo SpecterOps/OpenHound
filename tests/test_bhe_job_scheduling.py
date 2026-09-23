@@ -10,13 +10,17 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
+import requests
 from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
 
 from openhound.core.clients import bloodhound, bloodhound_enterprise
 from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound import BloodHoundHTTPError
-from openhound.core.clients.bloodhound_enterprise import JobStatus
+from openhound.core.clients.bloodhound_enterprise import (
+    JobStatus,
+    ManagedJobOutcome,
+)
 from openhound.core.clients.models.jobs import (
     ManagementOperation,
     ManagementOperationStatus,
@@ -52,6 +56,7 @@ def mock_bloodhound_api():
     app.state.job_started = False
     app.state.job_ended = False
     app.state.end_payload = None
+    app.state.collector_job_end_requests = []
     app.state.start_payload = None
     app.state.client_update_payload = None
     app.state.ingested_edges = 0
@@ -88,6 +93,13 @@ def mock_bloodhound_api():
         app.state.job_ended = True
         app.state.end_payload = body
         return load_json("job_end.json")
+
+    @app.post("/api/v2/collector-jobs/{job_id}/end")
+    async def end_managed_job(job_id: str, body: dict):
+        app.state.collector_job_end_requests.append(
+            {"job_id": job_id, "body": body}
+        )
+        return Response(status_code=200)
 
     @app.post("/api/v2/ingest")
     async def ingest(request: Request):
@@ -383,6 +395,199 @@ def test_client_update_uses_unknown_when_ip_lookup_fails(
         "Hostname": "test-host",
         "Version": "v0.3.0-rc1",
     }
+
+
+@pytest.mark.parametrize(
+    ("outcome", "failure_message", "metadata", "expected_body"),
+    [
+        (
+            ManagedJobOutcome.SUCCEEDED,
+            None,
+            None,
+            {"outcome": "succeeded"},
+        ),
+        (
+            ManagedJobOutcome.FAILED,
+            "Collection failed",
+            {"phase": "collect"},
+            {
+                "outcome": "failed",
+                "failure_message": "Collection failed",
+                "metadata": {"phase": "collect"},
+            },
+        ),
+    ],
+)
+def test_end_managed_job_sends_managed_outcome(
+    mock_service,
+    mock_bloodhound_api,
+    outcome,
+    failure_message,
+    metadata,
+    expected_body,
+):
+    mock_service.client.end_managed_job(
+        "collector-job-123",
+        outcome,
+        failure_message=failure_message,
+        metadata=metadata,
+    )
+
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == [
+        {"job_id": "collector-job-123", "body": expected_body}
+    ]
+
+
+def test_end_managed_job_uses_bounded_timeouts(mock_service, monkeypatch):
+    captured = {}
+
+    def capture_request(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(mock_service.client, "request", capture_request)
+
+    mock_service.client.end_managed_job(
+        "collector-job-123", ManagedJobOutcome.SUCCEEDED
+    )
+
+    assert captured["timeout"] == (
+        bloodhound_enterprise.MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS,
+        bloodhound_enterprise.MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
+    )
+
+
+@pytest.mark.parametrize(
+    "transient_error",
+    [
+        BloodHoundHTTPError("server error", 500),
+        requests.ConnectionError("connection failed"),
+        requests.Timeout("request timed out"),
+    ],
+    ids=["http-500", "connection-error", "timeout"],
+)
+def test_end_managed_job_retries_transient_errors(
+    mock_service, monkeypatch, caplog, transient_error
+):
+    attempts = 0
+    delays = []
+
+    def flaky_request(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise transient_error
+        return object()
+
+    monkeypatch.setattr(mock_service.client, "request", flaky_request)
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    with caplog.at_level(
+        logging.DEBUG, logger="openhound.core.clients.bloodhound_enterprise"
+    ):
+        mock_service.client.end_managed_job(
+            "collector-job-123", ManagedJobOutcome.SUCCEEDED
+        )
+
+    assert attempts == 2
+    assert delays == [bloodhound_enterprise.MANAGED_JOB_END_RETRY_DELAY_SECONDS]
+    assert [
+        record.levelno
+        for record in caplog.records
+        if record.getMessage().startswith(
+            (
+                "Attempting to end managed collector job",
+                "Managed collector job collector-job-123 end attempt failed",
+                "Managed collector job collector-job-123 ended successfully",
+            )
+        )
+    ] == [logging.INFO, logging.INFO, logging.INFO, logging.INFO]
+    assert any(
+        record.levelno == logging.DEBUG
+        and getattr(record, "endpoint", None)
+        == "/api/v2/collector-jobs/collector-job-123/end"
+        for record in caplog.records
+    )
+
+
+def test_end_managed_job_raises_after_transient_retries_are_exhausted(
+    mock_service, monkeypatch
+):
+    attempts = 0
+    delays = []
+
+    def unavailable(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise BloodHoundHTTPError("temporarily unavailable", 503)
+
+    monkeypatch.setattr(mock_service.client, "request", unavailable)
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    with pytest.raises(BloodHoundHTTPError) as error:
+        mock_service.client.end_managed_job(
+            "collector-job-123", ManagedJobOutcome.FAILED
+        )
+
+    assert error.value.code == 503
+    assert attempts == bloodhound_enterprise.MANAGED_JOB_END_MAX_RETRIES + 1
+    assert delays == [
+        bloodhound_enterprise.MANAGED_JOB_END_RETRY_DELAY_SECONDS
+    ] * bloodhound_enterprise.MANAGED_JOB_END_MAX_RETRIES
+
+
+def test_end_managed_job_does_not_retry_non_transient_client_error(
+    mock_service, monkeypatch
+):
+    attempts = 0
+    delays = []
+
+    def bad_request(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise BloodHoundHTTPError("bad request", 400)
+
+    monkeypatch.setattr(mock_service.client, "request", bad_request)
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    with pytest.raises(BloodHoundHTTPError) as error:
+        mock_service.client.end_managed_job(
+            "collector-job-123", ManagedJobOutcome.FAILED
+        )
+
+    assert error.value.code == 400
+    assert attempts == 1
+    assert delays == []
+
+
+@pytest.mark.parametrize(
+    "request_error",
+    [
+        requests.exceptions.InvalidURL("invalid URL"),
+        requests.exceptions.TooManyRedirects("too many redirects"),
+    ],
+    ids=["invalid-url", "too-many-redirects"],
+)
+def test_end_managed_job_does_not_retry_non_transient_request_error(
+    mock_service, monkeypatch, request_error
+):
+    attempts = 0
+    delays = []
+
+    def invalid_request(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise request_error
+
+    monkeypatch.setattr(mock_service.client, "request", invalid_request)
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    with pytest.raises(type(request_error)):
+        mock_service.client.end_managed_job(
+            "collector-job-123", ManagedJobOutcome.FAILED
+        )
+
+    assert attempts == 1
+    assert delays == []
 
 
 def test_jobs_starts_new_job(mock_service, mock_bloodhound_api):
@@ -781,6 +986,30 @@ def test_send_support_bundle_retries_transient_part_upload_failure(
 
     assert attempts == 3
     assert delays == [2, 2]
+
+
+def test_support_bundle_retry_preserves_broad_request_exception_policy(
+    mock_service, monkeypatch
+):
+    attempts = 0
+    delays = []
+
+    def request():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise requests.exceptions.InvalidURL("invalid URL")
+        return "ok"
+
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    result = mock_service.client._retry_support_bundle_request(
+        "test support bundle request", request
+    )
+
+    assert result == "ok"
+    assert attempts == 2
+    assert delays == [bloodhound_enterprise.SUPPORT_BUNDLE_RETRY_DELAY_SECONDS]
 
 
 def test_send_support_bundle_fails_after_transient_retries_are_exhausted(
