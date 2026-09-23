@@ -6,19 +6,21 @@ import logging
 import math
 import socket
 import time
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import TypeVar
 
-import openhound
 import requests
+
+from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound import BloodHound, BloodHoundHTTPError
 from openhound.core.clients.models.jobs import (
+    ArtifactUploadSession,
     JobsAvailable,
     JobsCurrent,
     JobsEnd,
     JobStart,
-    ArtifactUploadSession,
     ManagementAvailable,
     ManagementOperationResult,
     ManagementOperationStatus,
@@ -42,6 +44,49 @@ T = TypeVar("T")
 
 
 class BloodHoundEnterprise(BloodHound):
+    def __init__(
+        self,
+        token_key: str,
+        token_id: str,
+        bhe_uri: str = "http://localhost:8000",
+        credential_refresh: Callable[[], BHECredentials] | None = None,
+    ) -> None:
+        super().__init__(token_key=token_key, token_id=token_id, bhe_uri=bhe_uri)
+        self._credential_refresh = credential_refresh
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        extra_headers: dict[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ):
+        """Make a BHE request, refreshing managed credentials once after a 401."""
+        try:
+            return super().request(
+                method=method,
+                path=path,
+                body=body,
+                extra_headers=extra_headers,
+                timeout=timeout,
+            )
+        except BloodHoundHTTPError as error:
+            if error.code != 401 or self._credential_refresh is None:
+                raise
+
+        logger.info("BHE authentication failed; refreshing managed credentials.")
+        credentials = self._credential_refresh()
+        self.token_key = credentials.token_key
+        self.token_id = credentials.token_id
+        return super().request(
+            method=method,
+            path=path,
+            body=body,
+            extra_headers=extra_headers,
+            timeout=timeout,
+        )
+
     @property
     def jobs_available(self) -> JobsAvailable:
         path = "/api/v2/jobs/available"
