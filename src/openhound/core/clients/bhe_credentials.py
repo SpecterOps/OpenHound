@@ -46,6 +46,9 @@ class AWSBHECredentials:
         """
 
         secret = self._secrets_manager.get_secret(self.secret_name)
+        # TODO: The BHE secret payload format is still in flight. It may be JSON
+        # with token_id/token_key fields or an encoded binary value to decode
+        # before parsing; keep this conversion boundary easy to adapt.
         if not isinstance(secret, dict):
             raise InvalidBHECredentialsSecret(
                 "BHE credentials secret must be a JSON object containing token_id and token_key"
