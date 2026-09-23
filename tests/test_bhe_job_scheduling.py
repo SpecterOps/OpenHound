@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
 
 from openhound.core.clients import bloodhound, bloodhound_enterprise
+from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound import BloodHoundHTTPError
 from openhound.core.clients.bloodhound_enterprise import (
     JobStatus,
@@ -280,6 +281,66 @@ def test_request_forwards_connect_and_read_timeouts(monkeypatch):
     client.request(method="POST", path="/test", timeout=(1.5, 3.5))
 
     assert captured["timeout"] == (1.5, 3.5)
+
+
+def test_managed_client_refreshes_credentials_and_retries_once_after_401(monkeypatch):
+    responses = iter(
+        [
+            SimpleNamespace(status_code=401, text="expired"),
+            SimpleNamespace(status_code=204, text=""),
+        ]
+    )
+    requests = []
+
+    def mock_request(**kwargs):
+        requests.append(kwargs)
+        return next(responses)
+
+    refreshes = []
+
+    def refresh():
+        refreshes.append(True)
+        return BHECredentials(token_id="new-id", token_key="new-key")
+
+    monkeypatch.setattr(bloodhound.requests, "request", mock_request)
+    client = bloodhound_enterprise.BloodHoundEnterprise(
+        token_key="old-key",
+        token_id="old-id",
+        credential_refresh=refresh,
+    )
+
+    client.request(method="GET", path="/test")
+
+    assert refreshes == [True]
+    assert len(requests) == 2
+    assert requests[0]["headers"]["Authorization"] == "bhesignature old-id"
+    assert requests[1]["headers"]["Authorization"] == "bhesignature new-id"
+    assert client.token_id == "new-id"
+    assert client.token_key == "new-key"
+
+
+def test_managed_client_does_not_retry_a_second_401(monkeypatch):
+    def mock_request(**kwargs):
+        return SimpleNamespace(status_code=401, text="still expired")
+
+    refreshes = []
+
+    def refresh():
+        refreshes.append(True)
+        return BHECredentials(token_id="new-id", token_key="new-key")
+
+    monkeypatch.setattr(bloodhound.requests, "request", mock_request)
+    client = bloodhound_enterprise.BloodHoundEnterprise(
+        token_key="old-key",
+        token_id="old-id",
+        credential_refresh=refresh,
+    )
+
+    with pytest.raises(BloodHoundHTTPError) as error:
+        client.request(method="GET", path="/test")
+
+    assert error.value.code == 401
+    assert refreshes == [True]
 
 
 def test_upload_artifact_part_uses_bounded_timeouts(mock_service, monkeypatch):

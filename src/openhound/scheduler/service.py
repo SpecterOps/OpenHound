@@ -1,6 +1,7 @@
 import logging
 import signal
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import openhound
 import openhound.core.logging as openhound_logging
+from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
 from openhound.core.clients.models.jobs import (
     Job,
@@ -101,15 +103,20 @@ class Service:
         token_id: str,
         collector_name: str,
         log_base_path: Path | None = None,
+        interval: int = POLL_INTERVAL,
+        credential_refresh: Callable[[], BHECredentials] | None = None,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
         self.collector_name = collector_name
         self.client = BloodHoundEnterprise(
-            bhe_uri=bhe_uri, token_key=token_key, token_id=token_id
+            bhe_uri=bhe_uri,
+            token_key=token_key,
+            token_id=token_id,
+            credential_refresh=credential_refresh,
         )
         # Interval how often to check for a job
-        self.interval = POLL_INTERVAL
+        self.interval = interval
         self.log_base_path = (
             log_base_path or openhound_logging.logger_override.base_path
         )
