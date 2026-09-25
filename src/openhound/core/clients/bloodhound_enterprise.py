@@ -10,12 +10,14 @@ from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import quote
 
 import requests
 
 from openhound.core.clients.bloodhound import BloodHound, BloodHoundHTTPError
 from openhound.core.clients.models.jobs import (
     ArtifactUploadSession,
+    CollectorJobsAvailable,
     JobsAvailable,
     JobsCurrent,
     JobsEnd,
@@ -47,6 +49,8 @@ SUPPORT_BUNDLE_MAX_RETRIES = 3
 SUPPORT_BUNDLE_RETRY_DELAY_SECONDS = 2
 SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS = 10
 SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS = 120
+MANAGED_COLLECTOR_JOB_AVAILABLE_CONNECT_TIMEOUT_SECONDS = 10
+MANAGED_COLLECTOR_JOB_AVAILABLE_READ_TIMEOUT_SECONDS = 20
 
 T = TypeVar("T")
 
@@ -63,6 +67,38 @@ class BloodHoundEnterprise(BloodHound):
         path = "/api/v2/jobs/current"
         response = self.request(method="GET", path=path)
         return JobsCurrent.model_validate(response.json())
+
+    def available_collector_jobs(self, job_key: str) -> CollectorJobsAvailable:
+        """Return the next job from BHE's managed collector queue.
+
+        This endpoint is used only by managed OpenHound deployments and is not
+        part of the standard open-source/self-hosted collector workflow.
+        """
+        encoded_job_key = quote(f"eq:{job_key}", safe="")
+        path = (
+            "/api/v2/collector-job-queue/available?limit=1&job_key="
+            f"{encoded_job_key}"
+        )
+        logger.debug(
+            "Polling managed collector job queue.",
+            extra={"endpoint": path, "job_key": job_key},
+        )
+        try:
+            response = self.request(
+                method="GET",
+                path=path,
+                timeout=(
+                    MANAGED_COLLECTOR_JOB_AVAILABLE_CONNECT_TIMEOUT_SECONDS,
+                    MANAGED_COLLECTOR_JOB_AVAILABLE_READ_TIMEOUT_SECONDS,
+                ),
+            )
+        except (BloodHoundHTTPError, requests.RequestException):
+            logger.exception(
+                "Managed collector job queue request failed.",
+                extra={"endpoint": path, "job_key": job_key},
+            )
+            raise
+        return CollectorJobsAvailable.model_validate(response.json())
 
     def start_job(self, job_id: int) -> JobStart:
         path = "/api/v2/jobs/start"
