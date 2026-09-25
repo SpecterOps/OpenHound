@@ -10,6 +10,7 @@ import openhound
 import openhound.core.logging as openhound_logging
 from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
 from openhound.core.clients.models.jobs import (
+    CollectorJob,
     Job,
     ManagementOperation,
     ManagementOperationStatus,
@@ -168,6 +169,17 @@ class Service:
         #         return None
         #     raise
 
+        return None
+
+    def check_managed_collector_jobs(self) -> CollectorJob | None:
+        """Return the first available job from the managed collector queue."""
+        logger.info("Checking for new managed collector jobs in BloodHound Enterprise.")
+        available_jobs = self.client.available_collector_jobs(self.collector_name)
+        if available_jobs.data.jobs:
+            logger.info(
+                "New managed queue job available: %s", available_jobs.data.jobs[0].id
+            )
+            return available_jobs.data.jobs[0]
         return None
 
     def check_management(self) -> ManagementOperation | None:
