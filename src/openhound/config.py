@@ -23,6 +23,7 @@ class ManagedBHEConfig:
 _UNMANAGED_DEFAULTS = ModeDefaults(log_format="text")
 _MANAGED_DEFAULTS = ModeDefaults(log_format="json")
 DEFAULT_MANAGED_BHE_POLL_INTERVAL = 30
+MAX_MANAGED_BHE_POLL_INTERVAL = 599
 
 
 def is_managed() -> bool:
@@ -63,9 +64,10 @@ def get_managed_bhe_config() -> ManagedBHEConfig:
     )
     if poll_interval is None:
         poll_interval = DEFAULT_MANAGED_BHE_POLL_INTERVAL
-    if poll_interval <= 0:
+    if not 0 < poll_interval <= MAX_MANAGED_BHE_POLL_INTERVAL:
         raise ValueError(
-            "openhound.aws_secrets_manager.poll_interval must be greater than zero"
+            "openhound.aws_secrets_manager.poll_interval must be between 1 and "
+            f"{MAX_MANAGED_BHE_POLL_INTERVAL} seconds"
         )
 
     return ManagedBHEConfig(

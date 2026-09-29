@@ -83,5 +83,15 @@ def test_get_managed_bhe_config_rejects_non_positive_interval(monkeypatch):
 
     monkeypatch.setattr(dlt.config, "get", get)
 
-    with pytest.raises(ValueError, match="greater than zero"):
+    with pytest.raises(ValueError, match="between 1 and 599 seconds"):
+        get_managed_bhe_config()
+
+
+def test_get_managed_bhe_config_rejects_interval_at_bhe_timeout(monkeypatch):
+    def get(field, expected_type):
+        return "production/bhe" if field.endswith("secret_name") else 600
+
+    monkeypatch.setattr(dlt.config, "get", get)
+
+    with pytest.raises(ValueError, match="between 1 and 599 seconds"):
         get_managed_bhe_config()

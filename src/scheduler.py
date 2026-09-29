@@ -1,5 +1,4 @@
 import logging
-from functools import partial
 
 import dlt
 import typer
@@ -21,10 +20,10 @@ def start():
     if config.is_managed():
         managed_config = config.get_managed_bhe_config()
         credentials = AWSBHECredentials(managed_config.secret_name)
-        credential_refresh = partial(
-            credentials.poll_until_available, managed_config.poll_interval
+        current_credentials = credentials.poll_until_available(
+            managed_config.poll_interval
         )
-        current_credentials = credential_refresh()
+        credential_refresh = credentials.refresh
         token_key = current_credentials.token_key
         token_id = current_credentials.token_id
         interval = managed_config.poll_interval

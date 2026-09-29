@@ -15,6 +15,9 @@ def test_managed_scheduler_loads_aws_secret_before_starting_service(monkeypatch)
             assert interval == 45
             return BHECredentials(token_id="aws-id", token_key="aws-key")
 
+        def refresh(self):
+            return BHECredentials(token_id="refreshed-id", token_key="refreshed-key")
+
     class FakeService:
         def __init__(self, **kwargs):
             started.append(kwargs)
@@ -48,7 +51,7 @@ def test_managed_scheduler_loads_aws_secret_before_starting_service(monkeypatch)
     assert started[0]["collector_name"] == "collector"
     assert started[0]["interval"] == 45
     assert started[0]["credential_refresh"]() == BHECredentials(
-        token_id="aws-id", token_key="aws-key"
+        token_id="refreshed-id", token_key="refreshed-key"
     )
     assert started[1] == "started"
 
