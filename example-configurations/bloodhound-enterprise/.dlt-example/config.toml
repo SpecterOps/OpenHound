@@ -2,6 +2,13 @@
 [openhound]
 managed = false
 
+# Managed deployments read BHE HMAC credentials from AWS Secrets Manager rather
+# than secrets.toml. The named secret must be a JSON object with token_id and
+# token_key fields. poll_interval controls the BHE scheduler cadence in seconds.
+# [openhound.aws_secrets_manager]
+# secret_name = "openhound/bhe-credentials"
+# poll_interval = 30
+
 [runtime]
 http_show_error_body = true
 log_cli_level = "WARNING"
