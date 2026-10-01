@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from openhound.scheduler.instance import configure_instance, resolve_instance
+from openhound.scheduler.runtime_guard import register_running_process
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        register_running_process()
         paths = resolve_instance(args.instance, args.instance_dir)
         if paths:
             configure_instance(paths)

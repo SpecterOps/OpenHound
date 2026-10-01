@@ -24,7 +24,7 @@ jobs:
         run: ./scripts/windows/build.ps1 -OutputDirectory 'dist/windows/OpenHound Payload'
       - name: Build installer
         shell: pwsh
-        run: ./scripts/windows/build-installer.ps1 -PayloadDirectory 'dist/windows/OpenHound Payload'
+        run: ./scripts/windows/build-installer.ps1 -PayloadDirectory 'dist/windows/OpenHound Payload' -OutputDirectory 'dist/windows/installer'
       - name: Test installed runtime, upgrade, and uninstall
         shell: pwsh
         run: |

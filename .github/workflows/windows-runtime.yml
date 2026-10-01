@@ -1,4 +1,4 @@
-name: Windows runtime
+name: Windows runtime and installer
 on:
   pull_request:
     branches: [main]
@@ -19,9 +19,46 @@ jobs:
           python-version: "3.13"
           architecture: x64
       - uses: astral-sh/setup-uv@v7
+      - name: Validate extension catalog
+        shell: pwsh
+        run: python -B -m unittest discover -s tests -p test_windows_catalog.py -v
+      - name: Verify offline process firewall isolation
+        shell: pwsh
+        run: |
+          python -B -m unittest discover -s tests -p test_windows_offline_process.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Offline process controller tests failed.' }
+          if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count -ne 0) {
+            throw 'Offline process tests require enabled Windows Firewall profiles.'
+          }
+          python -B tests/windows/test_offline_process.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Offline process firewall test failed.' }
       - name: Build private runtime
         shell: pwsh
         run: ./scripts/windows/build.ps1 -OutputDirectory 'dist/windows/OpenHound Payload'
+      - name: Build offline installer
+        shell: pwsh
+        run: |
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (-not (Test-Path $compiler)) {
+            choco install innosetup --version=6.4.3 --yes --no-progress
+            if ($LASTEXITCODE -notin @(0, 3010)) { throw 'Inno Setup installation failed.' }
+          }
+          ./scripts/windows/build-installer.ps1 -PayloadDirectory 'dist/windows/OpenHound Payload' -CompilerPath $compiler
+          ./scripts/windows/build-installer.ps1 -PayloadDirectory 'dist/windows/OpenHound Payload' -CompilerPath $compiler -OutputDirectory (Join-Path $env:RUNNER_TEMP 'Upgrade Installer') -AppVersion '99.0.0'
+          ./scripts/windows/build-installer.ps1 -PayloadDirectory 'dist/windows/OpenHound Payload' -CompilerPath $compiler -OutputDirectory (Join-Path $env:RUNNER_TEMP 'Cancellation Installer') -AppVersion '98.0.0' -TestCancelInstall
+      - name: Verify offline installer selections, upgrade and uninstall
+        shell: pwsh
+        run: |
+          $payload = (Resolve-Path 'dist/windows/OpenHound Payload').Path
+          $manifest = Get-Content (Join-Path $payload 'runtime-info.json') -Raw | ConvertFrom-Json
+          $installer = (Resolve-Path "dist/windows/installers/openhound-$($manifest.openhound)-windows-x64-setup.exe").Path
+          $upgrade = Join-Path $env:RUNNER_TEMP 'Upgrade Installer/openhound-99.0.0-windows-x64-setup.exe'
+          $cancellation = Join-Path $env:RUNNER_TEMP 'Cancellation Installer/openhound-98.0.0-windows-x64-setup.exe'
+          if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count -ne 0) {
+            throw 'Offline installer tests require enabled Windows Firewall profiles.'
+          }
+          & python -B tests/windows/installer_smoke.py $installer $upgrade $cancellation $payload $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw 'Offline installer smoke test failed.' }
       - name: Verify packaged runtime from an unrelated working directory
         shell: pwsh
         run: |
@@ -55,3 +92,12 @@ jobs:
         with:
           name: openhound-windows-x64
           path: dist/windows/OpenHound Payload/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhound-windows-x64-installer
+          path: dist/windows/installers/*.exe
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: openhound-windows-installer-logs
+          path: ${{ runner.temp }}/OpenHound Installer Smoke */*.log

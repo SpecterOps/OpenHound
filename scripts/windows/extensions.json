@@ -1,0 +1,29 @@
+[
+  {
+    "id": "github",
+    "name": "GitHub",
+    "package": "openhound-github",
+    "extra": "github",
+    "entrypoint": "github",
+    "description": "Collect GitHub organization and enterprise data",
+    "url": "https://github.com/SpecterOps/openhound-github"
+  },
+  {
+    "id": "okta",
+    "name": "Okta",
+    "package": "openhound-okta",
+    "extra": "okta",
+    "entrypoint": "okta",
+    "description": "Collect Okta identity data",
+    "url": "https://github.com/SpecterOps/openhound-okta"
+  },
+  {
+    "id": "jamf",
+    "name": "Jamf",
+    "package": "openhound-jamf",
+    "extra": "jamf",
+    "entrypoint": "jamf",
+    "description": "Collect Jamf device management data",
+    "url": "https://github.com/SpecterOps/openhound-jamf"
+  }
+]

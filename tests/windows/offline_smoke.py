@@ -50,7 +50,8 @@ def main():
     names = {
         collector.name for collector in CollectorManager.from_entrypoint().collectors
     }
-    assert {"github", "offline"} <= names, names
+    if "--idle-child" not in sys.argv:
+        assert "offline" in names, names
     stop_file = root / "temp" / "stop.request"
     service = Service(
         "http://127.0.0.1:1",

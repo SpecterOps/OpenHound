@@ -1,6 +1,6 @@
 # Windows x64 installer
 
-The `Windows installer` GitHub Action builds an Inno Setup executable from the private Windows runtime and uploads it in the `openhound-windows-x64-installer` Actions artifact. Download and extract that artifact ZIP to get `OpenHound-<version>-windows-x64-setup.exe`. The ZIP is only GitHub Actions transport; run the setup executable to install OpenHound. The installer requires administrator rights and defaults to `C:\Program Files\OpenHound`.
+The `Windows installer` GitHub Action builds an Inno Setup executable from the private Windows runtime and uploads it in the `openhound-windows-x64-installer` Actions artifact. Download and extract that artifact ZIP to get `openhound-<version>-windows-x64-setup.exe`. The ZIP is only GitHub Actions transport; run the setup executable to install OpenHound. The installer requires administrator rights and defaults to `C:\Program Files\OpenHound`.
 
 This stage installs the foreground scheduler. It does not register a Windows service or start OpenHound automatically. Service integration needs a wrapper that can ask the scheduler to stop, wait for an active worker, and coordinate upgrades with Windows Service Control Manager. Until then, stop the foreground process before running setup or uninstall. Inno Setup does not close it automatically.
 
@@ -9,16 +9,16 @@ This stage installs the foreground scheduler. It does not register a Windows ser
 From an elevated PowerShell session, run the downloaded setup executable:
 
 ```powershell
-& '.\OpenHound-<version>-windows-x64-setup.exe'
+& '.\openhound-<version>-windows-x64-setup.exe'
 ```
 
 For unattended installation:
 
 ```powershell
-& '.\OpenHound-<version>-windows-x64-setup.exe' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+& '.\openhound-<version>-windows-x64-setup.exe' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
 ```
 
-The installer includes the private Python interpreter, locked dependencies, OpenHound, and the GitHub collector. Customers do not need Python, `uv`, or package downloads during installation or runtime; collection still needs access to BHE and GitHub. A current Microsoft Visual C++ 2015–2022 Redistributable (x64) remains a prerequisite pending the clean-machine DLL audit described in [Windows runtime](windows-runtime.md).
+The installer includes the private Python interpreter, locked dependencies, OpenHound, and selectable GitHub, Okta, and Jamf collectors. See [Windows runtime](windows-runtime.md#install-and-select-extensions) for component selection and upgrade rollback behavior. Customers do not need Python, `uv`, or package downloads during installation or runtime; collection still needs access to BHE and the selected source. A current Microsoft Visual C++ 2015–2022 Redistributable (x64) remains a prerequisite pending the clean-machine DLL audit described in [Windows runtime](windows-runtime.md).
 
 Create `%ProgramData%\SpecterOps\OpenHound\instances\default\.dlt\config.toml` and `secrets.toml` after installation, following the [configuration examples](windows-runtime.md#instance-configuration). Put the BHE URL and `collector_name = "github"` in `config.toml`; put the BHE token ID/key and GitHub token or App credentials in `secrets.toml`. Restrict access to secrets and any GitHub App PEM file to the account running OpenHound. No customer credentials are included in the installer or Actions artifact. The account running the scheduler needs read/write access to the instance directory.
 

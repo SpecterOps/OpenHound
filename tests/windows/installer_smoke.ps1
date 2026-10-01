@@ -112,6 +112,8 @@ try {
     if ($uninstallers.Count -ne 1) { throw "Expected one uninstall entry after in-place upgrade; found $($uninstallers.Count)." }
     foreach ($file in Get-ChildItem -LiteralPath $payload -File -Recurse) {
         $relative = $file.FullName.Substring($payload.Length).TrimStart('\')
+        # Generated compiler inputs are in the payload but not installed files.
+        if ($relative -in @('installer-components.iss', 'installer-managed-paths.iss')) { continue }
         $installedFile = Join-Path $install $relative
         if (-not (Test-Path -LiteralPath $installedFile -PathType Leaf)) { throw "Installed payload is missing $relative" }
         if ((Get-FileHash $file.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $installedFile -Algorithm SHA256).Hash) {
