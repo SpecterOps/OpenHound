@@ -2,6 +2,8 @@
 
 This is the first stage of the Windows distribution. It packages OpenHound with the GitHub collector and a private CPython 3.13 runtime. It runs the existing BloodHound Enterprise scheduler in the foreground. It does not register a service or install additional collectors.
 
+For the installable setup executable and upgrade instructions, see [Windows x64 installer](windows-installer.md).
+
 ## Build requirements
 
 Build on Windows x64 with PowerShell, Git, Python 3.13 x64, and `uv` on PATH. Network access is needed **at build time** for the [official CPython 3.13.16 embeddable archive](https://www.python.org/downloads/release/python-31316/) and the wheels recorded in `uv.lock`. The script checks the CPython SHA-256 and uses the lock file, wheel hashes, and wheel-only dependency installation. Keep a full Git checkout so `hatch-vcs` can determine the OpenHound version.

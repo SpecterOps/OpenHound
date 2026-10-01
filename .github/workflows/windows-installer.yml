@@ -1,0 +1,38 @@
+name: Windows installer
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: x64
+      - uses: astral-sh/setup-uv@v7
+      - name: Build private runtime
+        shell: pwsh
+        run: ./scripts/windows/build.ps1 -OutputDirectory 'dist/windows/OpenHound Payload'
+      - name: Build installer
+        shell: pwsh
+        run: ./scripts/windows/build-installer.ps1 -PayloadDirectory 'dist/windows/OpenHound Payload'
+      - name: Test installed runtime, upgrade, and uninstall
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem 'dist/windows/installer' -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw 'Expected exactly one installer executable.' }
+          ./tests/windows/installer_smoke.ps1 -PayloadDirectory 'dist/windows/OpenHound Payload' -Installer $installers[0].FullName
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhound-windows-x64-installer
+          path: dist/windows/installer/*.exe
+          if-no-files-found: error
