@@ -1,5 +1,6 @@
 """Block every installer/helper image before it executes, using debug events."""
 
+import base64
 import ctypes
 import os
 import subprocess
@@ -59,6 +60,66 @@ class DebugEvent(ctypes.Structure):
     ]
 
 
+def _run_firewall_script(script):
+    powershell = str(
+        Path(os.environ["SystemRoot"])
+        / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    )
+    encoded = base64.b64encode(
+        ("$ErrorActionPreference = 'Stop';\n" + script).encode("utf-16-le")
+    ).decode("ascii")
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"Windows Firewall command failed ({result.returncode}):\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+
+def _powershell_literal(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _add_firewall_rule(group, image):
+    # netsh validates executable suffixes and rejects Inno's extracted .tmp
+    # images. The Firewall COM API accepts their actual executable paths.
+    name = f"{group} {uuid.uuid4().hex}"
+    _run_firewall_script(
+        f"""
+$rule = New-Object -ComObject HNetCfg.FwRule
+$rule.Name = {_powershell_literal(name)}
+$rule.Grouping = {_powershell_literal(group)}
+$rule.ApplicationName = {_powershell_literal(image)}
+$rule.Direction = 2
+$rule.Action = 0
+$rule.Enabled = $true
+$rule.Profiles = 2147483647
+$policy = New-Object -ComObject HNetCfg.FwPolicy2
+$policy.Rules.Add($rule)
+"""
+    )
+
+
+def _remove_firewall_rules(group):
+    _run_firewall_script(
+        f"""
+$policy = New-Object -ComObject HNetCfg.FwPolicy2
+foreach ($rule in @($policy.Rules)) {{
+    if ($rule.Grouping -eq {_powershell_literal(group)}) {{
+        $policy.Rules.Remove($rule.Name)
+    }}
+}}
+"""
+    )
+
+
 def run_offline_process(arguments, *, cwd, env, timeout):
     """Run setup/uninstall offline, including extracted .tmp images and helpers.
 
@@ -88,7 +149,6 @@ def run_offline_process(arguments, *, cwd, env, timeout):
     terminate.argtypes = [wintypes.HANDLE, wintypes.UINT]
     terminate.restype = wintypes.BOOL
 
-    netsh = str(Path(os.environ["SystemRoot"]) / "System32/netsh.exe")
     rule = f"OpenHound Offline Smoke {uuid.uuid4().hex}"
     blocked = set()
     handles = []
@@ -124,24 +184,7 @@ def run_offline_process(arguments, *, cwd, env, timeout):
                     if not query(info.process, 0, image, ctypes.byref(size)):
                         raise ctypes.WinError(ctypes.get_last_error())
                     if image.value.casefold() not in blocked:
-                        subprocess.run(
-                            [
-                                netsh,
-                                "advfirewall",
-                                "firewall",
-                                "add",
-                                "rule",
-                                f"name={rule}",
-                                "dir=out",
-                                "action=block",
-                                "enable=yes",
-                                "profile=any",
-                                f"program={image.value}",
-                            ],
-                            check=True,
-                            capture_output=True,
-                            timeout=30,
-                        )
+                        _add_firewall_rule(rule, image.value)
                         blocked.add(image.value.casefold())
                         print(
                             f"Outbound networking blocked before launch: {image.value}"
@@ -160,6 +203,12 @@ def run_offline_process(arguments, *, cwd, env, timeout):
                     # Handle the debugger's initial breakpoint; preserve normal
                     # structured exception handling for all other exceptions.
                     status = 0x80010001  # DBG_EXCEPTION_NOT_HANDLED
+            except BaseException:
+                # Fail closed: kill the suspended process tree before resuming
+                # an event whose firewall rule could not be installed.
+                for handle in live.values():
+                    terminate(handle, 1)
+                raise
             finally:
                 if not resume(event.process_id, event.thread_id, status):
                     raise ctypes.WinError(ctypes.get_last_error())
@@ -172,10 +221,4 @@ def run_offline_process(arguments, *, cwd, env, timeout):
         for handle in handles:
             if handle != int(process._handle):
                 close(handle)
-        if blocked:
-            subprocess.run(
-                [netsh, "advfirewall", "firewall", "delete", "rule", f"name={rule}"],
-                check=True,
-                capture_output=True,
-                timeout=30,
-            )
+        _remove_firewall_rules(rule)
