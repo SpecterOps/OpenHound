@@ -20,6 +20,7 @@ from openhound.core.manager import CollectorManager
 from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import dataflow
 from openhound.scheduler.instance import InstancePaths, configure_instance
+from openhound.scheduler.runtime_guard import register_running_process
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ def _subprocess_collect(
         signal.signal(signal.SIGBREAK, signal.SIG_IGN)
     if instance_dir:
         configure_instance(InstancePaths(Path(instance_dir)))
+    register_running_process()
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
@@ -110,6 +112,7 @@ class Service:
         instance_dir: Path | None = None,
         stop_file: Path | None = None,
     ):
+        register_running_process()
         # BHE client settings
         self.bhe_uri = bhe_uri
         self.collector_name = collector_name
