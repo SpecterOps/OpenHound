@@ -1,0 +1,57 @@
+name: Windows runtime
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: x64
+      - uses: astral-sh/setup-uv@v7
+      - name: Build private runtime
+        shell: pwsh
+        run: ./scripts/windows/build.ps1 -OutputDirectory 'dist/windows/OpenHound Payload'
+      - name: Verify packaged runtime from an unrelated working directory
+        shell: pwsh
+        run: |
+          $payload = (Resolve-Path 'dist/windows/OpenHound Payload').Path
+          $copy = Join-Path $env:RUNNER_TEMP 'OpenHound Smoke Copy'
+          Copy-Item $payload $copy -Recurse
+          $wheelDir = Join-Path $env:RUNNER_TEMP 'offline-wheel'
+          uv build --wheel --out-dir $wheelDir tests/windows/offline_collector
+          $wheel = (Get-ChildItem $wheelDir -Filter '*.whl' | Select-Object -First 1).FullName
+          uv pip install --python (Get-Command python).Source --target (Join-Path $copy 'python/Lib/site-packages') --no-deps $wheel
+          $before = @(Get-ChildItem $copy -File -Recurse | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          if (Get-Command python -ErrorAction SilentlyContinue) { throw 'Python is still on PATH.' }
+          $outside = Join-Path $env:RUNNER_TEMP 'Unrelated Working Directory'
+          New-Item -ItemType Directory $outside -Force | Out-Null
+          Push-Location $outside
+          try {
+            & (Join-Path $copy 'OpenHound.cmd') --help
+            if ($LASTEXITCODE -ne 0) { throw 'Packaged launcher failed.' }
+            $missing = & (Join-Path $copy 'OpenHound.cmd') --instance-dir (Join-Path $env:RUNNER_TEMP 'Missing Config') 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 2 -or $missing -notmatch 'destination.bloodhoundenterprise.url') { throw 'Missing configuration was not actionable.' }
+            & (Join-Path $copy 'python/python.exe') -I -B (Join-Path $env:GITHUB_WORKSPACE 'tests/windows/offline_smoke.py') (Join-Path $env:RUNNER_TEMP 'OpenHound Instance')
+            if ($LASTEXITCODE -ne 0) { throw 'Offline packaged scheduler test failed.' }
+            & (Join-Path $copy 'python/python.exe') -I -B (Join-Path $env:GITHUB_WORKSPACE 'tests/windows/offline_smoke.py') (Join-Path $env:RUNNER_TEMP 'OpenHound Instance')
+            if ($LASTEXITCODE -ne 0) { throw 'Repeated launch did not preserve configuration and state.' }
+            if (@(Get-ChildItem $outside -Recurse -File).Count -ne 0) { throw 'Runtime wrote into the unrelated current directory.' }
+            $after = @(Get-ChildItem $copy -File -Recurse | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })
+            if (Compare-Object $before $after) { throw 'Runtime modified the application directory.' }
+          } finally { Pop-Location }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhound-windows-x64
+          path: dist/windows/OpenHound Payload/

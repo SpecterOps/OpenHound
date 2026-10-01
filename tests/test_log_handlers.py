@@ -13,6 +13,14 @@ from openhound.core.logging import (
 )
 
 
+@pytest.fixture(autouse=True)
+def reset_log_handlers(monkeypatch):
+    """Each test starts with the default handlers, independent of earlier tests."""
+    monkeypatch.delenv("RUNTIME__LOG_PATH", raising=False)
+    logger_override.base_path = logger_override.default_platform_path()
+    logger_override.setup()
+
+
 def test_root_handler_setup():
     """Test that the root logger has a handler configured and that it is a RotatingFileHandler"""
     root_logger = logging.getLogger()
@@ -79,10 +87,9 @@ def test_log_routing_content(tmp_path, caplog, monkeypatch):
     root_logger = logging.getLogger()
     dlt_logger = logging.getLogger("dlt")
 
-    with caplog.at_level(logging.INFO):
-        with caplog.at_level(logging.INFO, logger="dlt"):
-            root_logger.info("Core openhound log")
-            dlt_logger.info("Extension DLT log")
+    with caplog.at_level(logging.INFO), caplog.at_level(logging.INFO, logger="dlt"):
+        root_logger.info("Core openhound log")
+        dlt_logger.info("Extension DLT log")
 
     assert (tmp_path / "openhound.log").exists(), (
         "The 'openhound.log' file should exist for the core logs"

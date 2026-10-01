@@ -57,6 +57,8 @@ Follow the docs for setup, CLI usage, and collector development:
 Extend OpenHound with pre-built extensions for other services. Additional collectors can be installed
 using [pip extras](https://didactic-adventure-wrzl3gr.pages.github.io/getting-started/).
 
+For the private Windows x64 foreground scheduler runtime, see [Windows runtime build and operation](docs/windows-runtime.md).
+
 | Name   | Source repo                                    |
 |--------|------------------------------------------------|
 | Github | https://github.com/SpecterOps/openhound-github |

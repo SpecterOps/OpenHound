@@ -1,6 +1,6 @@
 import logging
 import signal
-import time
+import threading
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -18,6 +18,7 @@ from openhound.core.clients.models.jobs import (
 from openhound.core.manager import CollectorManager
 from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import dataflow
+from openhound.scheduler.instance import InstancePaths, configure_instance
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,6 @@ POLL_INTERVAL = 30  # seconds; fixed poll/check-in cadence, must remain below BH
 class ExtensionNotFoundError(Exception):
     """Raised when the configured collector extension cannot be found."""
 
-    pass
-
 
 @dataclass
 class Result:
@@ -36,7 +35,9 @@ class Result:
     job_id: int
 
 
-def _subprocess_collect(collector_name: str, job_id: int) -> Result:
+def _subprocess_collect(
+    collector_name: str, job_id: int, instance_dir: str | None = None
+) -> Result:
     """A subprocess which runs the DLT pipeline for the specified collector.
 
     Loads the collector by name from Python entrypoints.
@@ -52,6 +53,10 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
         ExtensionNotFoundError: If the collector cannot be found via entrypoints.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, signal.SIG_IGN)
+    if instance_dir:
+        configure_instance(InstancePaths(Path(instance_dir)))
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
@@ -101,6 +106,7 @@ class Service:
         token_id: str,
         collector_name: str,
         log_base_path: Path | None = None,
+        instance_dir: Path | None = None,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
@@ -113,6 +119,8 @@ class Service:
         self.log_base_path = (
             log_base_path or openhound_logging.logger_override.base_path
         )
+        self.instance_dir = instance_dir
+        self.stop_event = threading.Event()
 
         # Stores the ID of currently running BHE job
         self.job_running: int | None = None
@@ -127,6 +135,7 @@ class Service:
     def _exit_handler(self, sig: int, frame):
         """Handle SIGINT and SIGTERM signals. Sets self.exit to True to stop the while loop"""
         self.exit = True
+        self.stop_event.set()
         logger.warning(f"Received signal {sig}, shutting down gracefully.")
 
     def _shutdown(self) -> None:
@@ -224,7 +233,10 @@ class Service:
         self.job_running = job.id
         try:
             self.future = self.executor.submit(
-                _subprocess_collect, self.collector_name, job.id
+                _subprocess_collect,
+                self.collector_name,
+                job.id,
+                str(self.instance_dir) if self.instance_dir else None,
             )
         except BrokenProcessPool:
             logger.exception(
@@ -316,7 +328,7 @@ class Service:
                 logger.exception("Error checking for or starting jobs.")
         else:
             try:
-                self.client.jobs_current
+                _ = self.client.jobs_current
             except Exception:
                 logger.exception("Error checking in-progress job.")
 
@@ -324,18 +336,20 @@ class Service:
         """Start method to initiate the process of checking for jobs and running them. This method will run indefinitely until an exit signal is received"""
         signal.signal(signal.SIGINT, self._exit_handler)
         signal.signal(signal.SIGTERM, self._exit_handler)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, self._exit_handler)
         logger.info(
             f"Service started, monitoring {self.bhe_uri} every {self.interval} seconds."
         )
         try:
             self.client.update_client_metadata()
 
-        except Exception as err:
-            logger.exception(f"Unable to update client metadata: {err}")
+        except Exception:
+            logger.exception("Unable to update client metadata.")
 
         try:
             while not self.exit:
                 self._poll()
-                time.sleep(self.interval)
+                self.stop_event.wait(self.interval)
         finally:
             self._shutdown()

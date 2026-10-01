@@ -4,6 +4,7 @@ os.environ.setdefault("RUNTIME__DLTHUB_TELEMETRY", "false")
 
 import json
 import logging
+import multiprocessing
 import os
 import re
 import sys
@@ -13,9 +14,10 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import dlt
-import openhound
 from rich.console import Console
 from rich.logging import RichHandler
+
+import openhound
 
 VALID_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -244,7 +246,7 @@ class CustomLogger:
 
         # Share one rotating handler per file across loggers; opening the same file
         # with multiple handlers breaks rotation on Windows (WinError 32).
-        self._file_handlers: dict[Path, "RotatingFileHandler"] = {}
+        self._file_handlers: dict[Path, RotatingFileHandler] = {}
 
         self.handlers = {
             LogMode.CLI: self.cli_handlers,
@@ -457,5 +459,12 @@ class CustomLogger:
         return LogMode.SERVICE
 
 
-logger_override = CustomLogger("openhound.log")
+_worker_log = (
+    bool(os.environ.get("OPENHOUND_INSTANCE_DIR"))
+    and sys.platform == "win32"
+    and multiprocessing.current_process().name != "MainProcess"
+)
+logger_override = CustomLogger(
+    f"worker-{os.getpid()}.log" if _worker_log else "openhound.log"
+)
 logger_override.setup()

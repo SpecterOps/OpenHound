@@ -1,0 +1,11 @@
+name: offline
+description: Offline Windows package validation collector
+authors:
+  name: OpenHound Tests
+version: 0.0.1
+type: collector
+license: Apache-2.0
+homepage: https://github.com/SpecterOps/openhound
+credentials: []
+parameters: []
+references: []

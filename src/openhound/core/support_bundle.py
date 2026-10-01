@@ -14,6 +14,8 @@ _LOG_PATTERNS = (
     "openhound.log.*",
     "ext_*.log",
     "ext_*.log.*",
+    "worker-*.log",
+    "worker-*.log.*",
 )
 
 

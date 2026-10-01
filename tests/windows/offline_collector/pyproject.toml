@@ -1,0 +1,11 @@
+[project]
+name = "openhound-offline-test"
+version = "0.0.1"
+requires-python = ">=3.13"
+
+[project.entry-points."openhound.sources"]
+offline = "openhound_offline_test:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
