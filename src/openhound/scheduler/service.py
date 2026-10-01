@@ -1,6 +1,7 @@
 import logging
 import signal
 import threading
+import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -107,6 +108,7 @@ class Service:
         collector_name: str,
         log_base_path: Path | None = None,
         instance_dir: Path | None = None,
+        stop_file: Path | None = None,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
@@ -120,6 +122,7 @@ class Service:
             log_base_path or openhound_logging.logger_override.base_path
         )
         self.instance_dir = instance_dir
+        self.stop_file = stop_file
         self.stop_event = threading.Event()
 
         # Stores the ID of currently running BHE job
@@ -137,6 +140,27 @@ class Service:
         self.exit = True
         self.stop_event.set()
         logger.warning(f"Received signal {sig}, shutting down gracefully.")
+
+    def _consume_stop_file(self) -> bool:
+        """Consume an optional foreground stop request from a writable directory."""
+        if self.stop_file is None or not self.stop_file.is_file():
+            return False
+        self.stop_file.unlink()
+        self.exit = True
+        self.stop_event.set()
+        logger.info("Stop requested via %s; shutting down gracefully.", self.stop_file)
+        return True
+
+    def _wait_for_next_poll(self) -> None:
+        if self.stop_file is None:
+            self.stop_event.wait(self.interval)
+            return
+        deadline = time.monotonic() + self.interval
+        while not self.exit and not self._consume_stop_file():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self.stop_event.wait(min(0.2, remaining))
 
     def _shutdown(self) -> None:
         """Shut down the executor and wait for running tasks to finish. Executed when the service is shut down."""
@@ -342,14 +366,18 @@ class Service:
             f"Service started, monitoring {self.bhe_uri} every {self.interval} seconds."
         )
         try:
-            self.client.update_client_metadata()
-
-        except Exception:
-            logger.exception("Unable to update client metadata.")
-
-        try:
+            if self.stop_file is not None and self.stop_file.exists():
+                raise ValueError(
+                    f"Stop request file already exists: {self.stop_file}. Remove it before starting."
+                )
+            try:
+                self.client.update_client_metadata()
+            except Exception:
+                logger.exception("Unable to update client metadata.")
             while not self.exit:
+                if self._consume_stop_file():
+                    break
                 self._poll()
-                self.stop_event.wait(self.interval)
+                self._wait_for_next_poll()
         finally:
             self._shutdown()

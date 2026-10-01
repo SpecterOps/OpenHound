@@ -1,7 +1,6 @@
 """Run with the packaged interpreter and a CI-only collector in a copied payload."""
 
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -12,8 +11,7 @@ from openhound.scheduler.instance import InstancePaths, configure_instance
 
 
 class FakeClient:
-    def __init__(self, ready: Path | None = None):
-        self.ready = ready
+    def __init__(self):
         self.started = []
         self.ended = []
 
@@ -24,8 +22,7 @@ class FakeClient:
         self.ended.append((status, message))
 
     def update_client_metadata(self):
-        if self.ready:
-            self.ready.write_text("ready")
+        pass
 
     @property
     def management_available(self):
@@ -54,11 +51,24 @@ def main():
         collector.name for collector in CollectorManager.from_entrypoint().collectors
     }
     assert {"github", "offline"} <= names, names
+    stop_file = root / "temp" / "stop.request"
     service = Service(
-        "http://127.0.0.1:1", "unused", "unused", "offline", instance_dir=root
+        "http://127.0.0.1:1",
+        "unused",
+        "unused",
+        "offline",
+        instance_dir=root,
+        stop_file=stop_file if "--idle-child" in sys.argv else None,
     )
     if "--idle-child" in sys.argv:
-        service.client = FakeClient(root / "temp" / "idle-ready")
+        service.client = FakeClient()
+        wait = service._wait_for_next_poll
+
+        def idle_wait():
+            (root / "temp" / "idle-ready").write_text("ready")
+            wait()
+
+        service._wait_for_next_poll = idle_wait
         service.start()
         return
 
@@ -78,17 +88,13 @@ def main():
 
     idle_root = root / "idle"
     ready = idle_root / "temp" / "idle-ready"
+    stop_file = idle_root / "temp" / "stop.request"
     ready.unlink(missing_ok=True)
-    options = (
-        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        if sys.platform == "win32"
-        else {"start_new_session": True}
-    )
+    stop_file.unlink(missing_ok=True)
     process = subprocess.Popen(
         [sys.executable, "-I", "-B", __file__, "--idle-child", str(idle_root)],
         cwd=root / "output",
         env=os.environ.copy(),
-        **options,
     )
     try:
         deadline = time.monotonic() + 20
@@ -99,11 +105,9 @@ def main():
         ):
             time.sleep(0.1)
         assert ready.is_file(), "idle scheduler never became ready"
-        os.kill(
-            process.pid,
-            signal.CTRL_BREAK_EVENT if sys.platform == "win32" else signal.SIGTERM,
-        )
+        stop_file.write_text("stop")
         assert process.wait(timeout=10) == 0, "scheduler did not stop cleanly"
+        assert not stop_file.exists(), "scheduler did not consume the stop request"
     finally:
         if process.poll() is None:
             process.kill()

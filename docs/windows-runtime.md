@@ -56,14 +56,22 @@ From any working directory, including one unrelated to the payload:
 
 `OpenHound.cmd` starts its adjacent private `python.exe` and does not modify system Python. Leave the console open. Press **Ctrl+C** or **Ctrl+Break** to stop while idle; the scheduler closes its worker pool and exits. If a collection is running, shutdown waits for the worker to finish. Repeat the same command to restart; instance files and pipeline state persist.
 
+For a foreground process launched without an interactive console, provide an absolute stop request path inside the instance:
+
+```powershell
+& 'C:\Program Files\OpenHound\OpenHound.cmd' --stop-file "$env:ProgramData\SpecterOps\OpenHound\instances\default\temp\stop.request"
+```
+
+To stop it from another PowerShell session, create that file with `New-Item -ItemType File -Path "$env:ProgramData\SpecterOps\OpenHound\instances\default\temp\stop.request"`. The scheduler consumes the file and exits after its current poll; an active collection is allowed to finish. The file must not already exist when starting.
+
 For a development or Linux package installation, the equivalent foreground entry point is `openhound-scheduler --instance-dir /writable/instance`, or `python -m openhound.scheduler --instance-dir /writable/instance`. With no instance override on Linux, the Docker Enterprise launcher keeps its prior paths and configuration behavior.
 
 For troubleshooting, inspect `logs\openhound.log`, `logs\worker-*.log`, and `logs\ext_*.log` inside the instance. Missing BHE settings produce a message naming the required key and config directory. An unknown collector prints the installed collector names. A missing GitHub credential usually appears when a job starts; check the `sources.source.github.credentials` section and permissions. If Windows reports a missing DLL, check the VC runtime prerequisite above. The scheduler polls BHE every 30 seconds, so a healthy idle process may produce no collection output until a BHE job is available.
 
 ## Validation
 
-Windows CI builds the payload and tests it from a path with spaces and an unrelated current directory, with Python tools removed from PATH. It checks metadata and GitHub entry point discovery, then installs a CI-only offline collector into a **copy** of the payload. The offline test starts a scheduler job through `Service`, runs a spawned worker, checks the worker's instance paths, and verifies clean idle shutdown using a console break signal. No external API credentials are needed. The release payload contains only the GitHub collector.
+Windows CI builds the payload and tests it from a path with spaces and an unrelated current directory, with Python tools removed from PATH. It checks metadata and GitHub entry point discovery, then installs a CI-only offline collector into a **copy** of the payload. The offline test starts a scheduler job through `Service`, runs a spawned worker, checks the worker's instance paths, and verifies clean idle shutdown using a stop request file. Hosted CI does not provide a reliable interactive console for testing Ctrl+C or Ctrl+Break delivery. No external API credentials are needed. The release payload contains only the GitHub collector.
 
 To perform a live test, put valid BHE and GitHub values in a dedicated instance as above, start the foreground launcher, queue a GitHub collection job in BHE for this client, and watch the instance logs for job start, completed collection and BHE completion status. Confirm files appear under `output\github`, pipeline state appears under `state`, and no files are written to the payload directory. Stop with Ctrl+C and start it again to confirm configuration and state persist. The offline test does not verify GitHub API permissions or live BHE ingestion.
 
-Service integration can later invoke the packaged scheduler module or the private Python executable. It must pass the same instance directory, run with an account allowed to read secrets and write instance data, preserve the application directory across launches, and provide a stop signal with enough time for an active worker to finish. Installer placement and upgrades should keep the instance directory separate from the application files.
+Service integration can later invoke the packaged scheduler module or the private Python executable. It must pass the same instance directory, run with an account allowed to read secrets and write instance data, preserve the application directory across launches, and provide a stop request with enough time for an active worker to finish. Installer placement and upgrades should keep the instance directory separate from the application files.

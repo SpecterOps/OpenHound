@@ -19,11 +19,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--instance-dir", type=Path, help="Writable instance directory override"
     )
+    parser.add_argument(
+        "--stop-file", type=Path, help="Absolute path of an optional stop request file"
+    )
     args = parser.parse_args(argv)
     try:
         paths = resolve_instance(args.instance, args.instance_dir)
         if paths:
             configure_instance(paths)
+        if args.stop_file is not None and not args.stop_file.is_absolute():
+            raise ValueError(
+                "--stop-file must be an absolute path in a writable directory."
+            )
 
         import dlt
 
@@ -86,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
             collector_name=collector_name,
             log_base_path=paths.logs if paths else None,
             instance_dir=paths.root if paths else None,
+            stop_file=args.stop_file,
         ).start()
         return 0
     except (OSError, ValueError) as exc:
