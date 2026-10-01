@@ -22,6 +22,16 @@ jobs:
       - name: Validate extension catalog
         shell: pwsh
         run: python -B -m unittest discover -s tests -p test_windows_catalog.py -v
+      - name: Verify offline process firewall isolation
+        shell: pwsh
+        run: |
+          python -B -m unittest discover -s tests -p test_windows_offline_process.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Offline process controller tests failed.' }
+          if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count -ne 0) {
+            throw 'Offline process tests require enabled Windows Firewall profiles.'
+          }
+          python -B tests/windows/test_offline_process.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Offline process firewall test failed.' }
       - name: Build private runtime
         shell: pwsh
         run: ./scripts/windows/build.ps1 -OutputDirectory 'dist/windows/OpenHound Payload'
