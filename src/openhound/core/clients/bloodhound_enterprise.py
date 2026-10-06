@@ -121,7 +121,7 @@ class BloodHoundEnterprise(BloodHound):
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """End a claimed managed collector job."""
-        path = f"/api/v2/collector-jobs/{job_id}/end"
+        path = f"/api/v2/collector-job-queue/{job_id}/end"
         payload: dict[str, Any] = {"outcome": outcome.value}
         if failure_message is not None:
             payload["failure_message"] = failure_message
