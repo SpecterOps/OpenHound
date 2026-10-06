@@ -112,7 +112,7 @@ def mock_bloodhound_api():
         app.state.end_payload = body
         return load_json("job_end.json")
 
-    @app.post("/api/v2/collector-jobs/{job_id}/end")
+    @app.post("/api/v2/collector-job-queue/{job_id}/end")
     async def end_managed_job(job_id: str, body: dict):
         app.state.collector_job_end_requests.append(
             {"job_id": job_id, "body": body}
@@ -264,6 +264,8 @@ def mock_service(mock_bloodhound_api, monkeypatch):
         token_id="test-id",
         collector_name="openhound-faker",
     )
+
+
 def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeypatch):
     monkeypatch.setattr(
         bloodhound_enterprise.socket, "gethostname", lambda: "test-host"
@@ -482,7 +484,7 @@ def test_end_managed_job_retries_transient_errors(
     assert any(
         record.levelno == logging.DEBUG
         and getattr(record, "endpoint", None)
-        == "/api/v2/collector-jobs/collector-job-123/end"
+        == "/api/v2/collector-job-queue/collector-job-123/end"
         for record in caplog.records
     )
 
