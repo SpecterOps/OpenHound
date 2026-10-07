@@ -1,9 +1,10 @@
 """Managed BHE credential retrieval and validation."""
 
-from dataclasses import dataclass
 import logging
 import time
+from dataclasses import dataclass
 from typing import Protocol
+from uuid import UUID
 
 from .aws_secrets_manager import AWSSecretsManager, SecretValue
 
@@ -60,6 +61,12 @@ class AWSBHECredentials:
             raise InvalidBHECredentialsSecret(
                 "BHE credentials secret must contain a non-empty token_id"
             )
+        try:
+            UUID(token_id)
+        except ValueError:
+            raise InvalidBHECredentialsSecret(
+                "BHE credentials secret must contain a valid UUID token_id"
+            ) from None
         if not isinstance(token_key, str) or not token_key:
             raise InvalidBHECredentialsSecret(
                 "BHE credentials secret must contain a non-empty token_key"

@@ -265,11 +265,6 @@ class Service:
         """
         try:
             result = future.result()
-            logger.info(f"Job {result.job_id} completed successfully, notifying BHE.")
-            self.client.end_job(
-                JobStatus.COMPLETE,
-                f"Collector '{self.collector_name}' completed successfully",
-            )
 
         except ExtensionNotFoundError:
             logger.error(
@@ -297,9 +292,15 @@ class Service:
                 f"Unexpected error while running '{self.collector_name}' collector",
             )
 
-        finally:
-            self.future = None
-            self.job_running = None
+        else:
+            logger.info(f"Job {result.job_id} completed successfully, notifying BHE.")
+            self.client.end_job(
+                JobStatus.COMPLETE,
+                f"Collector '{self.collector_name}' completed successfully",
+            )
+
+        self.future = None
+        self.job_running = None
 
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
@@ -308,9 +309,7 @@ class Service:
             if self.future is not None and self.future.done():
                 self._handle_completed_job(self.future)
         except Exception:
-            logger.exception("Unexpected error handling completed job.")
-            self.future = None
-            self.job_running = None
+            logger.exception("Error reporting completed job; retaining result for retry.")
 
         # Management operations have priority over new collections while idle.
         if self.job_running is None:

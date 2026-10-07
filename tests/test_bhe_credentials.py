@@ -18,11 +18,11 @@ class FakeSecretsManager:
 
 
 def test_aws_bhe_credentials_loads_token_pair_from_json_secret():
-    manager = FakeSecretsManager({"token_id": "id", "token_key": "key"})
+    manager = FakeSecretsManager({"token_id": "12345678-1234-1234-1234-123456789abc", "token_key": "key"})
 
     result = AWSBHECredentials("production/bhe", manager).refresh()
 
-    assert result == BHECredentials(token_id="id", token_key="key")
+    assert result == BHECredentials(token_id="12345678-1234-1234-1234-123456789abc", token_key="key")
     assert manager.requested == ["production/bhe"]
 
 
@@ -30,6 +30,9 @@ def test_aws_bhe_credentials_loads_token_pair_from_json_secret():
     "secret",
     [
         "not-json",
+        {"token_id": "not-a-uuid", "token_key": "key"},
+        {"token_id": "   ", "token_key": "key"},
+        {"token_id": 123, "token_key": "key"},
         {},
         {"token_id": "id"},
         {"token_key": "key"},
