@@ -41,12 +41,23 @@ class ExtensionNotFoundError(Exception):
 
 
 class ManagedRuntimeUnavailableError(RuntimeError):
-    """BED-9516's managed collection runtime has not been installed."""
+    """Managed scheduling requires a configured collection runtime."""
+
+
+class CredentialValidationError(ValueError):
+    """A managed job's required credential document could not be loaded."""
+
+
+class ManagedJobProcessingError(RuntimeError):
+    """A sanitized managed polling failure that can be retried next poll."""
 
 
 @dataclass(frozen=True)
 class PreparedManagedJob:
-    """In-memory BED-9516 handoff; never serialize or log credential material."""
+    """Validated job and credentials for the managed collection runtime.
+
+    Keep credentials in memory; never serialize or log them.
+    """
 
     job: CollectorJob = field(repr=False)
     credentials: dict[str, Any] = field(repr=False)
@@ -157,8 +168,8 @@ class Service:
         self.collector_name = collector_name
         self.managed = is_managed() if managed is None else managed
         self.secrets_manager = secrets_manager or AWSSecretsManager()
-        # BED-9516 must supply a synchronous runtime that starts via the managed
-        # endpoint and owns collection, lease renewal, ingest and completion.
+        # The runner synchronously owns managed start, collection, lease renewal,
+        # ingest, and completion before the scheduler picks up another job.
         self.managed_job_runner = managed_job_runner
         self._pending_managed_failure: str | None = None
         self.client = BloodHoundEnterprise(
@@ -249,6 +260,27 @@ class Service:
         )
         self._pending_managed_failure = None
 
+    def _load_managed_credentials(self, job: CollectorJob) -> dict[str, Any]:
+        """Retrieve and validate credentials, exposing only a safe failure message."""
+        if job.secret_key_id is None or not job.secret_key_id.strip():
+            raise CredentialValidationError("Credential validation failed")
+
+        logger.debug(
+            "Retrieving managed collector credentials.",
+            extra={
+                "job_id": str(job.id),
+                "provider": "aws.secretsmanager",
+                "secret_count": 1,
+            },
+        )
+        try:
+            credentials = self.secrets_manager.get_secret(job.secret_key_id)
+            if isinstance(credentials, dict) and _usable_credential_value(credentials):
+                return credentials
+        except Exception:  # noqa: BLE001 - redact secret reader and validation errors
+            raise CredentialValidationError("Credential validation failed") from None
+        raise CredentialValidationError("Credential validation failed")
+
     def claim_and_validate_managed_job(
         self, available_job: CollectorJob
     ) -> PreparedManagedJob | None:
@@ -271,20 +303,8 @@ class Service:
         context = {"job_id": str(job.id)}
         logger.info("Job successfully picked up", extra=context)
         try:
-            if job.secret_key_id is None or not job.secret_key_id.strip():
-                raise ValueError("Missing required secret reference")
-            logger.debug(
-                "Retrieving managed collector credentials.",
-                extra={**context, "provider": "aws.secretsmanager", "secret_count": 1},
-            )
-            credentials = self.secrets_manager.get_secret(job.secret_key_id)
-            if not isinstance(credentials, dict) or not _usable_credential_value(
-                credentials
-            ):
-                raise ValueError("Invalid credential document")
-        except Exception:  # noqa: BLE001 - credential errors must never expose payloads
-            # Provider and validation errors may contain secret values. Never
-            # attach their text, traceback, or the claimed job to a log record.
+            credentials = self._load_managed_credentials(job)
+        except CredentialValidationError:
             logger.error("Credential validation failed", extra=context)
             self._report_managed_credential_failure(str(job.id))
             return None
@@ -295,7 +315,7 @@ class Service:
     def _require_managed_runtime(self) -> Callable[[PreparedManagedJob], None]:
         if self.managed_job_runner is None:
             raise ManagedRuntimeUnavailableError(
-                "BED-9516 managed start/runtime is required for managed scheduling"
+                "Managed collection runtime is required for managed scheduling"
             )
         return self.managed_job_runner
 
@@ -312,10 +332,9 @@ class Service:
             if prepared is not None:
                 runner(prepared)
         except Exception:  # noqa: BLE001 - redact managed runtime errors
-            logger.error("Managed collector job processing failed.")
-            # Reporting exhaustion and runtime failures must remain observable;
-            # suppress all raw provider/runtime exception details.
-            raise RuntimeError("Managed collector job processing failed") from None
+            raise ManagedJobProcessingError(
+                "Managed collector job processing failed"
+            ) from None
 
     def check_management(self) -> ManagementOperation | None:
         """Return the first pending support-bundle operation, if any."""
@@ -494,7 +513,7 @@ class Service:
                 if self.managed:
                     try:
                         self._poll()
-                    except RuntimeError:
+                    except ManagedJobProcessingError:
                         logger.error(
                             "Managed scheduler poll failed; retrying next poll."
                         )

@@ -36,6 +36,7 @@ from openhound.core.models.graph import Graph
 from openhound.scheduler import service as scheduler_service
 from openhound.scheduler.service import (
     ExtensionNotFoundError,
+    ManagedJobProcessingError,
     ManagedRuntimeUnavailableError,
     Result,
     Service,
@@ -600,11 +601,9 @@ def test_end_managed_job_raises_after_transient_retries_are_exhausted(
         )
 
     assert error.value.code == 503
-    assert attempts == bloodhound_enterprise.MANAGED_JOB_END_MAX_RETRIES + 1
-    assert (
-        delays
-        == [bloodhound_enterprise.MANAGED_JOB_END_RETRY_DELAY_SECONDS]
-        * bloodhound_enterprise.MANAGED_JOB_END_MAX_RETRIES
+    assert attempts == 4
+    assert delays == [bloodhound_enterprise.MANAGED_JOB_END_RETRY_DELAY_SECONDS] * (
+        bloodhound_enterprise.MANAGED_JOB_END_MAX_ATTEMPTS - 1
     )
 
 
@@ -1594,7 +1593,7 @@ def test_failed_claim_does_not_retrieve_or_end(
 ):
     state = mock_bloodhound_api.app.state
     attempts = (
-        bloodhound_enterprise.MANAGED_JOB_CLAIM_MAX_RETRIES + 1 if status == 503 else 1
+        bloodhound_enterprise.MANAGED_JOB_CLAIM_MAX_ATTEMPTS if status == 503 else 1
     )
     state.collector_job_claim_statuses = [status] * attempts
     delays = []
@@ -1604,7 +1603,7 @@ def test_failed_claim_does_not_retrieve_or_end(
         if status == 409:
             managed_service._poll()
         else:
-            with pytest.raises(RuntimeError) as raised:
+            with pytest.raises(ManagedJobProcessingError) as raised:
                 managed_service._poll()
             assert "raw-provider-secret" not in "".join(
                 traceback.format_exception(raised.value)
@@ -1679,13 +1678,15 @@ def test_exhausted_credential_failure_end_is_retained_and_retried_before_discove
 ):
     state = mock_bloodhound_api.app.state
     state.collector_job_claim_response["secret_key_id"] = None
-    state.collector_job_end_statuses = [503] * (
-        bloodhound_enterprise.MANAGED_JOB_END_MAX_RETRIES + 1
-    )
+    max_attempts = bloodhound_enterprise.MANAGED_JOB_END_MAX_ATTEMPTS
+    state.collector_job_end_statuses = [503] * max_attempts
     delays = []
     monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
 
-    with caplog.at_level(logging.DEBUG), pytest.raises(RuntimeError) as raised:
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(ManagedJobProcessingError) as raised,
+    ):
         managed_service._poll()
     assert (
         managed_service._pending_managed_failure
@@ -1696,10 +1697,8 @@ def test_exhausted_credential_failure_end_is_retained_and_retried_before_discove
     )
     assert "raw-provider-secret" not in caplog.text
     assert all("raw-provider-secret" not in repr(r.__dict__) for r in caplog.records)
-    assert (
-        delays
-        == [bloodhound_enterprise.MANAGED_JOB_END_RETRY_DELAY_SECONDS]
-        * bloodhound_enterprise.MANAGED_JOB_END_MAX_RETRIES
+    assert delays == [bloodhound_enterprise.MANAGED_JOB_END_RETRY_DELAY_SECONDS] * (
+        max_attempts - 1
     )
 
     state.collector_job_end_statuses = [resolved_status]
@@ -1710,9 +1709,7 @@ def test_exhausted_credential_failure_end_is_retained_and_retried_before_discove
         == len(state.collector_job_claim_requests)
         == 1
     )
-    assert state.managed_events == ["claim"] + ["end"] * (
-        bloodhound_enterprise.MANAGED_JOB_END_MAX_RETRIES + 2
-    )
+    assert state.managed_events == ["claim"] + ["end"] * (max_attempts + 1)
     assert managed_service.handoffs == []
 
 
@@ -1755,7 +1752,9 @@ def test_managed_runtime_dependency_fails_before_claim_or_legacy_work(
     managed_service, mock_bloodhound_api, entry
 ):
     managed_service.managed_job_runner = None
-    with pytest.raises(ManagedRuntimeUnavailableError, match="BED-9516"):
+    with pytest.raises(
+        ManagedRuntimeUnavailableError, match="Managed collection runtime is required"
+    ):
         getattr(managed_service, entry)()
     state = mock_bloodhound_api.app.state
     assert (
@@ -1787,7 +1786,9 @@ def test_mode_config_routes_scheduler_to_managed_dependency(mock_service, monkey
         collector_name="openhound-faker",
     )
     assert service.managed is True
-    with pytest.raises(ManagedRuntimeUnavailableError, match="BED-9516"):
+    with pytest.raises(
+        ManagedRuntimeUnavailableError, match="Managed collection runtime is required"
+    ):
         service._poll()
 
 
@@ -1798,7 +1799,10 @@ def test_runtime_failure_is_sanitized_and_not_reported_as_credential_failure(
         raise ValueError(str(prepared.credentials))
 
     managed_service.managed_job_runner = fail_start
-    with caplog.at_level(logging.DEBUG), pytest.raises(RuntimeError) as raised:
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(ManagedJobProcessingError) as raised,
+    ):
         managed_service._poll()
     assert "private-credential-value" not in "".join(
         traceback.format_exception(raised.value)
@@ -1817,3 +1821,77 @@ def test_valid_generic_nested_json_is_handed_off_without_field_schema(managed_se
     )
     managed_service._poll()
     assert managed_service.handoffs[0].credentials == credentials
+
+
+def test_unexpected_secret_reader_failure_is_redacted_and_reported_as_failed(
+    managed_service, mock_bloodhound_api, caplog
+):
+    state = mock_bloodhound_api.app.state
+
+    def retrieve(*, SecretId):
+        state.managed_events.append("retrieve")
+        raise RuntimeError("private-credential-value")
+
+    managed_service.secrets_manager = AWSSecretsManager(
+        SimpleNamespace(get_secret_value=retrieve)
+    )
+    with caplog.at_level(logging.DEBUG):
+        managed_service._poll()
+
+    assert state.managed_events == ["claim", "retrieve", "end"]
+    assert state.collector_job_end_requests[0]["body"] == {
+        "outcome": "failed",
+        "failure_message": "Credential validation failed",
+    }
+    assert managed_service.handoffs == []
+    assert all(
+        "private-credential-value" not in repr(r.__dict__) for r in caplog.records
+    )
+    assert "private-credential-value" not in caplog.text
+
+
+def test_managed_scheduler_logs_failure_once_and_retries_reporting_next_poll(
+    managed_service, mock_bloodhound_api, monkeypatch, caplog
+):
+    state = mock_bloodhound_api.app.state
+    state.collector_job_claim_response["secret_key_id"] = None
+    original_end = managed_service.client.end_managed_job
+    reports = []
+    pending_at_sleep = []
+
+    def end_job(*args, **kwargs):
+        reports.append((args, kwargs))
+        if len(reports) == 1:
+            raise requests.Timeout("raw-provider-secret")
+        return original_end(*args, **kwargs)
+
+    def next_poll(seconds):
+        assert seconds == managed_service.interval
+        pending_at_sleep.append(managed_service._pending_managed_failure)
+        if len(pending_at_sleep) == 2:
+            managed_service.exit = True
+
+    monkeypatch.setattr(managed_service.client, "end_managed_job", end_job)
+    monkeypatch.setattr(scheduler_service.time, "sleep", next_poll)
+    monkeypatch.setattr(scheduler_service.signal, "signal", lambda *args: None)
+
+    with caplog.at_level(logging.DEBUG):
+        managed_service.start()
+
+    assert reports == [reports[0], reports[0]]
+    assert pending_at_sleep == [state.collector_job_claim_response["id"], None]
+    assert (
+        len(state.collector_job_queue_requests)
+        == len(state.collector_job_claim_requests)
+        == 1
+    )
+    assert managed_service.handoffs == []
+    assert [
+        r.getMessage() for r in caplog.records if "poll failed" in r.getMessage()
+    ] == ["Managed scheduler poll failed; retrying next poll."]
+    assert not any(
+        r.getMessage() == "Managed collector job processing failed."
+        for r in caplog.records
+    )
+    assert "raw-provider-secret" not in caplog.text
+    assert all("raw-provider-secret" not in repr(r.__dict__) for r in caplog.records)

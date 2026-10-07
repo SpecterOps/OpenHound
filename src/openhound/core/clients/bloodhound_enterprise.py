@@ -42,7 +42,7 @@ class ManagedJobOutcome(str, Enum):
     FAILED = "failed"
 
 
-MANAGED_JOB_END_MAX_RETRIES = 3
+MANAGED_JOB_END_MAX_ATTEMPTS = 4
 MANAGED_JOB_END_RETRY_DELAY_SECONDS = 2
 MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_JOB_END_READ_TIMEOUT_SECONDS = 120
@@ -53,7 +53,7 @@ SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS = 10
 SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS = 120
 MANAGED_COLLECTOR_JOB_AVAILABLE_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_COLLECTOR_JOB_AVAILABLE_READ_TIMEOUT_SECONDS = 20
-MANAGED_JOB_CLAIM_MAX_RETRIES = 3
+MANAGED_JOB_CLAIM_MAX_ATTEMPTS = 4
 MANAGED_JOB_CLAIM_RETRY_DELAY_SECONDS = 2
 MANAGED_JOB_CLAIM_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS = 20
@@ -168,13 +168,12 @@ class BloodHoundEnterprise(BloodHound):
         part of the standard open-source/self-hosted collector workflow.
         """
         path = f"/api/v2/collector-job-queue/{job_id}/claim"
-        max_attempts = MANAGED_JOB_CLAIM_MAX_RETRIES + 1
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, MANAGED_JOB_CLAIM_MAX_ATTEMPTS + 1):
             context = {
                 "endpoint": path,
                 "job_id": job_id,
                 "attempt": attempt,
-                "max_attempts": max_attempts,
+                "max_attempts": MANAGED_JOB_CLAIM_MAX_ATTEMPTS,
             }
             logger.debug("Sending managed collector claim request.", extra=context)
             try:
@@ -198,7 +197,7 @@ class BloodHoundEnterprise(BloodHound):
                         "status_code": getattr(error, "code", None),
                     },
                 )
-                if not retryable or attempt == max_attempts:
+                if not retryable or attempt == MANAGED_JOB_CLAIM_MAX_ATTEMPTS:
                     raise _safe_managed_request_error(error) from None
                 time.sleep(MANAGED_JOB_CLAIM_RETRY_DELAY_SECONDS)
                 continue
@@ -237,20 +236,18 @@ class BloodHoundEnterprise(BloodHound):
         if metadata is not None:
             payload["metadata"] = metadata
         body = json.dumps(payload).encode()
-        max_attempts = MANAGED_JOB_END_MAX_RETRIES + 1
-
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, MANAGED_JOB_END_MAX_ATTEMPTS + 1):
             log_context = {
                 "job_id": job_id,
                 "outcome": outcome.value,
                 "attempt": attempt,
-                "max_attempts": max_attempts,
+                "max_attempts": MANAGED_JOB_END_MAX_ATTEMPTS,
             }
             logger.info(
                 "Attempting to end managed collector job %s (%s/%s).",
                 job_id,
                 attempt,
-                max_attempts,
+                MANAGED_JOB_END_MAX_ATTEMPTS,
                 extra=log_context,
             )
             logger.debug(
@@ -298,7 +295,7 @@ class BloodHoundEnterprise(BloodHound):
                     },
                 )
 
-                if not retryable or attempt == max_attempts:
+                if not retryable or attempt == MANAGED_JOB_END_MAX_ATTEMPTS:
                     raise _safe_managed_request_error(error) from None
 
                 logger.debug(

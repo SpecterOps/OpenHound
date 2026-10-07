@@ -31,7 +31,7 @@ DEFAULT_AWS_CLIENT_CONFIG = Config(
 )
 
 
-def _silence_sdk_logs() -> None:
+def _configure_safe_sdk_logging() -> None:
     """Silence AWS SDK logs process-wide; they can contain requests and secrets.
 
     Existing children may have explicit DEBUG levels or their own handlers.
@@ -131,7 +131,6 @@ class AWSSecretsManager:
     def _get_secrets_in_batches(
         self, client: SecretsManagerClient, secret_ids: list[str]
     ) -> dict[str, SecretValue]:
-        _silence_sdk_logs()
         values: dict[str, SecretValue] = {}
         failures: dict[str, SecretRetrievalError] = {}
         for chunk_index, chunk in enumerate(_chunks(secret_ids, MAX_BATCH_SIZE)):
@@ -170,7 +169,7 @@ class AWSSecretsManager:
         }
 
     def _get_client(self) -> SecretsManagerClient:
-        _silence_sdk_logs()
+        _configure_safe_sdk_logging()
         if self._client is not None:
             return self._client
         try:
@@ -184,7 +183,6 @@ class AWSSecretsManager:
     def _retrieve_secret(
         self, client: SecretsManagerClient, secret_id: str
     ) -> SecretValue:
-        _silence_sdk_logs()
         _log_debug("get_secret_value", "attempt", 1)
         try:
             response = client.get_secret_value(SecretId=secret_id)
