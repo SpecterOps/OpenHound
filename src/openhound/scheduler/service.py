@@ -284,7 +284,7 @@ class Service:
     def claim_and_validate_managed_job(
         self, available_job: CollectorJob
     ) -> PreparedManagedJob | None:
-        """Prepare the authoritative claimed snapshot for the managed runtime."""
+        """Claim a managed job and validate its credentials."""
         if not self.managed:
             raise RuntimeError("Managed job preparation requires managed mode")
         if self._pending_managed_failure is not None:
