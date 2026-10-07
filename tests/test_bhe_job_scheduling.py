@@ -16,6 +16,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
 
 from openhound.core.clients import bloodhound, bloodhound_enterprise
+from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound import BloodHoundHTTPError
 from openhound.core.clients.bloodhound_enterprise import (
     JobStatus,
@@ -302,6 +303,66 @@ def test_request_forwards_connect_and_read_timeouts(monkeypatch):
     client.request(method="POST", path="/test", timeout=(1.5, 3.5))
 
     assert captured["timeout"] == (1.5, 3.5)
+
+
+def test_managed_client_refreshes_credentials_and_retries_once_after_401(monkeypatch):
+    responses = iter(
+        [
+            SimpleNamespace(status_code=401, text="expired"),
+            SimpleNamespace(status_code=204, text=""),
+        ]
+    )
+    requests = []
+
+    def mock_request(**kwargs):
+        requests.append(kwargs)
+        return next(responses)
+
+    refreshes = []
+
+    def refresh():
+        refreshes.append(True)
+        return BHECredentials(token_id="new-id", token_key="new-key")
+
+    monkeypatch.setattr(bloodhound.requests, "request", mock_request)
+    client = bloodhound_enterprise.BloodHoundEnterprise(
+        token_key="old-key",
+        token_id="old-id",
+        credential_refresh=refresh,
+    )
+
+    client.request(method="GET", path="/test")
+
+    assert refreshes == [True]
+    assert len(requests) == 2
+    assert requests[0]["headers"]["Authorization"] == "bhesignature old-id"
+    assert requests[1]["headers"]["Authorization"] == "bhesignature new-id"
+    assert client.token_id == "new-id"
+    assert client.token_key == "new-key"
+
+
+def test_managed_client_does_not_retry_a_second_401(monkeypatch):
+    def mock_request(**kwargs):
+        return SimpleNamespace(status_code=401, text="still expired")
+
+    refreshes = []
+
+    def refresh():
+        refreshes.append(True)
+        return BHECredentials(token_id="new-id", token_key="new-key")
+
+    monkeypatch.setattr(bloodhound.requests, "request", mock_request)
+    client = bloodhound_enterprise.BloodHoundEnterprise(
+        token_key="old-key",
+        token_id="old-id",
+        credential_refresh=refresh,
+    )
+
+    with pytest.raises(BloodHoundHTTPError) as error:
+        client.request(method="GET", path="/test")
+
+    assert error.value.code == 401
+    assert refreshes == [True]
 
 
 def test_upload_artifact_part_uses_bounded_timeouts(mock_service, monkeypatch):
@@ -1152,3 +1213,78 @@ def test_collection_logs_include_extension_and_openhound_versions(monkeypatch, c
         assert record.collector_extension_version == "2.3.4"
         assert record.openhound_version == "4.5.6"
         assert record.job_id == 42
+
+
+@pytest.mark.parametrize("collection_error", [None, RuntimeError("collection failed")])
+@pytest.mark.parametrize(
+    "report_error",
+    [BloodHoundHTTPError("unauthorized", 401), RuntimeError("refresh failed")],
+)
+def test_completed_job_retries_reporting_without_losing_outcome(
+    mock_service, monkeypatch, collection_error, report_error
+):
+    future = Future()
+    if collection_error is None:
+        future.set_result(Result(results={"collect": ["a"]}, job_id=123))
+        expected = JobStatus.COMPLETE
+    else:
+        future.set_exception(collection_error)
+        expected = JobStatus.FAILED
+    mock_service.future = future
+    mock_service.job_running = 123
+    reports = []
+
+    def end_job(status, message):
+        reports.append((status, message))
+        if len(reports) == 1:
+            raise report_error
+
+    monkeypatch.setattr(mock_service.client, "end_job", end_job)
+    monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
+
+    mock_service._poll()
+
+    assert mock_service.future is future
+    assert mock_service.job_running == 123
+    assert [status for status, _ in reports] == [expected]
+
+    mock_service._poll()
+
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert reports == [reports[0], reports[0]]
+
+
+def test_managed_refresh_rejects_invalid_id_and_recovers(mock_service, monkeypatch):
+    from openhound.core.clients.bhe_credentials import (
+        AWSBHECredentials,
+        InvalidBHECredentialsSecret,
+    )
+
+    secret = {"token_id": "invalid-id", "token_key": "new-key"}
+    provider = AWSBHECredentials(
+        "bhe", SimpleNamespace(get_secret=lambda _: secret)
+    )
+    client = mock_service.client
+    client._credential_refresh = provider.refresh
+    old_pair = (client.token_id, client.token_key)
+    attempts = []
+    valid_id = "12345678-1234-1234-1234-123456789abc"
+
+    def request(self, **kwargs):
+        attempts.append((self.token_id, self.token_key))
+        if self.token_id != valid_id:
+            raise BloodHoundHTTPError("unauthorized", 401)
+        return "ok"
+
+    monkeypatch.setattr(bloodhound.BloodHound, "request", request)
+
+    with pytest.raises(InvalidBHECredentialsSecret):
+        client.request("GET", "/test")
+
+    assert (client.token_id, client.token_key) == old_pair
+    assert attempts == [old_pair]
+
+    secret["token_id"] = valid_id
+    assert client.request("GET", "/test") == "ok"
+    assert attempts == [old_pair, old_pair, (valid_id, "new-key")]
