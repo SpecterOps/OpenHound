@@ -1,6 +1,7 @@
 import logging
 import signal
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import openhound
 import openhound.core.logging as openhound_logging
+from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
 from openhound.core.clients.models.jobs import (
     CollectorJob,
@@ -102,15 +104,20 @@ class Service:
         token_id: str,
         collector_name: str,
         log_base_path: Path | None = None,
+        interval: int = POLL_INTERVAL,
+        credential_refresh: Callable[[], BHECredentials] | None = None,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
         self.collector_name = collector_name
         self.client = BloodHoundEnterprise(
-            bhe_uri=bhe_uri, token_key=token_key, token_id=token_id
+            bhe_uri=bhe_uri,
+            token_key=token_key,
+            token_id=token_id,
+            credential_refresh=credential_refresh,
         )
         # Interval how often to check for a job
-        self.interval = POLL_INTERVAL
+        self.interval = interval
         self.log_base_path = (
             log_base_path or openhound_logging.logger_override.base_path
         )
@@ -258,11 +265,6 @@ class Service:
         """
         try:
             result = future.result()
-            logger.info(f"Job {result.job_id} completed successfully, notifying BHE.")
-            self.client.end_job(
-                JobStatus.COMPLETE,
-                f"Collector '{self.collector_name}' completed successfully",
-            )
 
         except ExtensionNotFoundError:
             logger.error(
@@ -290,9 +292,15 @@ class Service:
                 f"Unexpected error while running '{self.collector_name}' collector",
             )
 
-        finally:
-            self.future = None
-            self.job_running = None
+        else:
+            logger.info(f"Job {result.job_id} completed successfully, notifying BHE.")
+            self.client.end_job(
+                JobStatus.COMPLETE,
+                f"Collector '{self.collector_name}' completed successfully",
+            )
+
+        self.future = None
+        self.job_running = None
 
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
@@ -301,9 +309,7 @@ class Service:
             if self.future is not None and self.future.done():
                 self._handle_completed_job(self.future)
         except Exception:
-            logger.exception("Unexpected error handling completed job.")
-            self.future = None
-            self.job_running = None
+            logger.exception("Error reporting completed job; retaining result for retry.")
 
         # Management operations have priority over new collections while idle.
         if self.job_running is None:
