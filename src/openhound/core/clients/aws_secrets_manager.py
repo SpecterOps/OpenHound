@@ -4,6 +4,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any, Protocol
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import (
     BotoCoreError,
     ClientError,
@@ -20,6 +21,38 @@ logger = logging.getLogger(__name__)
 
 MAX_BATCH_SIZE = 20
 _PROVIDER = "aws.secretsmanager"
+
+# Bounded defaults for AWS control-plane requests. Client construction reuses
+# this policy; injected clients retain their caller-supplied configuration.
+DEFAULT_AWS_CLIENT_CONFIG = Config(
+    connect_timeout=10,
+    read_timeout=20,
+    retries={"mode": "standard", "total_max_attempts": 4},
+)
+
+
+def _silence_sdk_logs() -> None:
+    """Silence AWS SDK logs process-wide; they can contain requests and secrets.
+
+    Existing children may have explicit DEBUG levels or their own handlers.
+    Namespace sinks also catch newly created children, including DEBUG children.
+    OpenHound's separate logger retains safe request/result context.
+    """
+    for namespace in ("boto3", "botocore"):
+        sdk_logger = logging.getLogger(namespace)
+        sdk_logger.setLevel(logging.CRITICAL + 1)
+        sdk_logger.handlers.clear()
+        sdk_logger.addHandler(logging.NullHandler())
+        sdk_logger.propagate = False
+    for name, child_logger in tuple(logging.Logger.manager.loggerDict.items()):
+        if name.startswith(("boto3.", "botocore.")) and isinstance(
+            child_logger, logging.Logger
+        ):
+            child_logger.disabled = True
+            # Ancestor handlers still receive descendant records even when the
+            # ancestor is disabled. Route new descendants to the namespace sink.
+            child_logger.handlers.clear()
+            child_logger.propagate = True
 
 
 class SecretsManagerClient(Protocol):
@@ -98,6 +131,7 @@ class AWSSecretsManager:
     def _get_secrets_in_batches(
         self, client: SecretsManagerClient, secret_ids: list[str]
     ) -> dict[str, SecretValue]:
+        _silence_sdk_logs()
         values: dict[str, SecretValue] = {}
         failures: dict[str, SecretRetrievalError] = {}
         for chunk_index, chunk in enumerate(_chunks(secret_ids, MAX_BATCH_SIZE)):
@@ -107,9 +141,7 @@ class AWSSecretsManager:
             except (ClientError, BotoCoreError) as error:
                 classified = _classify_aws_error(error)
                 chunk_values: dict[str, SecretValue] = {}
-                chunk_failures = {
-                    secret_id: classified for secret_id in chunk
-                }
+                chunk_failures = {secret_id: classified for secret_id in chunk}
             else:
                 chunk_values, chunk_failures = _parse_batch_response(response, chunk)
 
@@ -138,16 +170,21 @@ class AWSSecretsManager:
         }
 
     def _get_client(self) -> SecretsManagerClient:
+        _silence_sdk_logs()
         if self._client is not None:
             return self._client
         try:
-            return boto3.client("secretsmanager")
+            return boto3.client(
+                "secretsmanager",
+                config=DEFAULT_AWS_CLIENT_CONFIG,
+            )
         except BotoCoreError as error:
             raise _classify_aws_error(error) from None
 
     def _retrieve_secret(
         self, client: SecretsManagerClient, secret_id: str
     ) -> SecretValue:
+        _silence_sdk_logs()
         _log_debug("get_secret_value", "attempt", 1)
         try:
             response = client.get_secret_value(SecretId=secret_id)
@@ -172,9 +209,17 @@ def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
 def _parse_secret_value(response: Mapping[str, Any]) -> SecretValue:
     secret_string = response.get("SecretString")
     if not isinstance(secret_string, str):
-        raise SecretRequestError(
-            "AWS Secrets Manager response did not contain a SecretString payload"
-        )
+        # boto3 already base64-decodes SecretBinary. BHE's secret writer uses
+        # this representation for JSON documents.
+        secret_binary = response.get("SecretBinary")
+        if not isinstance(secret_binary, bytes):
+            raise SecretRequestError(
+                "AWS Secrets Manager response omitted a text payload"
+            )
+        try:
+            secret_string = secret_binary.decode("utf-8")
+        except UnicodeDecodeError:
+            raise SecretRequestError("AWS secret payload is not UTF-8 text") from None
 
     if secret_string.lstrip().startswith("{"):
         try:
@@ -271,7 +316,11 @@ def _log_debug(
     }
     if batch_number is not None:
         extra["batch_number"] = batch_number
-    message = "Secret retrieval attempt" if outcome == "attempt" else "Secret retrieval result"
+    message = (
+        "Secret retrieval attempt"
+        if outcome == "attempt"
+        else "Secret retrieval result"
+    )
     logger.debug(message, extra=extra)
 
 
