@@ -18,6 +18,7 @@ from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound import BloodHound, BloodHoundHTTPError
 from openhound.core.clients.models.jobs import (
     ArtifactUploadSession,
+    CollectorJob,
     CollectorJobsAvailable,
     JobsAvailable,
     JobsCurrent,
@@ -41,7 +42,7 @@ class ManagedJobOutcome(str, Enum):
     FAILED = "failed"
 
 
-MANAGED_JOB_END_MAX_RETRIES = 3
+MANAGED_JOB_END_MAX_ATTEMPTS = 4
 MANAGED_JOB_END_RETRY_DELAY_SECONDS = 2
 MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_JOB_END_READ_TIMEOUT_SECONDS = 120
@@ -52,8 +53,21 @@ SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS = 10
 SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS = 120
 MANAGED_COLLECTOR_JOB_AVAILABLE_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_COLLECTOR_JOB_AVAILABLE_READ_TIMEOUT_SECONDS = 20
+MANAGED_JOB_CLAIM_MAX_ATTEMPTS = 4
+MANAGED_JOB_CLAIM_RETRY_DELAY_SECONDS = 2
+MANAGED_JOB_CLAIM_CONNECT_TIMEOUT_SECONDS = 10
+MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS = 20
 
 T = TypeVar("T")
+
+
+def _safe_managed_request_error(error: Exception) -> Exception:
+    """Preserve actionable status/type without exposing provider response content."""
+    if isinstance(error, BloodHoundHTTPError):
+        return BloodHoundHTTPError("Managed collector request failed", error.code)
+    if isinstance(error, requests.RequestException):
+        return type(error)("Managed collector request failed")
+    return RuntimeError("Managed collector request failed")
 
 
 class BloodHoundEnterprise(BloodHound):
@@ -136,13 +150,63 @@ class BloodHoundEnterprise(BloodHound):
                     MANAGED_COLLECTOR_JOB_AVAILABLE_READ_TIMEOUT_SECONDS,
                 ),
             )
-        except (BloodHoundHTTPError, requests.RequestException):
-            logger.exception(
+        except (BloodHoundHTTPError, requests.RequestException) as error:
+            logger.error(
                 "Managed collector job queue request failed.",
                 extra={"endpoint": path, "job_key": job_key},
             )
-            raise
-        return CollectorJobsAvailable.model_validate(response.json())
+            raise _safe_managed_request_error(error) from None
+        try:
+            return CollectorJobsAvailable.model_validate(response.json())
+        except (ValueError, TypeError, KeyError):
+            raise RuntimeError("Invalid managed collector queue response") from None
+
+    def claim_managed_job(self, job_id: str) -> CollectorJob:
+        """Claim job from BHE's managed collector job queue.
+
+        This is used only by managed OpenHound deployments and is not
+        part of the standard open-source/self-hosted collector workflow.
+        """
+        path = f"/api/v2/collector-job-queue/{job_id}/claim"
+        for attempt in range(1, MANAGED_JOB_CLAIM_MAX_ATTEMPTS + 1):
+            context = {
+                "endpoint": path,
+                "job_id": job_id,
+                "attempt": attempt,
+                "max_attempts": MANAGED_JOB_CLAIM_MAX_ATTEMPTS,
+            }
+            logger.debug("Sending managed collector claim request.", extra=context)
+            try:
+                response = self.request(
+                    method="POST",
+                    path=path,
+                    timeout=(
+                        MANAGED_JOB_CLAIM_CONNECT_TIMEOUT_SECONDS,
+                        MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS,
+                    ),
+                )
+            except Exception as error:  # noqa: BLE001 - redact provider errors
+                retryable = self._is_transient_request_error(
+                    error, (requests.ConnectionError, requests.Timeout)
+                )
+                logger.debug(
+                    "Managed collector claim request failed.",
+                    extra={
+                        **context,
+                        "retryable": retryable,
+                        "status_code": getattr(error, "code", None),
+                    },
+                )
+                if not retryable or attempt == MANAGED_JOB_CLAIM_MAX_ATTEMPTS:
+                    raise _safe_managed_request_error(error) from None
+                time.sleep(MANAGED_JOB_CLAIM_RETRY_DELAY_SECONDS)
+                continue
+            try:
+                return CollectorJob.model_validate(response.json()["data"]["job"])
+            except (ValueError, TypeError, KeyError):
+                raise RuntimeError("Invalid managed collector claim response") from None
+
+        raise AssertionError("Managed collector claim retry loop exited unexpectedly.")
 
     def start_job(self, job_id: int) -> JobStart:
         path = "/api/v2/jobs/start"
@@ -172,20 +236,18 @@ class BloodHoundEnterprise(BloodHound):
         if metadata is not None:
             payload["metadata"] = metadata
         body = json.dumps(payload).encode()
-        max_attempts = MANAGED_JOB_END_MAX_RETRIES + 1
-
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, MANAGED_JOB_END_MAX_ATTEMPTS + 1):
             log_context = {
                 "job_id": job_id,
                 "outcome": outcome.value,
                 "attempt": attempt,
-                "max_attempts": max_attempts,
+                "max_attempts": MANAGED_JOB_END_MAX_ATTEMPTS,
             }
             logger.info(
                 "Attempting to end managed collector job %s (%s/%s).",
                 job_id,
                 attempt,
-                max_attempts,
+                MANAGED_JOB_END_MAX_ATTEMPTS,
                 extra=log_context,
             )
             logger.debug(
@@ -208,7 +270,13 @@ class BloodHoundEnterprise(BloodHound):
                         MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
                     ),
                 )
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - redact provider errors
+                if isinstance(error, BloodHoundHTTPError) and error.code == 404:
+                    logger.info(
+                        "Managed collector job is no longer actionable; discarding local state.",
+                        extra=log_context,
+                    )
+                    return
                 retryable = self._is_transient_request_error(
                     error,
                     (requests.ConnectionError, requests.Timeout),
@@ -220,12 +288,15 @@ class BloodHoundEnterprise(BloodHound):
                 )
                 logger.debug(
                     "Managed collector job end request failed.",
-                    extra={**log_context, "retryable": retryable},
-                    exc_info=True,
+                    extra={
+                        **log_context,
+                        "retryable": retryable,
+                        "status_code": getattr(error, "code", None),
+                    },
                 )
 
-                if not retryable or attempt == max_attempts:
-                    raise
+                if not retryable or attempt == MANAGED_JOB_END_MAX_ATTEMPTS:
+                    raise _safe_managed_request_error(error) from None
 
                 logger.debug(
                     "Retrying managed collector job end request in %s seconds.",

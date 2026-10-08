@@ -2,18 +2,66 @@ import json
 import logging
 from pathlib import Path
 
+import dlt
 import pytest
 
 from openhound.core.logging import (
     CustomLogger,
+    LogMode,
     OpenHoundJSONFormatter,
     OpenHoundTextFormatter,
     RotatingFileHandler,
-    logger_override,
 )
 
 
-def test_root_handler_setup():
+@pytest.fixture
+def configured_logger(tmp_path, monkeypatch):
+    """Set up real root/DLT loggers without retaining process-wide changes."""
+    original_get = dlt.config.get
+
+    def get(field, expected_type):
+        if field.startswith("runtime."):
+            return {
+                "runtime.log_path": str(tmp_path),
+                "runtime.log_format": "JSON",
+            }.get(field)
+        return original_get(field, expected_type)
+
+    monkeypatch.setattr(dlt.config, "get", get)
+    monkeypatch.setattr(
+        CustomLogger, "runtime_mode", property(lambda self: LogMode.SERVICE)
+    )
+    custom_logger = CustomLogger("openhound.log", base_path=str(tmp_path))
+    original = [
+        (logger, logger.handlers[:], logger.level, logger.propagate)
+        for logger in (custom_logger.root_logger, custom_logger.dlt_logger)
+    ]
+    try:
+        custom_logger.setup()
+        yield custom_logger
+    finally:
+        for logger, handlers, level, propagate in original:
+            logger.handlers[:] = handlers
+            logger.setLevel(level)
+            logger.propagate = propagate
+        for handler in custom_logger._file_handlers.values():
+            handler.close()
+
+
+@pytest.fixture
+def no_log_format_override(monkeypatch):
+    """Remove the resolved override, including values from local TOML files."""
+    original_get = dlt.config.get
+
+    def get(field, expected_type):
+        if field == "runtime.log_format":
+            return None
+        return original_get(field, expected_type)
+
+    monkeypatch.setattr(dlt.config, "get", get)
+
+
+def test_root_handler_setup(configured_logger):
     """Test that the root logger has a handler configured and that it is a RotatingFileHandler"""
     root_logger = logging.getLogger()
     assert len(root_logger.handlers) > 0, (
@@ -29,7 +77,7 @@ def test_root_handler_setup():
     )
 
 
-def test_dlt_handler_setup():
+def test_dlt_handler_setup(configured_logger):
     """Test that the default DLT handler is overwritten by our RotatingFileHandler"""
     dlt_logger = logging.getLogger("dlt")
     assert len(dlt_logger.handlers) > 0, (
@@ -48,9 +96,9 @@ def test_dlt_handler_setup():
     )
 
 
-def test_dlt_extension_handlers():
+def test_dlt_extension_handlers(configured_logger):
     """Test that the DLT handler is correctly set up for an extension and that the destination filename has changed"""
-    logger_override.set_handler("test_extension")
+    configured_logger.set_handler("test_extension")
     dlt_logger = logging.getLogger("dlt")
     assert len(dlt_logger.handlers) > 0, (
         "The DLT logger should have handlers configured after setting an extension handler"
@@ -68,13 +116,9 @@ def test_dlt_extension_handlers():
     )
 
 
-def test_log_routing_content(tmp_path, caplog, monkeypatch):
+def test_log_routing_content(configured_logger, tmp_path, caplog):
     """Test that logs are correctly routed and that the files are created for the expected paths"""
-    # Pin JSON (dlt's only crash-safe override value) so the JSON-parsing assertions are self-contained.
-    monkeypatch.setenv("RUNTIME__LOG_FORMAT", "JSON")
-    logger_override.base_path = tmp_path
-    logger_override.setup()
-    logger_override.set_handler("test_extension")
+    configured_logger.set_handler("test_extension")
 
     root_logger = logging.getLogger()
     dlt_logger = logging.getLogger("dlt")
@@ -126,10 +170,11 @@ def test_file_formatter_selection():
     )
 
 
-def test_managed_mode_writes_structured_file_logs(tmp_path, monkeypatch):
+def test_managed_mode_writes_structured_file_logs(
+    tmp_path, monkeypatch, no_log_format_override
+):
     """Managed mode should default rotating file logs to newline-delimited JSON."""
     monkeypatch.setenv("OPENHOUND__MANAGED", "true")
-    monkeypatch.delenv("RUNTIME__LOG_FORMAT", raising=False)
     monkeypatch.setenv("RUNTIME__LOG_PATH", str(tmp_path))
     custom_logger = CustomLogger("managed.log", base_path=str(tmp_path))
     # Keep this setup isolated from the process-wide loggers used by other tests.
@@ -184,10 +229,11 @@ def test_explicit_log_format_overrides_managed_default(tmp_path, monkeypatch):
         custom_logger.dlt_logger.handlers.clear()
 
 
-def test_mode_change_refreshes_cached_file_handler(tmp_path, monkeypatch):
+def test_mode_change_refreshes_cached_file_handler(
+    tmp_path, monkeypatch, no_log_format_override
+):
     """Re-running setup should apply a changed mode to an existing log file."""
     monkeypatch.setenv("RUNTIME__LOG_PATH", str(tmp_path))
-    monkeypatch.delenv("RUNTIME__LOG_FORMAT", raising=False)
     custom_logger = CustomLogger("mode-change.log", base_path=str(tmp_path))
     custom_logger.root_logger = logging.getLogger("mode-change-test")
     custom_logger.dlt_logger = logging.getLogger("mode-change-test-dlt")
@@ -278,51 +324,33 @@ def test_get_file_handler_caches_handler_per_path(tmp_path):
             handler.close()
 
 
-def test_root_and_dlt_loggers_share_single_file_handler(tmp_path, monkeypatch):
+def test_root_and_dlt_loggers_share_single_file_handler(configured_logger):
     """The root and dlt loggers writing to openhound.log must share one handler
     instance so the file is only opened once, which is required for rotation on
     Windows where an open handle blocks renaming the file."""
-    # A sibling module may set RUNTIME__LOG_PATH on import; keep our explicit base_path.
-    monkeypatch.delenv("RUNTIME__LOG_PATH", raising=False)
-    custom_logger = CustomLogger("openhound.log", base_path=str(tmp_path))
+    root_file_handlers = [
+        handler
+        for handler in configured_logger.root_logger.handlers
+        if isinstance(handler, RotatingFileHandler)
+    ]
+    dlt_file_handlers = [
+        handler
+        for handler in configured_logger.dlt_logger.handlers
+        if isinstance(handler, RotatingFileHandler)
+    ]
 
-    try:
-        custom_logger.setup()
-
-        root_logger = logging.getLogger()
-        dlt_logger = logging.getLogger("dlt")
-
-        root_file_handlers = [
-            handler
-            for handler in root_logger.handlers
-            if isinstance(handler, RotatingFileHandler)
-        ]
-        dlt_file_handlers = [
-            handler
-            for handler in dlt_logger.handlers
-            if isinstance(handler, RotatingFileHandler)
-        ]
-
-        assert len(root_file_handlers) == 1, (
-            "The root logger should have exactly one rotating file handler"
-        )
-        assert len(dlt_file_handlers) == 1, (
-            "The dlt logger should have exactly one rotating file handler"
-        )
-        assert root_file_handlers[0] is dlt_file_handlers[0], (
-            "Root and dlt loggers must share the same handler instance for openhound.log"
-        )
-        assert root_file_handlers[0].baseFilename.endswith("openhound.log"), (
-            "The shared handler should write to 'openhound.log'"
-        )
-    finally:
-        for handler in custom_logger._file_handlers.values():
-            handler.close()
-        # Undo the monkeypatched env before restoring global state so setup()
-        # runs against the real environment, not the modified one.
-        monkeypatch.undo()
-        # Restore the shared global logging state for subsequent tests.
-        logger_override.setup()
+    assert len(root_file_handlers) == 1, (
+        "The root logger should have exactly one rotating file handler"
+    )
+    assert len(dlt_file_handlers) == 1, (
+        "The dlt logger should have exactly one rotating file handler"
+    )
+    assert root_file_handlers[0] is dlt_file_handlers[0], (
+        "Root and dlt loggers must share the same handler instance for openhound.log"
+    )
+    assert root_file_handlers[0].baseFilename.endswith("openhound.log"), (
+        "The shared handler should write to 'openhound.log'"
+    )
 
 
 def test_build_file_handler_applies_rotation_settings(tmp_path):
