@@ -6,6 +6,7 @@ import logging
 import traceback
 from concurrent.futures import Future
 from concurrent.futures.process import BrokenProcessPool
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -68,6 +69,9 @@ def mock_bloodhound_api():
     app.state.collector_job_end_statuses = []
     app.state.collector_job_claim_requests = []
     app.state.collector_job_claim_statuses = []
+    app.state.collector_job_stateful_claims = False
+    app.state.collector_job_active_id = None
+    app.state.collector_job_lost_claim_responses = 0
     app.state.collector_job_claim_response = load_json(
         "collector_jobs_available_with_job.json"
     )["data"]["jobs"][0]
@@ -111,6 +115,18 @@ def mock_bloodhound_api():
         app.state.collector_job_queue_requests.append(dict(request.query_params))
         if app.state.collector_job_queue_error_status is not None:
             return Response(status_code=app.state.collector_job_queue_error_status)
+        if app.state.collector_job_stateful_claims:
+            jobs = [
+                job
+                for job in app.state.collector_job_queue_response["data"]["jobs"]
+                if job["id"] != app.state.collector_job_active_id
+            ]
+            return {
+                "count": len(jobs),
+                "skip": 0,
+                "limit": 1,
+                "data": {"jobs": jobs[:1]},
+            }
         return app.state.collector_job_queue_response
 
     @app.post("/api/v2/jobs/start")
@@ -129,6 +145,14 @@ def mock_bloodhound_api():
             status = app.state.collector_job_claim_statuses.pop(0)
             if status != 200:
                 return Response("raw-provider-secret", status_code=status)
+        if app.state.collector_job_stateful_claims:
+            if app.state.collector_job_active_id not in (None, job_id):
+                return Response("raw-provider-secret", status_code=409)
+            app.state.collector_job_active_id = job_id
+            if app.state.collector_job_lost_claim_responses:
+                app.state.collector_job_lost_claim_responses -= 1
+                # BHE has committed the assignment, but its response is lost.
+                raise requests.Timeout("raw-provider-secret")
         return {"data": {"job": app.state.collector_job_claim_response}}
 
     @app.post("/api/v2/jobs/end")
@@ -1331,10 +1355,14 @@ def managed_service(mock_service, mock_bloodhound_api):
     state.collector_job_queue_response["data"]["jobs"][0][
         "secret_key_id"
     ] = "stale-reference"
+    claimed_at = datetime.now(UTC)
     state.collector_job_claim_response.update(
         secret_key_id="private-secret-reference",
         status="claimed",
         params={"claimed_parameter": True},
+        claimed_by="33333333-3333-3333-3333-333333333333",
+        claimed_at=claimed_at.isoformat(),
+        claim_expires_at=(claimed_at + timedelta(minutes=15)).isoformat(),
     )
     mock_service.managed = True
     mock_service.handoffs = []
@@ -1895,3 +1923,179 @@ def test_managed_scheduler_logs_failure_once_and_retries_reporting_next_poll(
     )
     assert "raw-provider-secret" not in caplog.text
     assert all("raw-provider-secret" not in repr(r.__dict__) for r in caplog.records)
+
+
+@pytest.fixture
+def stateful_managed_service(managed_service, mock_bloodhound_api):
+    state = mock_bloodhound_api.app.state
+    state.collector_job_stateful_claims = True
+    job_a = state.collector_job_queue_response["data"]["jobs"][0]
+    job_b = {**job_a, "id": "22222222-2222-2222-2222-222222222222"}
+    state.collector_job_queue_response["data"]["jobs"].append(job_b)
+    state.collector_job_lost_claim_responses = (
+        bloodhound_enterprise.MANAGED_JOB_CLAIM_MAX_ATTEMPTS
+    )
+    return managed_service
+
+
+@pytest.mark.parametrize("lease_expired", [False, True])
+def test_committed_claim_with_lost_responses_is_reconciled_before_discovery(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch, caplog, lease_expired
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    job_id = state.collector_job_claim_response["id"]
+    delays = []
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", delays.append)
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(ManagedJobProcessingError):
+        service._poll()
+
+    assert state.collector_job_active_id == job_id
+    assert service._pending_managed_claim == job_id
+    assert service.secret_requests == service.handoffs == []
+    assert state.collector_job_end_requests == []
+    assert delays == [bloodhound_enterprise.MANAGED_JOB_CLAIM_RETRY_DELAY_SECONDS] * 3
+
+    # A fresh discovery would offer B, which this client cannot claim while
+    # holding A. Recovery must use A's retained ID instead of this result.
+    available = mock_bloodhound_api.get("/api/v2/collector-job-queue/available").json()
+    assert [job["id"] for job in available["data"]["jobs"]] == [
+        "22222222-2222-2222-2222-222222222222"
+    ]
+    discovery_count = len(state.collector_job_queue_requests)
+    if lease_expired:
+        state.collector_job_claim_response["claim_expires_at"] = (
+            datetime.now(UTC) - timedelta(seconds=1)
+        ).isoformat()
+        with caplog.at_level(logging.DEBUG), pytest.raises(ManagedJobProcessingError):
+            service._poll()
+        assert service._pending_managed_claim == job_id
+        assert service.secret_requests == service.handoffs == []
+    else:
+        with caplog.at_level(logging.DEBUG):
+            service._poll()
+        assert service._pending_managed_claim is None
+        assert service.secret_requests == ["private-secret-reference"]
+        assert len(service.handoffs) == 1
+        assert str(service.handoffs[0].job.id) == job_id
+        assert service.handoffs[0].job.params == {"claimed_parameter": True}
+
+    assert len(state.collector_job_queue_requests) == discovery_count
+    assert state.collector_job_claim_requests == [{"job_id": job_id, "body": b""}] * 5
+    assert state.collector_job_end_requests == []
+    assert state.job_started is False
+    assert "raw-provider-secret" not in caplog.text
+    assert all("raw-provider-secret" not in repr(r.__dict__) for r in caplog.records)
+
+
+@pytest.mark.parametrize("status", [404, 409])
+def test_definitive_claim_rejection_clears_pending_id_without_credentials_or_end(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch, status
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    monkeypatch.setattr(bloodhound_enterprise.time, "sleep", lambda seconds: None)
+    with pytest.raises(ManagedJobProcessingError):
+        service._poll()
+
+    state.collector_job_claim_statuses = [status]
+    if status == 404:
+        with pytest.raises(ManagedJobProcessingError):
+            service._poll()
+    else:
+        service._poll()
+
+    assert service._pending_managed_claim is None
+    assert service.secret_requests == service.handoffs == []
+    assert state.collector_job_end_requests == []
+    assert len(state.collector_job_queue_requests) == 1
+
+    # Once BHE confirms A is no longer claimable, the next poll can discover B.
+    job_b = state.collector_job_queue_response["data"]["jobs"][1]
+    state.collector_job_queue_response["data"]["jobs"] = [job_b]
+    state.collector_job_claim_response["id"] = job_b["id"]
+    state.collector_job_active_id = None
+    service._poll()
+    assert len(state.collector_job_queue_requests) == 2
+    assert str(service.handoffs[0].job.id) == job_b["id"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("id", "22222222-2222-2222-2222-222222222222"),
+        ("job_key", "other-collector"),
+        ("status", "running"),
+        ("claimed_by", None),
+        ("claimed_at", None),
+        ("claim_expires_at", None),
+        ("claim_expires_at", "2020-01-01T00:00:00Z"),
+        ("claim_expires_at", "2099-01-01T00:00:00"),
+    ],
+)
+def test_unusable_claim_response_blocks_credentials_and_retains_id(
+    managed_service, mock_bloodhound_api, field, value, caplog
+):
+    state = mock_bloodhound_api.app.state
+    job_id = state.collector_job_claim_response["id"]
+    state.collector_job_claim_response[field] = value
+    with caplog.at_level(logging.DEBUG), pytest.raises(ManagedJobProcessingError):
+        managed_service._poll()
+
+    assert managed_service._pending_managed_claim == job_id
+    assert managed_service.secret_requests == managed_service.handoffs == []
+    assert state.collector_job_end_requests == []
+    assert "Managed claim response does not confirm a usable claim." in caplog.text
+    assert "Credential validation failed" not in caplog.text
+    assert all(
+        "private-secret-reference" not in repr(r.__dict__) for r in caplog.records
+    )
+
+
+def test_lease_expiring_during_secret_retrieval_blocks_handoff(
+    managed_service, mock_bloodhound_api, monkeypatch
+):
+    state = mock_bloodhound_api.app.state
+    expires_at = datetime.fromisoformat(
+        state.collector_job_claim_response["claim_expires_at"]
+    )
+    clock = iter([expires_at - timedelta(seconds=1), expires_at + timedelta(seconds=1)])
+    monkeypatch.setattr(
+        scheduler_service, "datetime", SimpleNamespace(now=lambda timezone: next(clock))
+    )
+    with pytest.raises(ManagedJobProcessingError):
+        managed_service._poll()
+
+    assert (
+        managed_service._pending_managed_claim
+        == state.collector_job_claim_response["id"]
+    )
+    assert managed_service.secret_requests == ["private-secret-reference"]
+    assert managed_service.handoffs == []
+    assert state.collector_job_end_requests == []
+
+
+def test_malformed_committed_claim_response_keeps_id_until_reconciled(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch, caplog
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    job_id = state.collector_job_claim_response["id"]
+    state.collector_job_lost_claim_responses = 0
+    state.collector_job_claim_response["id"] = "raw-provider-secret"
+    with caplog.at_level(logging.DEBUG), pytest.raises(ManagedJobProcessingError):
+        service._poll()
+
+    assert state.collector_job_active_id == job_id
+    assert service._pending_managed_claim == job_id
+    assert service.secret_requests == service.handoffs == []
+    assert state.collector_job_end_requests == []
+    assert "raw-provider-secret" not in caplog.text
+
+    state.collector_job_claim_response["id"] = job_id
+    service._poll()
+    assert service._pending_managed_claim is None
+    assert len(state.collector_job_queue_requests) == 1
+    assert len(service.handoffs) == 1
+    assert str(service.handoffs[0].job.id) == job_id

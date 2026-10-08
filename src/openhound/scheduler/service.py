@@ -6,6 +6,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -165,24 +166,26 @@ class Service:
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
-        self.collector_name = collector_name
-        self.managed = is_managed() if managed is None else managed
-        self.secrets_manager = secrets_manager or AWSSecretsManager()
-        # The runner synchronously owns managed start, collection, lease renewal,
-        # ingest, and completion before the scheduler picks up another job.
-        self.managed_job_runner = managed_job_runner
-        self._pending_managed_failure: str | None = None
         self.client = BloodHoundEnterprise(
             bhe_uri=bhe_uri,
             token_key=token_key,
             token_id=token_id,
             credential_refresh=credential_refresh,
         )
-        # Interval how often to check for a job
+
+        # Shared scheduler settings
+        self.collector_name = collector_name
         self.interval = interval
         self.log_base_path = (
             log_base_path or openhound_logging.logger_override.base_path
         )
+
+        # Managed collection settings and recovery state
+        self.managed = is_managed() if managed is None else managed
+        self.secrets_manager = secrets_manager or AWSSecretsManager()
+        self.managed_job_runner = managed_job_runner
+        self._pending_managed_claim: str | None = None
+        self._pending_managed_failure: str | None = None
 
         # Stores the ID of currently running BHE job
         self.job_running: int | None = None
@@ -281,34 +284,61 @@ class Service:
             raise CredentialValidationError("Credential validation failed") from None
         raise CredentialValidationError("Credential validation failed")
 
-    def claim_and_validate_managed_job(
-        self, available_job: CollectorJob
-    ) -> PreparedManagedJob | None:
+    def _validate_managed_claim(self, job: CollectorJob, job_id: str) -> None:
+        """Check the job identity and lease confirmed by BHE's claim response."""
+
+        # The authenticated claim endpoint confirms the holder. Reclaiming does
+        # not renew the lease, so an old response is not enough to permit work.
+        lease_expires_at = job.claim_expires_at
+        if (
+            str(job.id) != job_id
+            or job.job_key != self.collector_name
+            or job.status != "claimed"
+            or job.claimed_by is None
+            or job.claimed_at is None
+            or lease_expires_at is None
+            or lease_expires_at.utcoffset() is None
+            or lease_expires_at <= datetime.now(UTC)
+        ):
+            logger.error(
+                "Managed claim response does not confirm a usable claim.",
+                extra={"job_id": job_id},
+            )
+            raise ManagedJobProcessingError("Managed claim could not be reconciled")
+
+    def _claim_and_validate_managed_job(self, job_id: str) -> PreparedManagedJob | None:
         """Claim a managed job and validate its credentials."""
-        if not self.managed:
-            raise RuntimeError("Managed job preparation requires managed mode")
-        if self._pending_managed_failure is not None:
-            raise RuntimeError("Managed credential failure reporting is unresolved")
+        # A timeout can happen after BHE commits the claim. Keep the ID until we
+        # reconcile it; discovery no longer lists jobs held by this collector.
+        self._pending_managed_claim = job_id
         try:
-            job = self.client.claim_managed_job(str(available_job.id))
+            job = self.client.claim_managed_job(job_id)
         except BloodHoundHTTPError as error:
+            if error.code in (404, 409):
+                # An existing claimed job held by this client would return 200.
+                self._pending_managed_claim = None
             if error.code == 409:
                 logger.debug(
                     "Managed collector claim conflict.",
-                    extra={"job_id": str(available_job.id)},
+                    extra={"job_id": job_id},
                 )
                 return None
             raise
 
-        context = {"job_id": str(job.id)}
+        self._validate_managed_claim(job, job_id)
+        context = {"job_id": job_id}
         logger.info("Job successfully picked up", extra=context)
         try:
             credentials = self._load_managed_credentials(job)
         except CredentialValidationError:
             logger.error("Credential validation failed", extra=context)
+            self._pending_managed_claim = None
             self._report_managed_credential_failure(str(job.id))
             return None
 
+        # Secret retrieval may have consumed the remaining lease time.
+        self._validate_managed_claim(job, job_id)
+        self._pending_managed_claim = None
         logger.info("Credential retrieval valid", extra=context)
         return PreparedManagedJob(job=job, credentials=credentials)
 
@@ -325,10 +355,13 @@ class Service:
             if self._pending_managed_failure is not None:
                 self._report_managed_credential_failure(self._pending_managed_failure)
                 return
-            available_job = self.check_managed_collector_jobs()
-            if available_job is None:
-                return
-            prepared = self.claim_and_validate_managed_job(available_job)
+            job_id = self._pending_managed_claim
+            if job_id is None:
+                available_job = self.check_managed_collector_jobs()
+                if available_job is None:
+                    return
+                job_id = str(available_job.id)
+            prepared = self._claim_and_validate_managed_job(job_id)
             if prepared is not None:
                 runner(prepared)
         except Exception:  # noqa: BLE001 - redact managed runtime errors
