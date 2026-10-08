@@ -1,16 +1,26 @@
 import logging
+import math
 import signal
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import openhound
 import openhound.core.logging as openhound_logging
+from openhound.config import is_managed
+from openhound.core.clients.aws_secrets_manager import AWSSecretsManager
 from openhound.core.clients.bhe_credentials import BHECredentials
-from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
+from openhound.core.clients.bloodhound import BloodHoundHTTPError
+from openhound.core.clients.bloodhound_enterprise import (
+    BloodHoundEnterprise,
+    JobStatus,
+    ManagedJobOutcome,
+)
 from openhound.core.clients.models.jobs import (
     CollectorJob,
     Job,
@@ -30,7 +40,48 @@ POLL_INTERVAL = 30  # seconds; fixed poll/check-in cadence, must remain below BH
 class ExtensionNotFoundError(Exception):
     """Raised when the configured collector extension cannot be found."""
 
-    pass
+
+class ManagedRuntimeUnavailableError(RuntimeError):
+    """Managed scheduling requires a configured collection runtime."""
+
+
+class CredentialValidationError(ValueError):
+    """A managed job's required credential document could not be loaded."""
+
+
+class ManagedJobProcessingError(RuntimeError):
+    """A sanitized managed polling failure that can be retried next poll."""
+
+
+@dataclass(frozen=True)
+class PreparedManagedJob:
+    """Validated job and credentials for the managed collection runtime.
+
+    Keep credentials in memory; never serialize or log them.
+    """
+
+    job: CollectorJob = field(repr=False)
+    credentials: dict[str, Any] = field(repr=False)
+
+
+def _usable_credential_value(value: Any) -> bool:
+    """Validate generic JSON values without inventing a collector field schema."""
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return bool(value) and all(
+            isinstance(key, str)
+            and bool(key.strip())
+            and _usable_credential_value(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return bool(value) and all(_usable_credential_value(item) for item in value)
+    if isinstance(value, (bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return False
 
 
 @dataclass
@@ -58,7 +109,9 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
-        if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
+        if (
+            collector.name == collector_name
+        ):  # pyright: ignore[reportAttributeAccessIssue]
             log_fields = {
                 "collector_extension": collector.name,
                 "collector_extension_version": (
@@ -106,21 +159,33 @@ class Service:
         log_base_path: Path | None = None,
         interval: int = POLL_INTERVAL,
         credential_refresh: Callable[[], BHECredentials] | None = None,
+        *,
+        managed: bool | None = None,
+        secrets_manager: AWSSecretsManager | None = None,
+        managed_job_runner: Callable[[PreparedManagedJob], None] | None = None,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
-        self.collector_name = collector_name
         self.client = BloodHoundEnterprise(
             bhe_uri=bhe_uri,
             token_key=token_key,
             token_id=token_id,
             credential_refresh=credential_refresh,
         )
-        # Interval how often to check for a job
+
+        # Shared scheduler settings
+        self.collector_name = collector_name
         self.interval = interval
         self.log_base_path = (
             log_base_path or openhound_logging.logger_override.base_path
         )
+
+        # Managed collection settings and recovery state
+        self.managed = is_managed() if managed is None else managed
+        self.secrets_manager = secrets_manager or AWSSecretsManager()
+        self.managed_job_runner = managed_job_runner
+        self._pending_managed_claim: str | None = None
+        self._pending_managed_failure: str | None = None
 
         # Stores the ID of currently running BHE job
         self.job_running: int | None = None
@@ -182,12 +247,127 @@ class Service:
         """Return the first available job from the managed collector queue."""
         logger.info("Checking for new managed collector jobs in BloodHound Enterprise.")
         available_jobs = self.client.available_collector_jobs(self.collector_name)
-        if available_jobs.data.jobs:
-            logger.info(
-                "New managed queue job available: %s", available_jobs.data.jobs[0].id
-            )
-            return available_jobs.data.jobs[0]
+        for job in available_jobs.data.jobs:
+            if job.job_key == self.collector_name:
+                return job
         return None
+
+    def _report_managed_credential_failure(self, job_id: str) -> None:
+        # Retain the unresolved ID if reporting exhausts its retries. On the next
+        # poll retry end, rather than claiming or retrieving another job.
+        self._pending_managed_failure = job_id
+        self.client.end_managed_job(
+            job_id,
+            ManagedJobOutcome.FAILED,
+            failure_message="Credential validation failed",
+        )
+        self._pending_managed_failure = None
+
+    def _load_managed_credentials(self, job: CollectorJob) -> dict[str, Any]:
+        """Retrieve and validate credentials, exposing only a safe failure message."""
+        if job.secret_key_id is None or not job.secret_key_id.strip():
+            raise CredentialValidationError("Credential validation failed")
+
+        logger.debug(
+            "Retrieving managed collector credentials.",
+            extra={
+                "job_id": str(job.id),
+                "provider": "aws.secretsmanager",
+                "secret_count": 1,
+            },
+        )
+        try:
+            credentials = self.secrets_manager.get_secret(job.secret_key_id)
+            if isinstance(credentials, dict) and _usable_credential_value(credentials):
+                return credentials
+        except Exception:  # noqa: BLE001 - redact secret reader and validation errors
+            raise CredentialValidationError("Credential validation failed") from None
+        raise CredentialValidationError("Credential validation failed")
+
+    def _validate_managed_claim(self, job: CollectorJob, job_id: str) -> None:
+        """Check the job identity and lease confirmed by BHE's claim response."""
+
+        # The authenticated claim endpoint confirms the holder. Reclaiming does
+        # not renew the lease, so an old response is not enough to permit work.
+        lease_expires_at = job.claim_expires_at
+        if (
+            str(job.id) != job_id
+            or job.job_key != self.collector_name
+            or job.status != "claimed"
+            or job.claimed_by is None
+            or job.claimed_at is None
+            or lease_expires_at is None
+            or lease_expires_at.utcoffset() is None
+            or lease_expires_at <= datetime.now(UTC)
+        ):
+            logger.error(
+                "Managed claim response does not confirm a usable claim.",
+                extra={"job_id": job_id},
+            )
+            raise ManagedJobProcessingError("Managed claim could not be reconciled")
+
+    def _claim_and_validate_managed_job(self, job_id: str) -> PreparedManagedJob | None:
+        """Claim a managed job and validate its credentials."""
+        # A timeout can happen after BHE commits the claim. Keep the ID until we
+        # reconcile it; discovery no longer lists jobs held by this collector.
+        self._pending_managed_claim = job_id
+        try:
+            job = self.client.claim_managed_job(job_id)
+        except BloodHoundHTTPError as error:
+            if error.code in (404, 409):
+                # An existing claimed job held by this client would return 200.
+                self._pending_managed_claim = None
+            if error.code == 409:
+                logger.debug(
+                    "Managed collector claim conflict.",
+                    extra={"job_id": job_id},
+                )
+                return None
+            raise
+
+        self._validate_managed_claim(job, job_id)
+        context = {"job_id": job_id}
+        logger.info("Job successfully picked up", extra=context)
+        try:
+            credentials = self._load_managed_credentials(job)
+        except CredentialValidationError:
+            logger.error("Credential validation failed", extra=context)
+            self._pending_managed_claim = None
+            self._report_managed_credential_failure(str(job.id))
+            return None
+
+        # Secret retrieval may have consumed the remaining lease time.
+        self._validate_managed_claim(job, job_id)
+        self._pending_managed_claim = None
+        logger.info("Credential retrieval valid", extra=context)
+        return PreparedManagedJob(job=job, credentials=credentials)
+
+    def _require_managed_runtime(self) -> Callable[[PreparedManagedJob], None]:
+        if self.managed_job_runner is None:
+            raise ManagedRuntimeUnavailableError(
+                "Managed collection runtime is required for managed scheduling"
+            )
+        return self.managed_job_runner
+
+    def _poll_managed_jobs(self) -> None:
+        runner = self._require_managed_runtime()
+        try:
+            if self._pending_managed_failure is not None:
+                self._report_managed_credential_failure(self._pending_managed_failure)
+                return
+            job_id = self._pending_managed_claim
+            if job_id is None:
+                available_job = self.check_managed_collector_jobs()
+                if available_job is None:
+                    return
+                job_id = str(available_job.id)
+            prepared = self._claim_and_validate_managed_job(job_id)
+            if prepared is not None:
+                runner(prepared)
+        except Exception:  # noqa: BLE001 - redact managed runtime errors
+            raise ManagedJobProcessingError(
+                "Managed collector job processing failed"
+            ) from None
 
     def check_management(self) -> ManagementOperation | None:
         """Return the first pending support-bundle operation, if any."""
@@ -199,6 +379,22 @@ class Service:
             ):
                 return operation
         return None
+
+    def _poll_management(self) -> bool:
+        """Return whether a support-bundle request was handled this poll."""
+        try:
+            operation = self.check_management()
+        except Exception:
+            logger.exception("Error checking management operations.")
+            return False
+
+        if operation is None:
+            return False
+        try:
+            self._send_support_bundle(operation)
+        except Exception:
+            logger.exception("Error executing management operation.")
+        return True
 
     def _send_support_bundle(self, operation: ManagementOperation) -> None:
         """Claim, upload, and complete a support-bundle operation."""
@@ -304,28 +500,30 @@ class Service:
 
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
-        # If a job is currently running check if the future is done and handle completion
-        try:
-            if self.future is not None and self.future.done():
-                self._handle_completed_job(self.future)
-        except Exception:
-            logger.exception("Error reporting completed job; retaining result for retry.")
-
-        # Management operations have priority over new collections while idle.
-        if self.job_running is None:
+        if not self.managed:
             try:
-                operation = self.check_management()
+                if self.future is not None and self.future.done():
+                    self._handle_completed_job(self.future)
             except Exception:
-                logger.exception("Error checking management operations.")
-                operation = None
+                logger.exception(
+                    "Error reporting completed job; retaining result for retry."
+                )
 
-            if operation is not None:
-                try:
-                    self._send_support_bundle(operation)
-                except Exception:
-                    logger.exception("Error executing management operation.")
-                return
+        # Support bundles precede new collections in either mode. An unresolved
+        # managed job must be reconciled before accepting management work.
+        idle = (
+            self.job_running is None
+            and self._pending_managed_claim is None
+            and self._pending_managed_failure is None
+        )
+        if idle and self._poll_management():
+            return
 
+        if self.managed:
+            self._poll_managed_jobs()
+            return
+
+        if self.job_running is None:
             try:
                 available_job = self.check_jobs()
                 if available_job:
@@ -334,7 +532,7 @@ class Service:
                 logger.exception("Error checking for or starting jobs.")
         else:
             try:
-                self.client.jobs_current
+                _ = self.client.jobs_current
             except Exception:
                 logger.exception("Error checking in-progress job.")
 
@@ -348,12 +546,27 @@ class Service:
         try:
             self.client.update_client_metadata()
 
-        except Exception as err:
-            logger.exception(f"Unable to update client metadata: {err}")
+        except Exception:
+            if self.managed:
+                logger.error("Unable to update client metadata.")
+            else:
+                logger.exception("Unable to update client metadata.")
 
         try:
             while not self.exit:
-                self._poll()
+                if self.managed:
+                    try:
+                        self._poll()
+                    except ManagedRuntimeUnavailableError:
+                        logger.error(
+                            "Managed collection runtime is unavailable; continuing support-bundle polling."
+                        )
+                    except ManagedJobProcessingError:
+                        logger.error(
+                            "Managed scheduler poll failed; retrying next poll."
+                        )
+                else:
+                    self._poll()
                 time.sleep(self.interval)
         finally:
             self._shutdown()
