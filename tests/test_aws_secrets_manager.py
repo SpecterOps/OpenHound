@@ -1,8 +1,13 @@
+import base64
+import json
 import logging
+import traceback
 from collections.abc import Mapping, Sequence
 from typing import Any, NoReturn, cast
 
+import boto3
 import pytest
+from botocore.awsrequest import AWSResponse
 from botocore.exceptions import (
     BotoCoreError,
     ClientError,
@@ -31,6 +36,38 @@ SECRET_VALUE = "secret-value-that-must-not-be-logged"
 PROVIDER_MESSAGE = "provider message that must not be exposed"
 
 
+@pytest.fixture(autouse=True)
+def restore_sdk_logging():
+    def sdk_loggers():
+        return {
+            name: sdk_logger
+            for name, sdk_logger in logging.Logger.manager.loggerDict.copy().items()
+            if name in ("boto3", "botocore") or name.startswith(("boto3.", "botocore."))
+            if isinstance(sdk_logger, logging.Logger)
+        }
+
+    original = {
+        name: (
+            sdk_logger.level,
+            sdk_logger.disabled,
+            sdk_logger.propagate,
+            sdk_logger.handlers[:],
+        )
+        for name, sdk_logger in sdk_loggers().items()
+    }
+    try:
+        yield
+    finally:
+        for name, sdk_logger in sdk_loggers().items():
+            level, disabled, propagate, handlers = original.get(
+                name, (logging.NOTSET, False, True, [])
+            )
+            sdk_logger.setLevel(level)
+            sdk_logger.disabled = disabled
+            sdk_logger.propagate = propagate
+            sdk_logger.handlers[:] = handlers
+
+
 class FakeSecretsManagerClient:
     def __init__(
         self,
@@ -51,9 +88,7 @@ class FakeSecretsManagerClient:
             raise self.get_error
         return self.get_response or {}
 
-    def batch_get_secret_value(
-        self, *, SecretIdList: list[str]
-    ) -> Mapping[str, Any]:
+    def batch_get_secret_value(self, *, SecretIdList: list[str]) -> Mapping[str, Any]:
         self.batch_requests.append(list(SecretIdList))
         if not self.batch_responses:
             return {"SecretValues": [], "Errors": []}
@@ -87,9 +122,7 @@ def assert_safe_failure(error: BaseException, forbidden: set[str]) -> None:
     assert all(value not in str(error) for value in forbidden)
 
 
-def assert_safe_logs(
-    caplog: pytest.LogCaptureFixture, forbidden: set[str]
-) -> None:
+def assert_safe_logs(caplog: pytest.LogCaptureFixture, forbidden: set[str]) -> None:
     assert all(value not in caplog.text for value in forbidden)
     assert all(
         all(value not in record.getMessage() for value in forbidden)
@@ -195,9 +228,10 @@ def test_get_secrets_continues_and_aggregates_typed_failures_safely(
     )
     forbidden = set(secret_ids) | {SECRET_VALUE, PROVIDER_MESSAGE}
 
-    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME), pytest.raises(
-        SecretBatchError
-    ) as raised:
+    with (
+        caplog.at_level(logging.DEBUG, logger=LOGGER_NAME),
+        pytest.raises(SecretBatchError) as raised,
+    ):
         AWSSecretsManager(client).get_secrets(secret_ids)
 
     assert client.batch_requests == [secret_ids[:20], secret_ids[20:]]
@@ -220,7 +254,9 @@ def test_get_secrets_continues_and_aggregates_typed_failures_safely(
         if record.levelno == logging.ERROR
     ]
     assert len(error_records) == 2
-    assert all(record.failure_category == "SecretBatchError" for record in error_records)
+    assert all(
+        record.failure_category == "SecretBatchError" for record in error_records
+    )
     assert_safe_logs(caplog, forbidden)
 
 
@@ -331,3 +367,204 @@ def test_successful_retrieval_logs_safe_attempt_and_result_records(
 def test_get_secrets_rejects_a_string_instead_of_ids() -> None:
     with pytest.raises(TypeError, match="iterable of secret identifiers"):
         AWSSecretsManager(FakeSecretsManagerClient()).get_secrets(SECRET_ID)
+
+
+def test_bhe_binary_json_secret_is_decoded_in_memory(caplog) -> None:
+    client = FakeSecretsManagerClient(
+        get_response={
+            "SecretBinary": b'{"credential":"secret-value-that-must-not-be-logged"}'
+        }
+    )
+    with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+        result = AWSSecretsManager(client).get_secret(SECRET_ID)
+    assert result == {"credential": SECRET_VALUE}
+    assert_safe_logs(caplog, {SECRET_ID, SECRET_VALUE})
+
+
+def test_invalid_binary_secret_is_safely_classified(caplog) -> None:
+    client = FakeSecretsManagerClient(
+        get_response={"SecretBinary": b"\xffsecret-value-that-must-not-be-logged"}
+    )
+    with (
+        caplog.at_level(logging.DEBUG, logger=LOGGER_NAME),
+        pytest.raises(SecretRequestError) as raised,
+    ):
+        AWSSecretsManager(client).get_secret(SECRET_ID)
+    assert_safe_failure(raised.value, {SECRET_ID, SECRET_VALUE})
+    assert_safe_logs(caplog, {SECRET_ID, SECRET_VALUE})
+
+
+def test_boto_client_uses_bounded_timeouts_and_retries(monkeypatch) -> None:
+    captured = {}
+    client = FakeSecretsManagerClient(get_response={"SecretString": SECRET_VALUE})
+
+    def create_client(service, **kwargs):
+        captured.update(service=service, **kwargs)
+        return client
+
+    monkeypatch.setattr(
+        "openhound.core.clients.aws_secrets_manager.boto3.client", create_client
+    )
+    assert AWSSecretsManager().get_secret(SECRET_ID) == SECRET_VALUE
+    config = captured["config"]
+    assert captured["service"] == "secretsmanager"
+    assert config.connect_timeout == 10
+    assert config.read_timeout == 20
+    assert config.retries == {"mode": "standard", "total_max_attempts": 4}
+
+
+@pytest.mark.parametrize(
+    "operation,response_kind,injected",
+    [
+        pytest.param("single", "string", False, id="single-string-created"),
+        pytest.param("single", "binary", True, id="single-binary-injected"),
+        pytest.param("single", "provider_error", False, id="single-error-created"),
+        pytest.param("batch", "string", True, id="batch-string-injected"),
+        pytest.param("batch", "binary", False, id="batch-binary-created"),
+        pytest.param("batch", "provider_error", True, id="batch-error-injected"),
+    ],
+)
+def test_real_sdk_http_pipeline_does_not_expose_secrets(
+    monkeypatch, caplog, operation, response_kind, injected
+) -> None:
+    document = json.dumps({"credential": SECRET_VALUE})
+    encoded_document = base64.b64encode(document.encode()).decode()
+    secret = (
+        {"SecretBinary": encoded_document}
+        if response_kind == "binary"
+        else {"SecretString": document}
+    )
+    if response_kind == "provider_error":
+        response_body = {
+            "__type": "AccessDeniedException",
+            "message": f"{PROVIDER_MESSAGE}: {SECRET_ID} {SECRET_VALUE}",
+        }
+        status = 400
+    else:
+        response_body = (
+            {"SecretValues": [{"Name": SECRET_ID, **secret}], "Errors": []}
+            if operation == "batch"
+            else secret
+        )
+        status = 200
+    raw_body = json.dumps(response_body).encode()
+    forbidden = {
+        SECRET_ID,
+        SECRET_VALUE,
+        PROVIDER_MESSAGE,
+        encoded_document,
+        raw_body.decode(),
+    }
+    requests = []
+    clients = []
+
+    class RawResponse:
+        def stream(self, *_args, **_kwargs):
+            yield raw_body
+
+    def create_client(service, **kwargs):
+        # This preexisting child has its own handler and explicit DEBUG level.
+        logging.getLogger("botocore.endpoint").debug(
+            "SDK construction %s", SECRET_ID, extra={"payload": SECRET_VALUE}
+        )
+        session = boto3.Session(
+            aws_access_key_id="fake-access-key",
+            aws_secret_access_key="fake-secret-key",
+            region_name="us-east-1",
+        )
+        client = session.client(service, **kwargs)
+        clients.append(client)
+        monkeypatch.setattr(client._endpoint.http_session, "send", send)
+        return client
+
+    def send(request):
+        requests.append(request)
+        # These children are first created after suppression; explicit DEBUG
+        # must not bypass the namespace sink, even for ERROR records.
+        for namespace in ("boto3.resources", "botocore.endpoint"):
+            child = logging.getLogger(
+                f"{namespace}.openhound_pipeline_{operation}_{response_kind}_{injected}"
+            )
+            child.setLevel(logging.DEBUG)
+            child.error(
+                "SDK response %s", PROVIDER_MESSAGE, extra={"payload": raw_body}
+            )
+        return AWSResponse(
+            request.url,
+            status,
+            {"content-type": "application/x-amz-json-1.1"},
+            RawResponse(),
+        )
+
+    monkeypatch.setattr(
+        "openhound.core.clients.aws_secrets_manager.boto3.client", create_client
+    )
+    if injected:
+        # An injected real client is constructed by its caller. Only the
+        # wrapper's subsequent retrieval is under test in this case.
+        client = boto3.Session(
+            aws_access_key_id="fake-access-key",
+            aws_secret_access_key="fake-secret-key",
+            region_name="us-east-1",
+        ).client("secretsmanager")
+        clients.append(client)
+        monkeypatch.setattr(client._endpoint.http_session, "send", send)
+    else:
+        client = None
+
+    for name in (
+        "boto3",
+        "botocore",
+        "boto3.resources",
+        "botocore.endpoint",
+        "botocore.parsers",
+    ):
+        sdk_logger = logging.getLogger(name)
+        sdk_logger.disabled = False
+        sdk_logger.setLevel(logging.DEBUG)
+        sdk_logger.addHandler(caplog.handler)
+        sdk_logger.propagate = False
+    caplog.clear()
+
+    try:
+        with caplog.at_level(logging.DEBUG):
+            manager = AWSSecretsManager(client)
+            if response_kind == "provider_error":
+                error_type = (
+                    SecretBatchError if operation == "batch" else SecretPermissionError
+                )
+                with pytest.raises(error_type) as raised:
+                    if operation == "batch":
+                        manager.get_secrets([SECRET_ID])
+                    else:
+                        manager.get_secret(SECRET_ID)
+                assert_safe_failure(raised.value, forbidden)
+                formatted = "".join(traceback.format_exception(raised.value))
+                assert all(value not in formatted for value in forbidden)
+                if operation == "batch":
+                    assert isinstance(
+                        raised.value.failures[SECRET_ID], SecretPermissionError
+                    )
+                    assert_safe_failure(raised.value.failures[SECRET_ID], forbidden)
+            elif operation == "batch":
+                assert manager.get_secrets([SECRET_ID]) == {
+                    SECRET_ID: {"credential": SECRET_VALUE}
+                }
+            else:
+                assert manager.get_secret(SECRET_ID) == {"credential": SECRET_VALUE}
+    finally:
+        for sdk_client in clients:
+            sdk_client.close()
+
+    assert len(requests) == 1
+    assert SECRET_ID in requests[0].body.decode()
+    assert_safe_logs(caplog, forbidden)
+    records = [record for record in caplog.records if record.name == LOGGER_NAME]
+    assert [getattr(record, "outcome", None) for record in records] == [
+        "attempt",
+        "failure" if response_kind == "provider_error" else "success",
+    ]
+    assert all(record.exc_info is None for record in records)
+    assert not any(
+        record.name.startswith(("boto3", "botocore")) for record in caplog.records
+    )
