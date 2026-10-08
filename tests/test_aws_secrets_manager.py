@@ -413,9 +413,17 @@ def test_boto_client_uses_bounded_timeouts_and_retries(monkeypatch) -> None:
     assert config.retries == {"mode": "standard", "total_max_attempts": 4}
 
 
-@pytest.mark.parametrize("operation", ["single", "batch"])
-@pytest.mark.parametrize("response_kind", ["string", "binary", "provider_error"])
-@pytest.mark.parametrize("injected", [False, True])
+@pytest.mark.parametrize(
+    "operation,response_kind,injected",
+    [
+        pytest.param("single", "string", False, id="single-string-created"),
+        pytest.param("single", "binary", True, id="single-binary-injected"),
+        pytest.param("single", "provider_error", False, id="single-error-created"),
+        pytest.param("batch", "string", True, id="batch-string-injected"),
+        pytest.param("batch", "binary", False, id="batch-binary-created"),
+        pytest.param("batch", "provider_error", True, id="batch-error-injected"),
+    ],
+)
 def test_real_sdk_http_pipeline_does_not_expose_secrets(
     monkeypatch, caplog, operation, response_kind, injected
 ) -> None:

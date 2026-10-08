@@ -380,6 +380,22 @@ class Service:
                 return operation
         return None
 
+    def _poll_management(self) -> bool:
+        """Return whether a support-bundle request was handled this poll."""
+        try:
+            operation = self.check_management()
+        except Exception:
+            logger.exception("Error checking management operations.")
+            return False
+
+        if operation is None:
+            return False
+        try:
+            self._send_support_bundle(operation)
+        except Exception:
+            logger.exception("Error executing management operation.")
+        return True
+
     def _send_support_bundle(self, operation: ManagementOperation) -> None:
         """Claim, upload, and complete a support-bundle operation."""
         bundle_path: Path | None = None
@@ -484,33 +500,30 @@ class Service:
 
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
+        if not self.managed:
+            try:
+                if self.future is not None and self.future.done():
+                    self._handle_completed_job(self.future)
+            except Exception:
+                logger.exception(
+                    "Error reporting completed job; retaining result for retry."
+                )
+
+        # Support bundles precede new collections in either mode. An unresolved
+        # managed job must be reconciled before accepting management work.
+        idle = (
+            self.job_running is None
+            and self._pending_managed_claim is None
+            and self._pending_managed_failure is None
+        )
+        if idle and self._poll_management():
+            return
+
         if self.managed:
             self._poll_managed_jobs()
             return
-        # If a job is currently running check if the future is done and handle completion
-        try:
-            if self.future is not None and self.future.done():
-                self._handle_completed_job(self.future)
-        except Exception:
-            logger.exception(
-                "Error reporting completed job; retaining result for retry."
-            )
 
-        # Management operations have priority over new collections while idle.
         if self.job_running is None:
-            try:
-                operation = self.check_management()
-            except Exception:
-                logger.exception("Error checking management operations.")
-                operation = None
-
-            if operation is not None:
-                try:
-                    self._send_support_bundle(operation)
-                except Exception:
-                    logger.exception("Error executing management operation.")
-                return
-
             try:
                 available_job = self.check_jobs()
                 if available_job:
@@ -525,8 +538,6 @@ class Service:
 
     def start(self) -> None:
         """Start method to initiate the process of checking for jobs and running them. This method will run indefinitely until an exit signal is received"""
-        if self.managed:
-            self._require_managed_runtime()
         signal.signal(signal.SIGINT, self._exit_handler)
         signal.signal(signal.SIGTERM, self._exit_handler)
         logger.info(
@@ -546,6 +557,10 @@ class Service:
                 if self.managed:
                     try:
                         self._poll()
+                    except ManagedRuntimeUnavailableError:
+                        logger.error(
+                            "Managed collection runtime is unavailable; continuing support-bundle polling."
+                        )
                     except ManagedJobProcessingError:
                         logger.error(
                             "Managed scheduler poll failed; retrying next poll."
