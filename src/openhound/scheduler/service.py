@@ -9,6 +9,7 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -37,11 +38,20 @@ from openhound.scheduler import dataflow
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 30  # seconds; fixed poll/check-in cadence, must remain below BHE's 600s client-checkin timeout
-HEARTBEAT_INTERVAL = 300  # seconds; BHE expires managed jobs after 15 minutes without a heartbeat
+HEARTBEAT_INTERVAL = (
+    300  # seconds; BHE expires managed jobs after 15 minutes without a heartbeat
+)
+
+# Explicit source registration for the collectors shipped with this PoC.
+MANAGED_SOURCE_MODULES = {
+    "faker": "openhound_faker.source",
+    "aws": "openhound_aws.source",
+}
 
 
 class ExtensionNotFoundError(Exception):
     """Raised when the configured collector extension cannot be found."""
+
 
 class ManagedRuntimeUnavailableError(RuntimeError):
     """Managed scheduling requires a configured collection runtime."""
@@ -84,6 +94,7 @@ def _usable_credential_value(value: Any) -> bool:
     if isinstance(value, float):
         return math.isfinite(value)
     return False
+
 
 @dataclass
 class Result:
@@ -140,6 +151,13 @@ def _subprocess_collect(
     for collector in available_collectors.collectors:
         if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
             if params is not None or secrets is not None:
+                if (
+                    collector.dlt_source is None
+                    and collector.name in MANAGED_SOURCE_MODULES
+                ):
+                    collector.dlt_source = import_module(
+                        MANAGED_SOURCE_MODULES[collector.name]
+                    ).source
                 _set_managed_source_environment(collector, params or {}, secrets or {})
             log_fields = {
                 "collector_extension": collector.name,
@@ -239,7 +257,8 @@ class Service:
         logger.info("Collection service stopping.")
         while self.future is not None and not self.future.done():
             self._poll_running_job()
-            time.sleep(self.interval)
+            if self.future is not None:
+                time.sleep(self.interval)
         if self.future is not None:
             try:
                 self._handle_completed_job(self.future)
@@ -562,7 +581,10 @@ class Service:
     def _send_managed_heartbeat(self, job_id: str) -> None:
         try:
             self.client.heartbeat_collector_job(job_id)
-        except Exception as error:  # noqa: BLE001 - failed heartbeats must not stop collection
+        except Exception as error:  # noqa: BLE001 - transient heartbeat failures must not stop collection
+            if isinstance(error, BloodHoundHTTPError) and error.code == 404:
+                self._abort_managed_job(job_id)
+                return
             logger.info(
                 "Managed collector job %s heartbeat request failed.",
                 job_id,
@@ -576,6 +598,20 @@ class Service:
             )
         else:
             logger.info("Managed collector job %s heartbeat succeeded.", job_id)
+
+    def _abort_managed_job(self, job_id: str) -> None:
+        """Stop local work without reporting an outcome for a claim we no longer own."""
+        logger.warning(
+            "Managed collector job %s claim lost; stopping collection.", job_id
+        )
+        # Python 3.13 has no public pool termination API, and Future.cancel()
+        # cannot stop running work. Join the killed worker before accepting jobs.
+        processes = list((self.executor._processes or {}).values())
+        for process in processes:
+            process.kill()
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        self._clear_running_job()
+        self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
         """Report the completed worker's outcome through the active job API."""
@@ -619,7 +655,8 @@ class Service:
                 and time.monotonic() >= self.next_heartbeat_at
             ):
                 self._send_managed_heartbeat(self.managed_job_id)
-                self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
+                if self.managed_job_id is not None:
+                    self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
         else:
             try:
                 _ = self.client.jobs_current
