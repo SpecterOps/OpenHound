@@ -1557,6 +1557,57 @@ def test_managed_poll_claims_retrieves_and_hands_off_authoritative_job(
         assert all(forbidden not in repr(r.__dict__) for r in caplog.records)
 
 
+def test_managed_poll_starts_claimed_job_and_tracks_worker(
+    managed_service, mock_bloodhound_api, monkeypatch
+):
+    service = managed_service
+    state = mock_bloodhound_api.app.state
+    service.managed_job_runner = service._run_prepared_managed_job
+    future = Future()
+    submitted = []
+
+    def submit(*args):
+        assert state.collector_job_start_requests == [
+            (state.collector_job_claim_response["id"], b"")
+        ]
+        submitted.append(args)
+        return future
+
+    monkeypatch.setattr(service.executor, "submit", submit)
+
+    service._poll()
+
+    job_id = state.collector_job_claim_response["id"]
+    assert state.managed_events == ["claim", "retrieve"]
+    assert submitted == [
+        (
+            scheduler_service._subprocess_collect,
+            "openhound-faker",
+            job_id,
+            {"claimed_parameter": True},
+            {"credential": "private-credential-value"},
+        )
+    ]
+    assert service.job_running == service.managed_job_id == job_id
+    assert service.future is future
+
+    service.next_heartbeat_at = 0
+    service._poll()
+    assert len(state.collector_job_claim_requests) == 1
+    assert len(state.collector_job_queue_requests) == 1
+    assert state.collector_job_heartbeat_requests == [(job_id, b"")]
+
+    state.collector_job_queue_response = load_json(
+        "collector_jobs_available_empty.json"
+    )
+    future.set_result(Result(results={}, job_id=job_id))
+    service._poll()
+    assert state.collector_job_end_requests == [
+        {"job_id": job_id, "body": {"outcome": "succeeded"}}
+    ]
+    assert service.job_running is service.future is None
+
+
 @pytest.mark.parametrize(
     "document",
     [

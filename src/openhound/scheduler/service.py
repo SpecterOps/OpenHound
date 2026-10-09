@@ -675,11 +675,15 @@ class Service:
 
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
-        if not self.managed:
-            try:
-                if self.future is not None and self.future.done():
-                    self._handle_completed_job(self.future)
-            except Exception:
+        try:
+            if self.future is not None and self.future.done():
+                self._handle_completed_job(self.future)
+        except Exception:
+            if self.managed:
+                logger.error(
+                    "Error reporting completed managed job; retaining result for retry."
+                )
+            else:
                 logger.exception(
                     "Error reporting completed job; retaining result for retry."
                 )
