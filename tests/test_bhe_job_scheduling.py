@@ -83,6 +83,7 @@ def mock_bloodhound_api():
     )["data"]["jobs"][0]
     app.state.managed_events = []
     app.state.collector_job_start_requests = []
+    app.state.collector_job_start_statuses = []
     app.state.collector_job_heartbeat_requests = []
     app.state.start_payload = None
     app.state.jobs_available_requests = 0
@@ -157,6 +158,11 @@ def mock_bloodhound_api():
         if app.state.collector_job_stateful_claims:
             if app.state.collector_job_active_id not in (None, job_id):
                 return Response("raw-provider-secret", status_code=409)
+            if (
+                app.state.collector_job_active_id == job_id
+                and app.state.collector_job_claim_response["status"] == "running"
+            ):
+                return Response("raw-provider-secret", status_code=409)
             app.state.collector_job_active_id = job_id
             if app.state.collector_job_lost_claim_responses:
                 app.state.collector_job_lost_claim_responses -= 1
@@ -186,6 +192,23 @@ def mock_bloodhound_api():
     @app.post("/api/v2/collector-job-queue/{job_id}/start")
     async def start_collector_job(job_id: str, request: Request):
         app.state.collector_job_start_requests.append((job_id, await request.body()))
+        if app.state.collector_job_start_statuses:
+            status = app.state.collector_job_start_statuses.pop(0)
+            if status != 200:
+                return Response("raw-provider-secret", status_code=status)
+        if app.state.collector_job_stateful_claims:
+            if app.state.collector_job_active_id != job_id:
+                return Response("raw-provider-secret", status_code=404)
+            job = app.state.collector_job_claim_response
+            if job["status"] != "running":
+                if job["status"] != "claimed" or datetime.fromisoformat(
+                    job["claim_expires_at"]
+                ) <= datetime.now(UTC):
+                    return Response("raw-provider-secret", status_code=409)
+                job["status"] = "running"
+                job["claim_expires_at"] = (
+                    datetime.now(UTC) + timedelta(minutes=15)
+                ).isoformat()
         return Response(status_code=200)
 
     @app.post("/api/v2/collector-job-queue/{job_id}/heartbeat")
@@ -1606,6 +1629,175 @@ def test_managed_poll_starts_claimed_job_and_tracks_worker(
         {"job_id": job_id, "body": {"outcome": "succeeded"}}
     ]
     assert service.job_running is service.future is None
+
+
+@pytest.mark.parametrize(
+    "committed", [False, True], ids=["before-start", "lost-response"]
+)
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.Timeout("raw-provider-secret"),
+        requests.ConnectionError("raw-provider-secret"),
+        BloodHoundHTTPError("raw-provider-secret", 503),
+    ],
+    ids=["timeout", "connection-error", "http-503"],
+)
+def test_managed_start_failure_retries_prepared_job_before_discovery(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch, caplog, committed, error
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    state.collector_job_lost_claim_responses = 0
+    service.managed_job_runner = service._run_prepared_managed_job
+    job_id = state.collector_job_claim_response["id"]
+    original = service.client.request
+    starts = []
+
+    def flaky_request(**kwargs):
+        if kwargs["path"].endswith("/start"):
+            assert service._pending_managed_claim == job_id
+            assert service._pending_managed_start is not None
+            starts.append(kwargs["path"])
+            if len(starts) <= 3:
+                if committed:
+                    original(**kwargs)
+                raise error
+        return original(**kwargs)
+
+    monkeypatch.setattr(service.client, "request", flaky_request)
+
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(3):
+            with pytest.raises(ManagedJobProcessingError) as raised:
+                service._poll()
+            assert "raw-provider-secret" not in "".join(
+                traceback.format_exception(raised.value)
+            )
+            assert service._pending_managed_claim == job_id
+            assert service._pending_managed_start is not None
+            assert str(service._pending_managed_start.job.id) == job_id
+            assert "private-credential-value" not in repr(
+                service._pending_managed_start
+            )
+            assert (
+                service.future is service.job_running is service.managed_job_id is None
+            )
+            assert service.executor.submitted == []
+            assert state.collector_job_end_requests == []
+            assert state.collector_job_claim_response["status"] == (
+                "running" if committed else "claimed"
+            )
+
+        # Recovery must repeat start, not claim: BHE rejects re-claim of a running job.
+        service._poll()
+
+    assert starts == [f"/api/v2/collector-job-queue/{job_id}/start"] * 4
+    assert state.collector_job_claim_requests == [{"job_id": job_id, "body": b""}]
+    assert len(state.collector_job_queue_requests) == 1
+    assert state.management_available_requests == 1
+    assert service.secret_requests == ["private-secret-reference"]
+    assert service._pending_managed_claim is service._pending_managed_start is None
+    assert service.job_running == service.managed_job_id == job_id
+    assert state.collector_job_claim_response["status"] == "running"
+    (submission,) = service.executor.submitted
+    args, _, future = submission
+    assert args[1:] == (
+        "openhound-faker",
+        job_id,
+        {"claimed_parameter": True},
+        {"credential": "private-credential-value"},
+    )
+    assert service.future is future
+    for forbidden in ("raw-provider-secret", "private-credential-value"):
+        assert forbidden not in caplog.text
+        assert all(forbidden not in repr(record.__dict__) for record in caplog.records)
+
+    service._poll()
+    assert len(starts) == 4
+    assert len(service.executor.submitted) == 1
+
+    state.collector_job_queue_response = load_json(
+        "collector_jobs_available_empty.json"
+    )
+    future.set_result(Result(results={}, job_id=job_id))
+    service._poll()
+    assert state.collector_job_end_requests == [
+        {"job_id": job_id, "body": {"outcome": "succeeded"}}
+    ]
+    assert service.job_running is service.future is None
+
+
+@pytest.mark.parametrize("status", [404, 409])
+@pytest.mark.parametrize("lost_response_first", [False, True])
+def test_managed_start_rejection_clears_preparation_and_allows_next_job(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch, status, lost_response_first
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    state.collector_job_lost_claim_responses = 0
+    service.managed_job_runner = service._run_prepared_managed_job
+    original = service.client.start_collector_job
+
+    def lost_response(job_id):
+        original(job_id)
+        raise requests.Timeout("raw-provider-secret")
+
+    if lost_response_first:
+        monkeypatch.setattr(service.client, "start_collector_job", lost_response)
+        with pytest.raises(ManagedJobProcessingError):
+            service._poll()
+        assert service._pending_managed_start is not None
+
+    monkeypatch.setattr(service.client, "start_collector_job", original)
+    state.collector_job_start_statuses = [status]
+    with pytest.raises(ManagedJobProcessingError):
+        service._poll()
+
+    assert service._pending_managed_claim is service._pending_managed_start is None
+    assert service.future is service.job_running is service.managed_job_id is None
+    assert service.executor.submitted == []
+    assert len(state.collector_job_queue_requests) == 1
+    assert len(state.collector_job_claim_requests) == 1
+    assert state.collector_job_end_requests == []
+
+    # BHE no longer permits this start; discovery can now select another job.
+    job_b = state.collector_job_queue_response["data"]["jobs"][1]
+    state.collector_job_queue_response["data"]["jobs"] = [job_b]
+    state.collector_job_claim_response.update(id=job_b["id"], status="claimed")
+    state.collector_job_active_id = None
+    service._poll()
+    assert len(state.collector_job_queue_requests) == 2
+    assert service.job_running == job_b["id"]
+    assert len(service.executor.submitted) == 1
+
+
+def test_managed_expired_claim_start_rejection_clears_preparation(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    state.collector_job_lost_claim_responses = 0
+    service.managed_job_runner = service._run_prepared_managed_job
+    original = service.client.start_collector_job
+
+    def unavailable(job_id):
+        raise requests.Timeout("raw-provider-secret")
+
+    monkeypatch.setattr(service.client, "start_collector_job", unavailable)
+    with pytest.raises(ManagedJobProcessingError):
+        service._poll()
+    assert service._pending_managed_start is not None
+
+    state.collector_job_claim_response["claim_expires_at"] = (
+        datetime.now(UTC) - timedelta(seconds=1)
+    ).isoformat()
+    monkeypatch.setattr(service.client, "start_collector_job", original)
+    with pytest.raises(ManagedJobProcessingError):
+        service._poll()
+    assert service._pending_managed_claim is service._pending_managed_start is None
+    assert service.executor.submitted == []
+    assert state.collector_job_end_requests == []
 
 
 @pytest.mark.parametrize(
