@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import openhound
 import openhound.core.logging as openhound_logging
@@ -418,9 +419,7 @@ class Service:
         return self.managed_job_runner
 
     def _run_prepared_managed_job(self, prepared: PreparedManagedJob) -> None:
-        self.run_claimed_job(
-            str(prepared.job.id), prepared.job.params, prepared.credentials
-        )
+        self.run_claimed_job(prepared.job.id, prepared.job.params, prepared.credentials)
 
     def _poll_managed_jobs(self) -> None:
         runner = self._require_managed_runtime()
@@ -504,11 +503,12 @@ class Service:
         self._launch_job(job.id)
 
     def run_claimed_job(
-        self, job_id: str, params: dict[str, Any], secrets: dict[str, Any]
+        self, job_id: str | UUID, params: dict[str, Any], secrets: dict[str, Any]
     ) -> None:
         """Start a validated managed job; the scheduler polls it until completion."""
-        job_id = str(job_id)
-        self._launch_job(job_id, params=params, secrets=secrets, managed=True)
+        # Normalize managed UUIDs once at the runtime boundary. Unmanaged IDs
+        # remain integers throughout the shared lifecycle.
+        self._launch_job(str(job_id), params=params, secrets=secrets, managed=True)
 
     def _launch_job(
         self,
@@ -523,16 +523,20 @@ class Service:
             raise RuntimeError(f"Job {self.job_running} is already running")
 
         logger.info("Starting job %s with collector '%s'.", job_id, self.collector_name)
+        managed_job_id: str | None = None
         if managed:
-            self.client.start_collector_job(str(job_id))
+            if not isinstance(job_id, str):
+                raise TypeError("Managed job IDs must be strings")
+            managed_job_id = job_id
         else:
-            assert isinstance(job_id, int)
+            if not isinstance(job_id, int):
+                raise TypeError("Unmanaged job IDs must be integers")
             self.client.start_job(job_id)
 
         if managed:
             logger.info("Managed collector job %s started successfully.", job_id)
         self.job_running = job_id
-        self.managed_job_id = str(job_id) if managed else None
+        self.managed_job_id = managed_job_id
         self.next_heartbeat_at = (
             time.monotonic() + HEARTBEAT_INTERVAL if managed else None
         )
