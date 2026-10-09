@@ -3,8 +3,11 @@ import gzip
 import hashlib
 import json
 import logging
+import subprocess
+import sys
+import time
 import traceback
-from concurrent.futures import Future
+from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -79,6 +82,9 @@ def mock_bloodhound_api():
         "collector_jobs_available_with_job.json"
     )["data"]["jobs"][0]
     app.state.managed_events = []
+    app.state.collector_job_start_requests = []
+    app.state.collector_job_start_statuses = []
+    app.state.collector_job_heartbeat_requests = []
     app.state.start_payload = None
     app.state.jobs_available_requests = 0
     app.state.jobs_current_requests = 0
@@ -152,6 +158,11 @@ def mock_bloodhound_api():
         if app.state.collector_job_stateful_claims:
             if app.state.collector_job_active_id not in (None, job_id):
                 return Response("raw-provider-secret", status_code=409)
+            if (
+                app.state.collector_job_active_id == job_id
+                and app.state.collector_job_claim_response["status"] == "running"
+            ):
+                return Response("raw-provider-secret", status_code=409)
             app.state.collector_job_active_id = job_id
             if app.state.collector_job_lost_claim_responses:
                 app.state.collector_job_lost_claim_responses -= 1
@@ -177,6 +188,35 @@ def mock_bloodhound_api():
         return Response(
             "raw-provider-secret" if status != 200 else "", status_code=status
         )
+
+    @app.post("/api/v2/collector-job-queue/{job_id}/start")
+    async def start_collector_job(job_id: str, request: Request):
+        app.state.collector_job_start_requests.append((job_id, await request.body()))
+        if app.state.collector_job_start_statuses:
+            status = app.state.collector_job_start_statuses.pop(0)
+            if status != 200:
+                return Response("raw-provider-secret", status_code=status)
+        if app.state.collector_job_stateful_claims:
+            if app.state.collector_job_active_id != job_id:
+                return Response("raw-provider-secret", status_code=404)
+            job = app.state.collector_job_claim_response
+            if job["status"] != "running":
+                if job["status"] != "claimed" or datetime.fromisoformat(
+                    job["claim_expires_at"]
+                ) <= datetime.now(UTC):
+                    return Response("raw-provider-secret", status_code=409)
+                job["status"] = "running"
+                job["claim_expires_at"] = (
+                    datetime.now(UTC) + timedelta(minutes=15)
+                ).isoformat()
+        return Response(status_code=200)
+
+    @app.post("/api/v2/collector-job-queue/{job_id}/heartbeat")
+    async def heartbeat_collector_job(job_id: str, request: Request):
+        app.state.collector_job_heartbeat_requests.append(
+            (job_id, await request.body())
+        )
+        return Response(status_code=200)
 
     @app.post("/api/v2/ingest")
     async def ingest(request: Request):
@@ -292,6 +332,7 @@ def mock_service(mock_bloodhound_api, monkeypatch):
     class DummyExecutor:
         def __init__(self, *args, **kwargs):
             self.submitted = []
+            self._processes = {}
 
         def submit(self, *args, **kwargs):
             future = Future()
@@ -538,6 +579,42 @@ def test_end_managed_job_sends_managed_outcome(
     assert mock_bloodhound_api.app.state.collector_job_end_requests == [
         {"job_id": "collector-job-123", "body": expected_body}
     ]
+
+
+def test_start_and_heartbeat_collector_job_use_bodyless_requests(
+    mock_service, mock_bloodhound_api
+):
+    job_id = "e0d43dbd-2cdf-4d68-9a81-2f95cd58a92f"
+    mock_service.client.start_collector_job(job_id)
+    mock_service.client.heartbeat_collector_job(job_id)
+
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == [
+        (job_id, b"")
+    ]
+    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == [
+        (job_id, b"")
+    ]
+
+
+def test_start_and_heartbeat_collector_job_use_bounded_timeouts(
+    mock_service, monkeypatch
+):
+    requests_sent = []
+    monkeypatch.setattr(
+        mock_service.client,
+        "request",
+        lambda *args, **kwargs: requests_sent.append(kwargs),
+    )
+
+    mock_service.client.start_collector_job("collector-job-123")
+    mock_service.client.heartbeat_collector_job("collector-job-123")
+
+    assert [request["timeout"] for request in requests_sent] == [
+        (
+            bloodhound_enterprise.MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
+            bloodhound_enterprise.MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
+        )
+    ] * 2
 
 
 def test_end_managed_job_uses_bounded_timeouts(mock_service, monkeypatch):
@@ -810,15 +887,22 @@ def test_poll_starts_new_job(mock_service, mock_bloodhound_api, monkeypatch):
     """Similar to test_jobs_starts_new_job but using the poll method"""
     submitted = Future()
     secret_requests = []
-    monkeypatch.setattr(mock_service.executor, "submit", lambda *args: submitted)
     monkeypatch.setattr(
         mock_service.secrets_manager, "get_secret", secret_requests.append
     )
+    submitted_args = []
+
+    def submit(*args):
+        submitted_args.append(args)
+        return submitted
+
+    monkeypatch.setattr(mock_service.executor, "submit", submit)
 
     mock_service._poll()
 
     assert mock_service.job_running == 123
     assert mock_service.future is submitted
+    assert submitted_args[0][1:] == ("openhound-faker", 123, None, None)
     assert mock_bloodhound_api.app.state.job_started is True
     assert mock_bloodhound_api.app.state.start_payload == {"id": 123}
     assert mock_bloodhound_api.app.state.collector_job_queue_requests == []
@@ -985,8 +1069,16 @@ def test_checkin_swallows_exception(mock_service, monkeypatch):
     mock_service._poll()
 
 
-def test_scheduler_ingest_opengraph(mock_service, mock_bloodhound_api, monkeypatch):
+def test_scheduler_ingest_opengraph(
+    mock_service, mock_bloodhound_api, monkeypatch, tmp_path
+):
     """Run the DLT pipeline with the openhound-faker collector + check the amount of ingested nodes + edges"""
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / ".dlt"))
+    monkeypatch.setattr(
+        scheduler_service.dataflow,
+        "Path",
+        lambda value: tmp_path if value == "/tmp/openhound" else Path(value),
+    )
     monkeypatch.setenv(
         "DESTINATION__BLOODHOUNDENTERPRISE__URL", "http://localhost:8000"
     )
@@ -1488,6 +1580,226 @@ def test_managed_poll_claims_retrieves_and_hands_off_authoritative_job(
         assert all(forbidden not in repr(r.__dict__) for r in caplog.records)
 
 
+def test_managed_poll_starts_claimed_job_and_tracks_worker(
+    managed_service, mock_bloodhound_api, monkeypatch
+):
+    service = managed_service
+    state = mock_bloodhound_api.app.state
+    service.managed_job_runner = service._run_prepared_managed_job
+    future = Future()
+    submitted = []
+
+    def submit(*args):
+        assert state.collector_job_start_requests == [
+            (state.collector_job_claim_response["id"], b"")
+        ]
+        submitted.append(args)
+        return future
+
+    monkeypatch.setattr(service.executor, "submit", submit)
+
+    service._poll()
+
+    job_id = state.collector_job_claim_response["id"]
+    assert state.managed_events == ["claim", "retrieve"]
+    assert submitted == [
+        (
+            scheduler_service._subprocess_collect,
+            "openhound-faker",
+            job_id,
+            {"claimed_parameter": True},
+            {"credential": "private-credential-value"},
+        )
+    ]
+    assert service.job_running == service.managed_job_id == job_id
+    assert service.future is future
+
+    service.next_heartbeat_at = 0
+    service._poll()
+    assert len(state.collector_job_claim_requests) == 1
+    assert len(state.collector_job_queue_requests) == 1
+    assert state.collector_job_heartbeat_requests == [(job_id, b"")]
+
+    state.collector_job_queue_response = load_json(
+        "collector_jobs_available_empty.json"
+    )
+    future.set_result(Result(results={}, job_id=job_id))
+    service._poll()
+    assert state.collector_job_end_requests == [
+        {"job_id": job_id, "body": {"outcome": "succeeded"}}
+    ]
+    assert service.job_running is service.future is None
+
+
+@pytest.mark.parametrize(
+    "committed", [False, True], ids=["before-start", "lost-response"]
+)
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.Timeout("raw-provider-secret"),
+        requests.ConnectionError("raw-provider-secret"),
+        BloodHoundHTTPError("raw-provider-secret", 503),
+    ],
+    ids=["timeout", "connection-error", "http-503"],
+)
+def test_managed_start_failure_retries_prepared_job_before_discovery(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch, caplog, committed, error
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    state.collector_job_lost_claim_responses = 0
+    service.managed_job_runner = service._run_prepared_managed_job
+    job_id = state.collector_job_claim_response["id"]
+    original = service.client.request
+    starts = []
+
+    def flaky_request(**kwargs):
+        if kwargs["path"].endswith("/start"):
+            assert service._pending_managed_claim == job_id
+            assert service._pending_managed_start is not None
+            starts.append(kwargs["path"])
+            if len(starts) <= 3:
+                if committed:
+                    original(**kwargs)
+                raise error
+        return original(**kwargs)
+
+    monkeypatch.setattr(service.client, "request", flaky_request)
+
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(3):
+            with pytest.raises(ManagedJobProcessingError) as raised:
+                service._poll()
+            assert "raw-provider-secret" not in "".join(
+                traceback.format_exception(raised.value)
+            )
+            assert service._pending_managed_claim == job_id
+            assert service._pending_managed_start is not None
+            assert str(service._pending_managed_start.job.id) == job_id
+            assert "private-credential-value" not in repr(
+                service._pending_managed_start
+            )
+            assert (
+                service.future is service.job_running is service.managed_job_id is None
+            )
+            assert service.executor.submitted == []
+            assert state.collector_job_end_requests == []
+            assert state.collector_job_claim_response["status"] == (
+                "running" if committed else "claimed"
+            )
+
+        # Recovery must repeat start, not claim: BHE rejects re-claim of a running job.
+        service._poll()
+
+    assert starts == [f"/api/v2/collector-job-queue/{job_id}/start"] * 4
+    assert state.collector_job_claim_requests == [{"job_id": job_id, "body": b""}]
+    assert len(state.collector_job_queue_requests) == 1
+    assert state.management_available_requests == 1
+    assert service.secret_requests == ["private-secret-reference"]
+    assert service._pending_managed_claim is service._pending_managed_start is None
+    assert service.job_running == service.managed_job_id == job_id
+    assert state.collector_job_claim_response["status"] == "running"
+    (submission,) = service.executor.submitted
+    args, _, future = submission
+    assert args[1:] == (
+        "openhound-faker",
+        job_id,
+        {"claimed_parameter": True},
+        {"credential": "private-credential-value"},
+    )
+    assert service.future is future
+    for forbidden in ("raw-provider-secret", "private-credential-value"):
+        assert forbidden not in caplog.text
+        assert all(forbidden not in repr(record.__dict__) for record in caplog.records)
+
+    service._poll()
+    assert len(starts) == 4
+    assert len(service.executor.submitted) == 1
+
+    state.collector_job_queue_response = load_json(
+        "collector_jobs_available_empty.json"
+    )
+    future.set_result(Result(results={}, job_id=job_id))
+    service._poll()
+    assert state.collector_job_end_requests == [
+        {"job_id": job_id, "body": {"outcome": "succeeded"}}
+    ]
+    assert service.job_running is service.future is None
+
+
+@pytest.mark.parametrize("status", [404, 409])
+@pytest.mark.parametrize("lost_response_first", [False, True])
+def test_managed_start_rejection_clears_preparation_and_allows_next_job(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch, status, lost_response_first
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    state.collector_job_lost_claim_responses = 0
+    service.managed_job_runner = service._run_prepared_managed_job
+    original = service.client.start_collector_job
+
+    def lost_response(job_id):
+        original(job_id)
+        raise requests.Timeout("raw-provider-secret")
+
+    if lost_response_first:
+        monkeypatch.setattr(service.client, "start_collector_job", lost_response)
+        with pytest.raises(ManagedJobProcessingError):
+            service._poll()
+        assert service._pending_managed_start is not None
+
+    monkeypatch.setattr(service.client, "start_collector_job", original)
+    state.collector_job_start_statuses = [status]
+    with pytest.raises(ManagedJobProcessingError):
+        service._poll()
+
+    assert service._pending_managed_claim is service._pending_managed_start is None
+    assert service.future is service.job_running is service.managed_job_id is None
+    assert service.executor.submitted == []
+    assert len(state.collector_job_queue_requests) == 1
+    assert len(state.collector_job_claim_requests) == 1
+    assert state.collector_job_end_requests == []
+
+    # BHE no longer permits this start; discovery can now select another job.
+    job_b = state.collector_job_queue_response["data"]["jobs"][1]
+    state.collector_job_queue_response["data"]["jobs"] = [job_b]
+    state.collector_job_claim_response.update(id=job_b["id"], status="claimed")
+    state.collector_job_active_id = None
+    service._poll()
+    assert len(state.collector_job_queue_requests) == 2
+    assert service.job_running == job_b["id"]
+    assert len(service.executor.submitted) == 1
+
+
+def test_managed_expired_claim_start_rejection_clears_preparation(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    state.collector_job_lost_claim_responses = 0
+    service.managed_job_runner = service._run_prepared_managed_job
+    original = service.client.start_collector_job
+
+    def unavailable(job_id):
+        raise requests.Timeout("raw-provider-secret")
+
+    monkeypatch.setattr(service.client, "start_collector_job", unavailable)
+    with pytest.raises(ManagedJobProcessingError):
+        service._poll()
+    assert service._pending_managed_start is not None
+
+    state.collector_job_claim_response["claim_expires_at"] = (
+        datetime.now(UTC) - timedelta(seconds=1)
+    ).isoformat()
+    monkeypatch.setattr(service.client, "start_collector_job", original)
+    with pytest.raises(ManagedJobProcessingError):
+        service._poll()
+    assert service._pending_managed_claim is service._pending_managed_start is None
+    assert service.executor.submitted == []
+    assert state.collector_job_end_requests == []
+
+
 @pytest.mark.parametrize(
     "document",
     [
@@ -1767,10 +2079,7 @@ def test_mode_config_routes_scheduler_to_managed_dependency(mock_service, monkey
         collector_name="openhound-faker",
     )
     assert service.managed is True
-    with pytest.raises(
-        ManagedRuntimeUnavailableError, match="Managed collection runtime is required"
-    ):
-        service._poll()
+    assert service.managed_job_runner == service._run_prepared_managed_job
 
 
 def test_runtime_failure_is_sanitized_and_not_reported_as_credential_failure(
@@ -2120,3 +2429,395 @@ def test_support_bundle_tracebacks_keep_aws_auth_errors_redacted(
         assert forbidden not in caplog.text
         assert forbidden not in formatted_error
         assert all(forbidden not in repr(record.__dict__) for record in caplog.records)
+def test_managed_worker_sets_dlt_environment_before_pipeline(monkeypatch, caplog):
+    collector = SimpleNamespace(
+        name="faker",
+        dlt_source=SimpleNamespace(section="source", name="random"),
+        package_version="1.0.0",
+        metadata=None,
+    )
+    worker_environment = {}
+    observed_environment = {}
+    monkeypatch.setattr(
+        scheduler_service.CollectorManager,
+        "from_entrypoint",
+        lambda: SimpleNamespace(collectors=[collector]),
+    )
+    monkeypatch.setattr(
+        scheduler_service, "os", SimpleNamespace(environ=worker_environment)
+    )
+
+    def capture_pipeline(extension):
+        observed_environment.update(worker_environment)
+        return {"collect": []}
+
+    monkeypatch.setattr(scheduler_service.dataflow, "pipeline", capture_pipeline)
+
+    with caplog.at_level(logging.INFO, logger="openhound.scheduler.service"):
+        result = _subprocess_collect(
+            "faker",
+            "collector-job-123",
+            {"node_count": 4, "filters": ["one", "two"]},
+            {"token": "secret-value"},
+        )
+
+    assert result.job_id == "collector-job-123"
+    assert observed_environment == {
+        "SOURCES__SOURCE__RANDOM__NODE_COUNT": "4",
+        "SOURCES__SOURCE__RANDOM__FILTERS": '["one", "two"]',
+        "SOURCES__SOURCE__RANDOM__CREDENTIALS__TOKEN": "secret-value",
+    }
+    assert "secret-value" not in caplog.text
+
+
+def test_managed_environment_requires_a_registered_dlt_source():
+    collector = SimpleNamespace(name="example", dlt_source=None)
+
+    with pytest.raises(ValueError, match="has no registered DLT source"):
+        scheduler_service._set_managed_source_environment(collector, {}, {})
+
+
+def test_managed_worker_registers_real_faker_source_in_a_fresh_process(monkeypatch):
+    monkeypatch.setenv("SOURCES__SOURCE__RANDOM__NODE_COUNT", "999")
+    code = """
+from openhound.scheduler.service import _subprocess_collect, dataflow
+
+def inspect_collection(extension):
+    return {"node_count": len(list(extension.dlt_source()))}
+
+dataflow.pipeline = inspect_collection
+result = _subprocess_collect(
+    "faker", "e0d43dbd-2cdf-4d68-9a81-2f95cd58a92f", {"node_count": 4}, {}
+)
+assert result.results == {"node_count": 4}, result.results
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, timeout=30
+    )
+
+
+class FakeClock:
+    def __init__(self, on_sleep=lambda now: None):
+        self.now = 0
+        self.on_sleep = on_sleep
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        assert seconds > 0
+        self.now += seconds
+        self.on_sleep(self.now)
+
+
+def test_managed_job_uses_shared_poll_loop_without_polling_for_new_jobs(
+    mock_service, mock_bloodhound_api, monkeypatch, caplog
+):
+    future = Future()
+    submitted = []
+
+    def submit(*args):
+        assert mock_bloodhound_api.app.state.collector_job_start_requests == [
+            ("collector-job-123", b"")
+        ]
+        submitted.append(args)
+        return future
+
+    clock = FakeClock()
+    monkeypatch.setattr(mock_service.executor, "submit", submit)
+    monkeypatch.setattr(scheduler_service, "time", clock)
+    monkeypatch.setattr(
+        mock_service,
+        "check_jobs",
+        lambda: pytest.fail("job polling must stop during managed collection"),
+    )
+
+    def fail_unmanaged_checkin(self):
+        pytest.fail("managed jobs must use the heartbeat endpoint")
+
+    monkeypatch.setattr(
+        mock_service.client.__class__,
+        "jobs_current",
+        property(fail_unmanaged_checkin),
+    )
+
+    with caplog.at_level(logging.INFO, logger="openhound.scheduler.service"):
+        mock_service.run_claimed_job(
+            "collector-job-123", {"node_count": 4}, {"token": "secret-value"}
+        )
+        assert mock_service.job_running == "collector-job-123"
+        for now, expected_heartbeats in ((0, 0), (299, 0), (300, 1), (599, 1), (600, 2)):
+            clock.now = now
+            mock_service._poll()
+            assert len(
+                mock_bloodhound_api.app.state.collector_job_heartbeat_requests
+            ) == expected_heartbeats
+        future.set_result(Result(results={"collect": []}, job_id="collector-job-123"))
+        clock.now = 630
+        monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
+        mock_service._poll()
+
+    assert submitted[0][1:] == (
+        "openhound-faker",
+        "collector-job-123",
+        {"node_count": 4},
+        {"token": "secret-value"},
+    )
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == [
+        ("collector-job-123", b"")
+    ]
+    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == [
+        ("collector-job-123", b""),
+        ("collector-job-123", b""),
+    ]
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == [
+        {"job_id": "collector-job-123", "body": {"outcome": "succeeded"}}
+    ]
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert "claimed successfully" not in caplog.text
+    assert "started successfully" in caplog.text
+    assert "heartbeat succeeded" in caplog.text
+    assert "secret-value" not in caplog.text
+
+
+def test_managed_start_failure_does_not_launch_worker(mock_service, monkeypatch):
+    monkeypatch.setattr(
+        mock_service.client,
+        "start_collector_job",
+        lambda job_id: (_ for _ in ()).throw(BloodHoundHTTPError("conflict", 409)),
+    )
+    monkeypatch.setattr(
+        mock_service.executor,
+        "submit",
+        lambda *args: pytest.fail("worker must not launch after start failure"),
+    )
+
+    with pytest.raises(BloodHoundHTTPError) as error:
+        mock_service.run_claimed_job("collector-job-123", {}, {})
+
+    assert error.value.code == 409
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert mock_service.next_heartbeat_at is None
+
+
+@pytest.mark.parametrize(
+    ("job_id", "managed", "message"),
+    [
+        (123, True, "Managed job IDs must be strings"),
+        ("collector-job-123", False, "Unmanaged job IDs must be integers"),
+    ],
+)
+def test_launch_job_rejects_invalid_id_type_before_start(
+    mock_service, mock_bloodhound_api, job_id, managed, message
+):
+    with pytest.raises(TypeError, match=message):
+        mock_service._launch_job(job_id, managed=managed)
+
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == []
+    assert mock_bloodhound_api.app.state.job_started is False
+    assert mock_service.executor.submitted == []
+    assert mock_service.future is mock_service.job_running is None
+
+
+def test_managed_runtime_normalizes_uuid_at_entry(mock_service, mock_bloodhound_api):
+    job_id = UUID("e0d43dbd-2cdf-4d68-9a81-2f95cd58a92f")
+
+    mock_service.run_claimed_job(job_id, {}, {})
+
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == [
+        (str(job_id), b"")
+    ]
+    assert mock_service.job_running == mock_service.managed_job_id == str(job_id)
+    args, _, _ = mock_service.executor.submitted[0]
+    assert args[2] == str(job_id)
+
+
+def test_claimed_job_cannot_start_while_another_job_runs(
+    mock_service, mock_bloodhound_api
+):
+    mock_service.job_running = 123
+    mock_service.future = Future()
+
+    with pytest.raises(RuntimeError, match="Job 123 is already running"):
+        mock_service.run_claimed_job("collector-job-123", {}, {})
+
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == []
+    assert mock_service.job_running == 123
+
+
+def test_transient_managed_heartbeat_failures_keep_collection_running(
+    mock_service, mock_bloodhound_api, monkeypatch, caplog
+):
+    future = Future()
+    attempts = []
+
+    clock = FakeClock()
+    monkeypatch.setattr(mock_service.executor, "submit", lambda *args: future)
+    monkeypatch.setattr(scheduler_service, "time", clock)
+    monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
+
+    def heartbeat(job_id):
+        attempts.append(clock.now)
+        if len(attempts) == 1:
+            raise requests.Timeout("no response")
+        if len(attempts) == 2:
+            raise BloodHoundHTTPError("temporary failure", 503)
+
+    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", heartbeat)
+
+    with caplog.at_level(logging.INFO, logger="openhound.scheduler.service"):
+        mock_service.run_claimed_job("collector-job-123", {}, {})
+        for now in (300, 600, 900):
+            clock.now = now
+            mock_service._poll()
+        future.set_result(Result(results={}, job_id="collector-job-123"))
+        clock.now = 930
+        mock_service._poll()
+
+    assert attempts == [300, 600, 900]
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == [
+        {"job_id": "collector-job-123", "body": {"outcome": "succeeded"}}
+    ]
+    assert caplog.text.count("heartbeat request failed") == 2
+    assert "heartbeat succeeded" in caplog.text
+
+
+@pytest.mark.parametrize("during_shutdown", [False, True], ids=["poll", "shutdown"])
+def test_managed_heartbeat_claim_loss_stops_worker_without_reporting_outcome(
+    mock_service, mock_bloodhound_api, monkeypatch, during_shutdown
+):
+    future = Future()
+    future.set_running_or_notify_cancel()
+    events = []
+    executor = mock_service.executor
+
+    class Worker:
+        def kill(self):
+            events.append("kill")
+            future.set_exception(BrokenProcessPool("worker killed"))
+
+    executor._processes = {123: Worker()}
+    monkeypatch.setattr(executor, "submit", lambda *args: future)
+
+    def shutdown(*, wait, cancel_futures):
+        assert wait is True
+        assert cancel_futures is True
+        events.append("join")
+
+    monkeypatch.setattr(executor, "shutdown", shutdown)
+    clock = FakeClock()
+    monkeypatch.setattr(scheduler_service, "time", clock)
+
+    def lose_claim(job_id):
+        raise BloodHoundHTTPError("claim lost", 404)
+
+    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
+    mock_service.run_claimed_job("collector-job-123", {}, {})
+    clock.now = 300
+    if during_shutdown:
+        mock_service._shutdown()
+    else:
+        mock_service._poll()
+        monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
+        mock_service._poll()
+
+    assert events == ["kill", "join"]
+    assert future.cancelled() is False  # A running future cannot simply be cancelled.
+    assert mock_service.executor is not executor
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert mock_service.next_heartbeat_at is None
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == []
+    assert mock_bloodhound_api.app.state.job_ended is False
+
+
+def test_managed_heartbeat_claim_loss_kills_a_real_running_process(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
+    original_submit = executor.submit
+    mock_service.executor = executor
+    monkeypatch.setattr(
+        executor, "submit", lambda *args: original_submit(time.sleep, 60)
+    )
+
+    def lose_claim(job_id):
+        raise BloodHoundHTTPError("claim lost", 404)
+
+    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
+    try:
+        mock_service.run_claimed_job("collector-job-123", {}, {})
+        future = mock_service.future
+        deadline = time.monotonic() + 10
+        while not future.running() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert future.running()
+        workers = list(executor._processes.values())
+        assert workers and all(worker.is_alive() for worker in workers)
+
+        mock_service.next_heartbeat_at = 0
+        mock_service._poll()
+
+        assert all(not worker.is_alive() for worker in workers)
+        assert future.done()
+        assert mock_service.future is None
+        assert mock_service.executor is not executor
+        assert mock_bloodhound_api.app.state.collector_job_end_requests == []
+    finally:
+        for worker in list((executor._processes or {}).values()):
+            worker.kill()
+        executor.shutdown(wait=True, cancel_futures=True)
+        mock_service.executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_managed_worker_failure_ends_job_failed(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    future = Future()
+    future.set_exception(RuntimeError("worker error"))
+    monkeypatch.setattr(mock_service.executor, "submit", lambda *args: future)
+    monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
+
+    mock_service.run_claimed_job("collector-job-123", {}, {})
+    mock_service._poll()
+
+    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == []
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == [
+        {
+            "job_id": "collector-job-123",
+            "body": {
+                "outcome": "failed",
+                "failure_message": "Unexpected error while running 'openhound-faker' collector",
+            },
+        }
+    ]
+
+
+def test_shutdown_keeps_heartbeating_until_managed_worker_finishes(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    future = Future()
+
+    def finish_worker(now):
+        if now >= 630 and not future.done():
+            future.set_result(Result(results={}, job_id="collector-job-123"))
+
+    clock = FakeClock(finish_worker)
+    monkeypatch.setattr(mock_service.executor, "submit", lambda *args: future)
+    monkeypatch.setattr(scheduler_service, "time", clock)
+
+    mock_service.run_claimed_job("collector-job-123", {}, {})
+    mock_service._shutdown()
+
+    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == [
+        ("collector-job-123", b""),
+        ("collector-job-123", b""),
+    ]
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == [
+        {"job_id": "collector-job-123", "body": {"outcome": "succeeded"}}
+    ]
+    assert mock_service.future is None
