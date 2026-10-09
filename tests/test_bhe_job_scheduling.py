@@ -1836,10 +1836,7 @@ def test_mode_config_routes_scheduler_to_managed_dependency(mock_service, monkey
         collector_name="openhound-faker",
     )
     assert service.managed is True
-    with pytest.raises(
-        ManagedRuntimeUnavailableError, match="Managed collection runtime is required"
-    ):
-        service._poll()
+    assert service.managed_job_runner == service._run_prepared_managed_job
 
 
 def test_runtime_failure_is_sanitized_and_not_reported_as_credential_failure(
