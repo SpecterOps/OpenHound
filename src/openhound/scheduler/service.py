@@ -1,5 +1,7 @@
+import json
 import logging
 import math
+import os
 import signal
 import time
 from collections.abc import Callable
@@ -35,11 +37,11 @@ from openhound.scheduler import dataflow
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 30  # seconds; fixed poll/check-in cadence, must remain below BHE's 600s client-checkin timeout
+HEARTBEAT_INTERVAL = 300  # seconds; BHE expires managed jobs after 15 minutes without a heartbeat
 
 
 class ExtensionNotFoundError(Exception):
     """Raised when the configured collector extension cannot be found."""
-
 
 class ManagedRuntimeUnavailableError(RuntimeError):
     """Managed scheduling requires a configured collection runtime."""
@@ -83,14 +85,41 @@ def _usable_credential_value(value: Any) -> bool:
         return math.isfinite(value)
     return False
 
-
 @dataclass
 class Result:
     results: dict
-    job_id: int
+    job_id: int | str
 
 
-def _subprocess_collect(collector_name: str, job_id: int) -> Result:
+def _set_managed_source_environment(
+    collector, params: dict[str, Any], secrets: dict[str, Any]
+) -> None:
+    """Provide one managed job's validated values to its DLT source."""
+    source = collector.dlt_source
+    if source is None:
+        raise ValueError(f"Collector '{collector.name}' has no registered DLT source")
+
+    section = source.section or source.__module__.rsplit(".", 1)[-1]
+    source_name = source.name or source.__name__
+    prefix = f"SOURCES__{section.upper()}__{source_name.upper()}"
+    for name, value in params.items():
+        if name.lower() == "credentials":
+            raise ValueError("Managed job parameters cannot contain credentials")
+        os.environ[f"{prefix}__{name.upper()}"] = (
+            value if isinstance(value, str) else json.dumps(value)
+        )
+    for name, value in secrets.items():
+        os.environ[f"{prefix}__CREDENTIALS__{name.upper()}"] = (
+            value if isinstance(value, str) else json.dumps(value)
+        )
+
+
+def _subprocess_collect(
+    collector_name: str,
+    job_id: int | str,
+    params: dict[str, Any] | None = None,
+    secrets: dict[str, Any] | None = None,
+) -> Result:
     """A subprocess which runs the DLT pipeline for the specified collector.
 
     Loads the collector by name from Python entrypoints.
@@ -109,9 +138,9 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
-        if (
-            collector.name == collector_name
-        ):  # pyright: ignore[reportAttributeAccessIssue]
+        if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
+            if params is not None or secrets is not None:
+                _set_managed_source_environment(collector, params or {}, secrets or {})
             log_fields = {
                 "collector_extension": collector.name,
                 "collector_extension_version": (
@@ -187,8 +216,11 @@ class Service:
         self._pending_managed_claim: str | None = None
         self._pending_managed_failure: str | None = None
 
-        # Stores the ID of currently running BHE job
-        self.job_running: int | None = None
+        # Stores the ID of the currently running BHE job.
+        # MVP runs one job at a time.
+        self.job_running: int | str | None = None
+        self.managed_job_id: str | None = None
+        self.next_heartbeat_at: float | None = None
 
         # Futures/results from the subprocess executor
         self.future: Future[Result] | None = None
@@ -203,10 +235,27 @@ class Service:
         logger.warning(f"Received signal {sig}, shutting down gracefully.")
 
     def _shutdown(self) -> None:
-        """Shut down the executor and wait for running tasks to finish. Executed when the service is shut down."""
+        """Finish the active job and keep checking in until its worker stops."""
         logger.info("Collection service stopping.")
+        while self.future is not None and not self.future.done():
+            self._poll_running_job()
+            time.sleep(self.interval)
+        if self.future is not None:
+            try:
+                self._handle_completed_job(self.future)
+            except Exception:
+                logger.exception(
+                    "Unexpected error handling completed job during shutdown."
+                )
+                self._clear_running_job()
         self.executor.shutdown(wait=True, cancel_futures=True)
         logger.info("Collection service stopped.")
+
+    def _clear_running_job(self) -> None:
+        self.future = None
+        self.job_running = None
+        self.managed_job_id = None
+        self.next_heartbeat_at = None
 
     def _reset_executor(self) -> None:
         """Tear down and recreate the process pool after it has entered a broken state."""
@@ -427,76 +476,155 @@ class Service:
                     )
 
     def _start_job(self, job: Job) -> None:
-        """Starts a BloodHound enterprise job by ID and runs the collection process in a subprocess. The results are then used to end the job in BHE with a complete status.
-        this function returns no value but updates the self.futures list with the future of the subprocess and sets the currently running job ID in self.job_running
+        """Start an unmanaged job using the shared worker lifecycle."""
+        self._launch_job(job.id)
 
-        Args:
-            job (Job): The job to start as a Job object.
-        """
+    def run_claimed_job(
+        self, job_id: str, params: dict[str, Any], secrets: dict[str, Any]
+    ) -> None:
+        """Start a validated managed job; the scheduler polls it until completion."""
+        job_id = str(job_id)
+        self._launch_job(job_id, params=params, secrets=secrets, managed=True)
 
-        logger.info(f"Starting job {job.id} with collector '{self.collector_name}'")
-        self.client.start_job(job.id)
-        self.job_running = job.id
+    def _launch_job(
+        self,
+        job_id: int | str,
+        *,
+        params: dict[str, Any] | None = None,
+        secrets: dict[str, Any] | None = None,
+        managed: bool = False,
+    ) -> None:
+        """Notify BHE and submit one collector worker."""
+        if self.job_running is not None:
+            raise RuntimeError(f"Job {self.job_running} is already running")
+
+        logger.info("Starting job %s with collector '%s'.", job_id, self.collector_name)
+        if managed:
+            self.client.start_collector_job(str(job_id))
+        else:
+            assert isinstance(job_id, int)
+            self.client.start_job(job_id)
+
+        if managed:
+            logger.info("Managed collector job %s started successfully.", job_id)
+        self.job_running = job_id
+        self.managed_job_id = str(job_id) if managed else None
+        self.next_heartbeat_at = (
+            time.monotonic() + HEARTBEAT_INTERVAL if managed else None
+        )
         try:
             self.future = self.executor.submit(
-                _subprocess_collect, self.collector_name, job.id
+                _subprocess_collect,
+                self.collector_name,
+                job_id,
+                dict(params or {}) if managed else None,
+                dict(secrets or {}) if managed else None,
             )
         except BrokenProcessPool:
-            logger.exception(
-                f"Failed to submit job {job.id}: process pool is broken, resetting."
-            )
-            self.future = None
-            self.job_running = None
+            logger.exception("Failed to submit job %s: process pool is broken.", job_id)
             self._reset_executor()
-            self.client.end_job(
-                JobStatus.FAILED,
-                f"Failed to start collector '{self.collector_name}': worker pool was broken",
+            try:
+                self._end_job(
+                    JobStatus.FAILED,
+                    f"Failed to start collector '{self.collector_name}': worker pool was broken",
+                )
+            finally:
+                self._clear_running_job()
+        except Exception as error:
+            logger.error(
+                "Failed to submit job %s.",
+                job_id,
+                extra={"job_id": job_id, "error_type": type(error).__name__},
             )
+            try:
+                self._end_job(
+                    JobStatus.FAILED,
+                    f"Failed to start collector '{self.collector_name}'",
+                )
+            finally:
+                self._clear_running_job()
+            raise
+
+    def _end_job(self, status: JobStatus, message: str) -> None:
+        if self.managed_job_id is not None:
+            self.client.end_managed_job(
+                self.managed_job_id,
+                (
+                    ManagedJobOutcome.SUCCEEDED
+                    if status is JobStatus.COMPLETE
+                    else ManagedJobOutcome.FAILED
+                ),
+                failure_message=message if status is JobStatus.FAILED else None,
+            )
+        else:
+            self.client.end_job(status, message)
+
+    def _send_managed_heartbeat(self, job_id: str) -> None:
+        try:
+            self.client.heartbeat_collector_job(job_id)
+        except Exception as error:  # noqa: BLE001 - failed heartbeats must not stop collection
+            logger.info(
+                "Managed collector job %s heartbeat request failed.",
+                job_id,
+                extra={
+                    "job_id": job_id,
+                    "error_type": type(error).__name__,
+                    "status_code": (
+                        error.code if isinstance(error, BloodHoundHTTPError) else None
+                    ),
+                },
+            )
+        else:
+            logger.info("Managed collector job %s heartbeat succeeded.", job_id)
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
-        """Handles completion of a job and reports success or failure to BloodHound Enterprise
-
-        Args:
-            future (Future[Result]): Future containing the result of the collection subprocess, including the job ID.
-        """
+        """Report the completed worker's outcome through the active job API."""
         try:
             result = future.result()
-
+            logger.info(f"Job {result.job_id} completed successfully, notifying BHE.")
         except ExtensionNotFoundError:
             logger.error(
                 f"Collector '{self.collector_name}' not found. Marking job as failed."
             )
-            self.client.end_job(
-                JobStatus.FAILED,
-                f"Collector '{self.collector_name}' not found",
-            )
-
+            status = JobStatus.FAILED
+            message = f"Collector '{self.collector_name}' not found"
         except BrokenProcessPool:
             logger.exception(
                 "Collection worker was terminated abruptly; resetting process pool."
             )
             self._reset_executor()
-            self.client.end_job(
-                JobStatus.FAILED,
-                f"Collection worker for '{self.collector_name}' was terminated abruptly",
+            status = JobStatus.FAILED
+            message = (
+                f"Collection worker for '{self.collector_name}' was terminated abruptly"
             )
-
-        except Exception:
-            logger.exception("Collection subprocess failed.")
-            self.client.end_job(
-                JobStatus.FAILED,
-                f"Unexpected error while running '{self.collector_name}' collector",
+        except Exception as error:  # noqa: BLE001 - any worker error must end the job
+            logger.error(
+                "Collection subprocess failed.",
+                extra={"error_type": type(error).__name__},
             )
-
+            status = JobStatus.FAILED
+            message = (
+                f"Unexpected error while running '{self.collector_name}' collector"
+            )
         else:
-            logger.info(f"Job {result.job_id} completed successfully, notifying BHE.")
-            self.client.end_job(
-                JobStatus.COMPLETE,
-                f"Collector '{self.collector_name}' completed successfully",
-            )
+            status = JobStatus.COMPLETE
+            message = f"Collector '{self.collector_name}' completed successfully"
+        self._end_job(status, message)
+        self._clear_running_job()
 
-        self.future = None
-        self.job_running = None
+    def _poll_running_job(self) -> None:
+        if self.managed_job_id is not None:
+            if (
+                self.next_heartbeat_at is not None
+                and time.monotonic() >= self.next_heartbeat_at
+            ):
+                self._send_managed_heartbeat(self.managed_job_id)
+                self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
+        else:
+            try:
+                _ = self.client.jobs_current
+            except Exception:
+                logger.exception("Error checking in-progress job.")
 
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
@@ -531,10 +659,7 @@ class Service:
             except Exception:
                 logger.exception("Error checking for or starting jobs.")
         else:
-            try:
-                _ = self.client.jobs_current
-            except Exception:
-                logger.exception("Error checking in-progress job.")
+            self._poll_running_job()
 
     def start(self) -> None:
         """Start method to initiate the process of checking for jobs and running them. This method will run indefinitely until an exit signal is received"""
