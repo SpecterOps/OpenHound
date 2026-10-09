@@ -233,6 +233,7 @@ class Service:
         self.secrets_manager = secrets_manager or AWSSecretsManager()
         self.managed_job_runner = managed_job_runner or self._run_prepared_managed_job
         self._pending_managed_claim: str | None = None
+        self._pending_managed_start: PreparedManagedJob | None = None
         self._pending_managed_failure: str | None = None
 
         # Stores the ID of the currently running BHE job.
@@ -407,9 +408,13 @@ class Service:
 
         # Secret retrieval may have consumed the remaining lease time.
         self._validate_managed_claim(job, job_id)
-        self._pending_managed_claim = None
         logger.info("Credential retrieval valid", extra=context)
         return PreparedManagedJob(job=job, credentials=credentials)
+
+    def _clear_pending_managed_start(self) -> None:
+        """Discard preparation state once start is confirmed or rejected."""
+        self._pending_managed_claim = None
+        self._pending_managed_start = None
 
     def _require_managed_runtime(self) -> Callable[[PreparedManagedJob], None]:
         if self.managed_job_runner is None:
@@ -427,15 +432,22 @@ class Service:
             if self._pending_managed_failure is not None:
                 self._report_managed_credential_failure(self._pending_managed_failure)
                 return
-            job_id = self._pending_managed_claim
-            if job_id is None:
-                available_job = self.check_managed_collector_jobs()
-                if available_job is None:
-                    return
-                job_id = str(available_job.id)
-            prepared = self._claim_and_validate_managed_job(job_id)
+            prepared = self._pending_managed_start
+            if prepared is None:
+                job_id = self._pending_managed_claim
+                if job_id is None:
+                    available_job = self.check_managed_collector_jobs()
+                    if available_job is None:
+                        return
+                    job_id = str(available_job.id)
+                prepared = self._claim_and_validate_managed_job(job_id)
+                # Keep validated inputs in memory across ambiguous start failures.
+                # Repeating BHE's idempotent start also reconciles a job that is
+                # already running remotely; re-claiming it would return 409.
+                self._pending_managed_start = prepared
             if prepared is not None:
                 runner(prepared)
+                self._clear_pending_managed_start()
         except Exception:  # noqa: BLE001 - redact managed runtime errors
             raise ManagedJobProcessingError(
                 "Managed collector job processing failed"
@@ -527,7 +539,14 @@ class Service:
         if managed:
             if not isinstance(job_id, str):
                 raise TypeError("Managed job IDs must be strings")
+            try:
+                self.client.start_collector_job(job_id)
+            except BloodHoundHTTPError as error:
+                if error.code in (404, 409):
+                    self._clear_pending_managed_start()
+                raise
             managed_job_id = job_id
+            self._clear_pending_managed_start()
         else:
             if not isinstance(job_id, int):
                 raise TypeError("Unmanaged job IDs must be integers")
@@ -697,6 +716,7 @@ class Service:
         idle = (
             self.job_running is None
             and self._pending_managed_claim is None
+            and self._pending_managed_start is None
             and self._pending_managed_failure is None
         )
         if idle and self._poll_management():
