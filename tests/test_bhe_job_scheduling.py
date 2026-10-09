@@ -2411,6 +2411,38 @@ def test_managed_start_failure_does_not_launch_worker(mock_service, monkeypatch)
     assert mock_service.next_heartbeat_at is None
 
 
+@pytest.mark.parametrize(
+    ("job_id", "managed", "message"),
+    [
+        (123, True, "Managed job IDs must be strings"),
+        ("collector-job-123", False, "Unmanaged job IDs must be integers"),
+    ],
+)
+def test_launch_job_rejects_invalid_id_type_before_start(
+    mock_service, mock_bloodhound_api, job_id, managed, message
+):
+    with pytest.raises(TypeError, match=message):
+        mock_service._launch_job(job_id, managed=managed)
+
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == []
+    assert mock_bloodhound_api.app.state.job_started is False
+    assert mock_service.executor.submitted == []
+    assert mock_service.future is mock_service.job_running is None
+
+
+def test_managed_runtime_normalizes_uuid_at_entry(mock_service, mock_bloodhound_api):
+    job_id = UUID("e0d43dbd-2cdf-4d68-9a81-2f95cd58a92f")
+
+    mock_service.run_claimed_job(job_id, {}, {})
+
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == [
+        (str(job_id), b"")
+    ]
+    assert mock_service.job_running == mock_service.managed_job_id == str(job_id)
+    args, _, _ = mock_service.executor.submitted[0]
+    assert args[2] == str(job_id)
+
+
 def test_claimed_job_cannot_start_while_another_job_runs(
     mock_service, mock_bloodhound_api
 ):
