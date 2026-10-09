@@ -604,14 +604,19 @@ class Service:
         logger.warning(
             "Managed collector job %s claim lost; stopping collection.", job_id
         )
-        # Python 3.13 has no public pool termination API, and Future.cancel()
-        # cannot stop running work. Join the killed worker before accepting jobs.
         processes = list((self.executor._processes or {}).values())
-        for process in processes:
-            process.kill()
-        self.executor.shutdown(wait=True, cancel_futures=True)
-        self._clear_running_job()
-        self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
+        try:
+            for process in processes:
+                try:
+                    process.kill()
+                except OSError:
+                    logger.exception("Unable to kill worker process.")
+            self.executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            logger.exception("Error shutting down executor after claim loss.")
+        finally:
+            self._clear_running_job()
+            self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
         """Report the completed worker's outcome through the active job API."""
