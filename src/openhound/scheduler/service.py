@@ -230,7 +230,7 @@ class Service:
         # Managed collection settings and recovery state
         self.managed = is_managed() if managed is None else managed
         self.secrets_manager = secrets_manager or AWSSecretsManager()
-        self.managed_job_runner = managed_job_runner
+        self.managed_job_runner = managed_job_runner or self._run_prepared_managed_job
         self._pending_managed_claim: str | None = None
         self._pending_managed_failure: str | None = None
 
@@ -416,6 +416,11 @@ class Service:
                 "Managed collection runtime is required for managed scheduling"
             )
         return self.managed_job_runner
+
+    def _run_prepared_managed_job(self, prepared: PreparedManagedJob) -> None:
+        self.run_claimed_job(
+            str(prepared.job.id), prepared.job.params, prepared.credentials
+        )
 
     def _poll_managed_jobs(self) -> None:
         runner = self._require_managed_runtime()
