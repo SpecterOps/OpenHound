@@ -695,7 +695,10 @@ class Service:
             return
 
         if self.managed:
-            self._poll_managed_jobs()
+            if self.job_running is None:
+                self._poll_managed_jobs()
+            else:
+                self._poll_running_job()
             return
 
         if self.job_running is None:
