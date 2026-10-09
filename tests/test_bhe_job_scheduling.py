@@ -3,8 +3,11 @@ import gzip
 import hashlib
 import json
 import logging
+import subprocess
+import sys
+import time
 import traceback
-from concurrent.futures import Future
+from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -306,6 +309,7 @@ def mock_service(mock_bloodhound_api, monkeypatch):
     class DummyExecutor:
         def __init__(self, *args, **kwargs):
             self.submitted = []
+            self._processes = {}
 
         def submit(self, *args, **kwargs):
             future = Future()
@@ -2233,6 +2237,25 @@ def test_managed_environment_requires_a_registered_dlt_source():
         scheduler_service._set_managed_source_environment(collector, {}, {})
 
 
+def test_managed_worker_registers_real_faker_source_in_a_fresh_process(monkeypatch):
+    monkeypatch.setenv("SOURCES__SOURCE__RANDOM__NODE_COUNT", "999")
+    code = """
+from openhound.scheduler.service import _subprocess_collect, dataflow
+
+def inspect_collection(extension):
+    return {"node_count": len(list(extension.dlt_source()))}
+
+dataflow.pipeline = inspect_collection
+result = _subprocess_collect(
+    "faker", "e0d43dbd-2cdf-4d68-9a81-2f95cd58a92f", {"node_count": 4}, {}
+)
+assert result.results == {"node_count": 4}, result.results
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, timeout=30
+    )
+
+
 class FakeClock:
     def __init__(self, on_sleep=lambda now: None):
         self.now = 0
@@ -2353,7 +2376,7 @@ def test_claimed_job_cannot_start_while_another_job_runs(
     assert mock_service.job_running == 123
 
 
-def test_managed_heartbeat_failures_keep_collection_running(
+def test_transient_managed_heartbeat_failures_keep_collection_running(
     mock_service, mock_bloodhound_api, monkeypatch, caplog
 ):
     future = Future()
@@ -2369,7 +2392,7 @@ def test_managed_heartbeat_failures_keep_collection_running(
         if len(attempts) == 1:
             raise requests.Timeout("no response")
         if len(attempts) == 2:
-            raise BloodHoundHTTPError("claim lost", 404)
+            raise BloodHoundHTTPError("temporary failure", 503)
 
     monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", heartbeat)
 
@@ -2388,6 +2411,95 @@ def test_managed_heartbeat_failures_keep_collection_running(
     ]
     assert caplog.text.count("heartbeat request failed") == 2
     assert "heartbeat succeeded" in caplog.text
+
+
+@pytest.mark.parametrize("during_shutdown", [False, True], ids=["poll", "shutdown"])
+def test_managed_heartbeat_claim_loss_stops_worker_without_reporting_outcome(
+    mock_service, mock_bloodhound_api, monkeypatch, during_shutdown
+):
+    future = Future()
+    future.set_running_or_notify_cancel()
+    events = []
+    executor = mock_service.executor
+
+    class Worker:
+        def kill(self):
+            events.append("kill")
+            future.set_exception(BrokenProcessPool("worker killed"))
+
+    executor._processes = {123: Worker()}
+    monkeypatch.setattr(executor, "submit", lambda *args: future)
+
+    def shutdown(*, wait, cancel_futures):
+        assert wait is True
+        assert cancel_futures is True
+        events.append("join")
+
+    monkeypatch.setattr(executor, "shutdown", shutdown)
+    clock = FakeClock()
+    monkeypatch.setattr(scheduler_service, "time", clock)
+
+    def lose_claim(job_id):
+        raise BloodHoundHTTPError("claim lost", 404)
+
+    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
+    mock_service.run_claimed_job("collector-job-123", {}, {})
+    clock.now = 300
+    if during_shutdown:
+        mock_service._shutdown()
+    else:
+        mock_service._poll()
+        monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
+        mock_service._poll()
+
+    assert events == ["kill", "join"]
+    assert future.cancelled() is False  # A running future cannot simply be cancelled.
+    assert mock_service.executor is not executor
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert mock_service.next_heartbeat_at is None
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == []
+    assert mock_bloodhound_api.app.state.job_ended is False
+
+
+def test_managed_heartbeat_claim_loss_kills_a_real_running_process(
+    mock_service, mock_bloodhound_api, monkeypatch
+):
+    executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
+    original_submit = executor.submit
+    mock_service.executor = executor
+    monkeypatch.setattr(
+        executor, "submit", lambda *args: original_submit(time.sleep, 60)
+    )
+
+    def lose_claim(job_id):
+        raise BloodHoundHTTPError("claim lost", 404)
+
+    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
+    try:
+        mock_service.run_claimed_job("collector-job-123", {}, {})
+        future = mock_service.future
+        deadline = time.monotonic() + 10
+        while not future.running() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert future.running()
+        workers = list(executor._processes.values())
+        assert workers and all(worker.is_alive() for worker in workers)
+
+        mock_service.next_heartbeat_at = 0
+        mock_service._poll()
+
+        assert all(not worker.is_alive() for worker in workers)
+        assert future.done()
+        assert mock_service.future is None
+        assert mock_service.executor is not executor
+        assert mock_bloodhound_api.app.state.collector_job_end_requests == []
+    finally:
+        for worker in list((executor._processes or {}).values()):
+            worker.kill()
+        executor.shutdown(wait=True, cancel_futures=True)
+        mock_service.executor.shutdown(wait=True, cancel_futures=True)
 
 
 def test_managed_worker_failure_ends_job_failed(
