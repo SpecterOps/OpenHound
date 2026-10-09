@@ -46,6 +46,8 @@ MANAGED_JOB_END_MAX_ATTEMPTS = 4
 MANAGED_JOB_END_RETRY_DELAY_SECONDS = 2
 MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_JOB_END_READ_TIMEOUT_SECONDS = 120
+MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS = 10
+MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS = 20
 SUPPORT_BUNDLE_PART_SIZE = 8 * 1024 * 1024  # 8 MiB
 SUPPORT_BUNDLE_MAX_RETRIES = 3
 SUPPORT_BUNDLE_RETRY_DELAY_SECONDS = 2
@@ -220,6 +222,28 @@ class BloodHoundEnterprise(BloodHound):
         job_content = json.dumps(payload)
         response = self.request(method="POST", path=path, body=job_content.encode())
         return JobsEnd.model_validate(response.json())
+
+    def start_collector_job(self, job_id: str) -> None:
+        """Move a claimed managed collector job to running."""
+        self.request(
+            method="POST",
+            path=f"/api/v2/collector-job-queue/{job_id}/start",
+            timeout=(
+                MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
+                MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
+            ),
+        )
+
+    def heartbeat_collector_job(self, job_id: str) -> None:
+        """Renew the claim for a running managed collector job."""
+        self.request(
+            method="POST",
+            path=f"/api/v2/collector-job-queue/{job_id}/heartbeat",
+            timeout=(
+                MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
+                MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
+            ),
+        )
 
     def end_managed_job(
         self,

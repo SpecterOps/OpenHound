@@ -79,6 +79,8 @@ def mock_bloodhound_api():
         "collector_jobs_available_with_job.json"
     )["data"]["jobs"][0]
     app.state.managed_events = []
+    app.state.collector_job_start_requests = []
+    app.state.collector_job_heartbeat_requests = []
     app.state.start_payload = None
     app.state.jobs_available_requests = 0
     app.state.jobs_current_requests = 0
@@ -177,6 +179,18 @@ def mock_bloodhound_api():
         return Response(
             "raw-provider-secret" if status != 200 else "", status_code=status
         )
+
+    @app.post("/api/v2/collector-job-queue/{job_id}/start")
+    async def start_collector_job(job_id: str, request: Request):
+        app.state.collector_job_start_requests.append((job_id, await request.body()))
+        return Response(status_code=200)
+
+    @app.post("/api/v2/collector-job-queue/{job_id}/heartbeat")
+    async def heartbeat_collector_job(job_id: str, request: Request):
+        app.state.collector_job_heartbeat_requests.append(
+            (job_id, await request.body())
+        )
+        return Response(status_code=200)
 
     @app.post("/api/v2/ingest")
     async def ingest(request: Request):
@@ -538,6 +552,42 @@ def test_end_managed_job_sends_managed_outcome(
     assert mock_bloodhound_api.app.state.collector_job_end_requests == [
         {"job_id": "collector-job-123", "body": expected_body}
     ]
+
+
+def test_start_and_heartbeat_collector_job_use_bodyless_requests(
+    mock_service, mock_bloodhound_api
+):
+    job_id = "e0d43dbd-2cdf-4d68-9a81-2f95cd58a92f"
+    mock_service.client.start_collector_job(job_id)
+    mock_service.client.heartbeat_collector_job(job_id)
+
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == [
+        (job_id, b"")
+    ]
+    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == [
+        (job_id, b"")
+    ]
+
+
+def test_start_and_heartbeat_collector_job_use_bounded_timeouts(
+    mock_service, monkeypatch
+):
+    requests_sent = []
+    monkeypatch.setattr(
+        mock_service.client,
+        "request",
+        lambda *args, **kwargs: requests_sent.append(kwargs),
+    )
+
+    mock_service.client.start_collector_job("collector-job-123")
+    mock_service.client.heartbeat_collector_job("collector-job-123")
+
+    assert [request["timeout"] for request in requests_sent] == [
+        (
+            bloodhound_enterprise.MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
+            bloodhound_enterprise.MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
+        )
+    ] * 2
 
 
 def test_end_managed_job_uses_bounded_timeouts(mock_service, monkeypatch):
