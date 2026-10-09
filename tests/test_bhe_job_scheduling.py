@@ -1035,8 +1035,16 @@ def test_checkin_swallows_exception(mock_service, monkeypatch):
     mock_service._poll()
 
 
-def test_scheduler_ingest_opengraph(mock_service, mock_bloodhound_api, monkeypatch):
+def test_scheduler_ingest_opengraph(
+    mock_service, mock_bloodhound_api, monkeypatch, tmp_path
+):
     """Run the DLT pipeline with the openhound-faker collector + check the amount of ingested nodes + edges"""
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / ".dlt"))
+    monkeypatch.setattr(
+        scheduler_service.dataflow,
+        "Path",
+        lambda value: tmp_path if value == "/tmp/openhound" else Path(value),
+    )
     monkeypatch.setenv(
         "DESTINATION__BLOODHOUNDENTERPRISE__URL", "http://localhost:8000"
     )
