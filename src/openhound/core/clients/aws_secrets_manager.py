@@ -348,14 +348,16 @@ def _classify_aws_error(
         location += f" in {region}"
     if isinstance(error, RuntimeError):
         # Botocore uses a plain RuntimeError for this credential refresh failure.
-        # Leave unrelated runtime errors to the caller's safe fallback handling.
         expired_refresh_message = "Credentials were refreshed, but the refreshed credentials are still expired."
         if str(error) == expired_refresh_message:
             return AWSConfigurationError(
                 f"{expired_refresh_message} Check the credential provider and system clock.",
                 **context,
             )
-        raise error
+        return SecretRequestError(
+            f"AWS secret retrieval failed ({type(error).__name__})",
+            **context,
+        )
     if isinstance(error, (FileNotFoundError, PermissionError)):
         reason = error.strerror or (
             "File not found"

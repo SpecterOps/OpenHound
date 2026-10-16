@@ -627,6 +627,28 @@ def test_sts_failure_retains_actual_operation_and_metadata(
     assert all(record.exc_info is None for record in caplog.records)
 
 
+@pytest.mark.parametrize("batch", [False, True])
+def test_unrelated_runtime_errors_are_classified_without_provider_output(caplog, batch):
+    error = RuntimeError(SECRET_VALUE)
+    client = FakeSecretsManagerClient(get_error=error, batch_responses=[error])
+    manager = AWSSecretsManager(client)
+    with caplog.at_level(logging.DEBUG):
+        if batch:
+            with pytest.raises(SecretBatchError) as raised:
+                manager.get_secrets([SECRET_ID])
+            failure = raised.value.failures[SECRET_ID]
+        else:
+            with pytest.raises(SecretRequestError) as raised:
+                manager.get_secret(SECRET_ID)
+            failure = raised.value
+
+    assert isinstance(failure, SecretRequestError)
+    assert str(failure) == "AWS secret retrieval failed (RuntimeError)"
+    assert failure.context["sdk_exception_type"] == "RuntimeError"
+    assert SECRET_VALUE not in "".join(traceback.format_exception(raised.value))
+    assert_safe_logs(caplog, {SECRET_VALUE})
+
+
 @pytest.mark.parametrize(
     "code,expected_type",
     [

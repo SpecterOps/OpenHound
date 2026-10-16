@@ -1895,7 +1895,7 @@ def test_missing_managed_secret_reference_fails_without_local_fallback(
         ),
         (
             RuntimeError("private-credential-value"),
-            "Credential secret retrieval failed",
+            "AWS secret retrieval failed",
         ),
     ],
     ids=["aws-permission-error", "aws-missing-secret", "unexpected-reader-error"],
