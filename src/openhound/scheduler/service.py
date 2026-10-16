@@ -17,7 +17,10 @@ from uuid import UUID
 import openhound
 import openhound.core.logging as openhound_logging
 from openhound.config import is_managed
-from openhound.core.clients.aws_secrets_manager import AWSSecretsManager
+from openhound.core.clients.aws_secrets_manager import (
+    AWSSecretsManager,
+    SecretRetrievalError,
+)
 from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound import BloodHoundHTTPError
 from openhound.core.clients.bloodhound_enterprise import (
@@ -63,6 +66,10 @@ class ManagedRuntimeUnavailableError(RuntimeError):
 
 class CredentialValidationError(ValueError):
     """A managed job's required credential document could not be loaded."""
+
+    def __init__(self, message: str, summary: str = "Credential document is invalid"):
+        super().__init__(message)
+        self.summary = summary
 
 
 class ManagedJobProcessingError(RuntimeError):
@@ -238,6 +245,7 @@ class Service:
         self._pending_managed_claim: str | None = None
         self._pending_managed_start: PreparedManagedJob | None = None
         self._pending_managed_failure: str | None = None
+        self._pending_managed_failure_summary = "Credential document is invalid"
 
         # Stores the ID of the currently running BHE job.
         # MVP runs one job at a time.
@@ -332,14 +340,16 @@ class Service:
         self.client.end_managed_job(
             job_id,
             ManagedJobOutcome.FAILED,
-            failure_message="Credential validation failed",
+            failure_message=self._pending_managed_failure_summary,
         )
         self._pending_managed_failure = None
 
     def _load_managed_credentials(self, job: CollectorJob) -> dict[str, Any]:
         """Retrieve and validate credentials, exposing only a safe failure message."""
         if job.secret_key_id is None or not job.secret_key_id.strip():
-            raise CredentialValidationError("Credential validation failed")
+            raise CredentialValidationError(
+                "Managed job has no credential secret identifier"
+            )
 
         logger.debug(
             "Retrieving managed collector credentials.",
@@ -353,9 +363,16 @@ class Service:
             credentials = self.secrets_manager.get_secret(job.secret_key_id)
             if isinstance(credentials, dict) and _usable_credential_value(credentials):
                 return credentials
-        except Exception:  # noqa: BLE001 - redact secret reader and validation errors
-            raise CredentialValidationError("Credential validation failed") from None
-        raise CredentialValidationError("Credential validation failed")
+        except SecretRetrievalError as error:
+            raise CredentialValidationError(str(error), error.failure_summary) from None
+        except Exception as error:  # noqa: BLE001 - unexpected readers can expose payloads
+            raise CredentialValidationError(
+                f"Credential secret reader failed ({type(error).__name__})",
+                "Credential secret retrieval failed",
+            ) from None
+        raise CredentialValidationError(
+            "Credential document must be a non-empty JSON object with usable values"
+        )
 
     def _validate_managed_claim(self, job: CollectorJob, job_id: str) -> None:
         """Check the job identity and lease confirmed by BHE's claim response."""
@@ -403,9 +420,15 @@ class Service:
         logger.info("Job successfully picked up", extra=context)
         try:
             credentials = self._load_managed_credentials(job)
-        except CredentialValidationError:
-            logger.error("Credential validation failed", extra=context)
+        except CredentialValidationError as error:
+            logger.error(
+                "Cannot prepare managed job %s: %s. Reporting this job failed.",
+                job_id,
+                str(error).rstrip("."),
+                extra={**context, "secret_id": job.secret_key_id},
+            )
             self._pending_managed_claim = None
+            self._pending_managed_failure_summary = error.summary
             self._report_managed_credential_failure(str(job.id))
             return None
 
@@ -772,7 +795,8 @@ class Service:
                         )
                     except ManagedJobProcessingError:
                         logger.error(
-                            "Managed scheduler poll failed; retrying next poll."
+                            "Managed scheduler poll failed; retrying next poll in %s seconds.",
+                            self.interval,
                         )
                 else:
                     self._poll()
