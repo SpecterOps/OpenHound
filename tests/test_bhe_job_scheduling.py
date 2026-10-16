@@ -588,9 +588,7 @@ def test_start_and_heartbeat_collector_job_use_bodyless_requests(
     mock_service.client.start_collector_job(job_id)
     mock_service.client.heartbeat_collector_job(job_id)
 
-    assert mock_bloodhound_api.app.state.collector_job_start_requests == [
-        (job_id, b"")
-    ]
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == [(job_id, b"")]
     assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == [
         (job_id, b"")
     ]
@@ -1618,7 +1616,7 @@ def test_managed_poll_starts_claimed_job_and_tracks_worker(
     service._poll()
     assert len(state.collector_job_claim_requests) == 1
     assert len(state.collector_job_queue_requests) == 1
-    assert state.collector_job_heartbeat_requests == [(job_id, b"")]
+    assert state.collector_job_heartbeat_requests == []
 
     state.collector_job_queue_response = load_json(
         "collector_jobs_available_empty.json"
@@ -1731,7 +1729,11 @@ def test_managed_start_failure_retries_prepared_job_before_discovery(
 @pytest.mark.parametrize("status", [404, 409])
 @pytest.mark.parametrize("lost_response_first", [False, True])
 def test_managed_start_rejection_clears_preparation_and_allows_next_job(
-    stateful_managed_service, mock_bloodhound_api, monkeypatch, status, lost_response_first
+    stateful_managed_service,
+    mock_bloodhound_api,
+    monkeypatch,
+    status,
+    lost_response_first,
 ):
     service = stateful_managed_service
     state = mock_bloodhound_api.app.state
@@ -2429,6 +2431,8 @@ def test_support_bundle_tracebacks_keep_aws_auth_errors_redacted(
         assert forbidden not in caplog.text
         assert forbidden not in formatted_error
         assert all(forbidden not in repr(record.__dict__) for record in caplog.records)
+
+
 def test_managed_worker_sets_dlt_environment_before_pipeline(monkeypatch, caplog):
     collector = SimpleNamespace(
         name="faker",
@@ -2510,6 +2514,13 @@ class FakeClock:
         self.on_sleep(self.now)
 
 
+@pytest.fixture
+def enabled_managed_heartbeats(monkeypatch):
+    """Keep the deferred heartbeat implementation covered until BHE supports it."""
+    monkeypatch.setattr(scheduler_service, "_MANAGED_HEARTBEATS_DISABLED", False)
+
+
+@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_job_uses_shared_poll_loop_without_polling_for_new_jobs(
     mock_service, mock_bloodhound_api, monkeypatch, caplog
 ):
@@ -2546,12 +2557,19 @@ def test_managed_job_uses_shared_poll_loop_without_polling_for_new_jobs(
             "collector-job-123", {"node_count": 4}, {"token": "secret-value"}
         )
         assert mock_service.job_running == "collector-job-123"
-        for now, expected_heartbeats in ((0, 0), (299, 0), (300, 1), (599, 1), (600, 2)):
+        for now, expected_heartbeats in (
+            (0, 0),
+            (299, 0),
+            (300, 1),
+            (599, 1),
+            (600, 2),
+        ):
             clock.now = now
             mock_service._poll()
-            assert len(
-                mock_bloodhound_api.app.state.collector_job_heartbeat_requests
-            ) == expected_heartbeats
+            assert (
+                len(mock_bloodhound_api.app.state.collector_job_heartbeat_requests)
+                == expected_heartbeats
+            )
         future.set_result(Result(results={"collect": []}, job_id="collector-job-123"))
         clock.now = 630
         monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
@@ -2648,6 +2666,7 @@ def test_claimed_job_cannot_start_while_another_job_runs(
     assert mock_service.job_running == 123
 
 
+@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_transient_managed_heartbeat_failures_keep_collection_running(
     mock_service, mock_bloodhound_api, monkeypatch, caplog
 ):
@@ -2686,6 +2705,7 @@ def test_transient_managed_heartbeat_failures_keep_collection_running(
 
 
 @pytest.mark.parametrize("during_shutdown", [False, True], ids=["poll", "shutdown"])
+@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_heartbeat_claim_loss_stops_worker_without_reporting_outcome(
     mock_service, mock_bloodhound_api, monkeypatch, during_shutdown
 ):
@@ -2735,6 +2755,7 @@ def test_managed_heartbeat_claim_loss_stops_worker_without_reporting_outcome(
     assert mock_bloodhound_api.app.state.job_ended is False
 
 
+@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_heartbeat_claim_loss_kills_a_real_running_process(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
@@ -2797,6 +2818,7 @@ def test_managed_worker_failure_ends_job_failed(
     ]
 
 
+@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_shutdown_keeps_heartbeating_until_managed_worker_finishes(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
