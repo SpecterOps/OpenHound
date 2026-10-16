@@ -24,6 +24,12 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+# Seconds to wait for BloodHound when installing an extension schema: the first number is for
+# opening the connection, the second for each wait on the reply. Without them a stalled server
+# would block `schema upload` forever.
+EXTENSION_UPLOAD_CONNECT_TIMEOUT_SECONDS = 10
+EXTENSION_UPLOAD_READ_TIMEOUT_SECONDS = 120
+
 
 class BloodHoundHTTPError(DltException):
     def __init__(self, reason: str, code: int):
@@ -133,6 +139,36 @@ class BloodHoundClient(ABC):
         path = "/api/v2/custom-nodes"
         response = self.request(method="POST", path=path, body=body.encode())
         return CustomNodes.model_validate(response.json())
+
+    def upsert_extension(self, body: bytes, content_type: str) -> bool:
+        """Install a new OpenGraph extension schema, or update the one with the same name.
+
+        BloodHound calls this operation an "upsert": it creates the extension when the
+        schema name is new and updates it when the name already exists. The request body
+        is either the schema as JSON, or a zip bundle that contains a ``schema.json`` file
+        and optional ``saved_queries.json`` and ``pz_rules.json`` files. The content type
+        tells BloodHound which of the two it is receiving.
+
+        Args:
+            body (bytes): The raw file contents to send.
+            content_type (str): Either ``application/json`` or ``application/zip``.
+
+        Returns:
+            bool: True when an existing extension was updated, False when a new one was created.
+        """
+        path = "/api/v2/extensions"
+        response = self.request(
+            method="PUT",
+            path=path,
+            body=body,
+            extra_headers={"Content-Type": content_type},
+            timeout=(
+                EXTENSION_UPLOAD_CONNECT_TIMEOUT_SECONDS,
+                EXTENSION_UPLOAD_READ_TIMEOUT_SECONDS,
+            ),
+        )
+        # BloodHound answers 200 (OK) for an update and 201 (Created) for a brand new extension.
+        return response.status_code == 200
 
     @property
     def asset_group_tags(self) -> AssetGroupsTags:
