@@ -42,6 +42,9 @@ POLL_INTERVAL = 30  # seconds; fixed poll/check-in cadence, must remain below BH
 HEARTBEAT_INTERVAL = (
     300  # seconds; BHE expires managed jobs after 15 minutes without a heartbeat
 )
+# TODO: Remove this constant and the guard in _send_managed_heartbeat once BHE
+# supports managed collector heartbeats. This is deliberately not configurable.
+_MANAGED_HEARTBEATS_DISABLED = True
 
 # Explicit source registration for the collectors shipped with this PoC.
 MANAGED_SOURCE_MODULES = {
@@ -607,6 +610,9 @@ class Service:
             self.client.end_job(status, message)
 
     def _send_managed_heartbeat(self, job_id: str) -> None:
+        if _MANAGED_HEARTBEATS_DISABLED:
+            return
+
         try:
             self.client.heartbeat_collector_job(job_id)
         except Exception as error:  # noqa: BLE001 - transient heartbeat failures must not stop collection
