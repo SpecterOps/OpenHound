@@ -1838,7 +1838,7 @@ def test_invalid_managed_credentials_end_failed_without_start(
             "job_id": state.collector_job_claim_response["id"],
             "body": {
                 "outcome": "failed",
-                "failure_message": "Credential validation failed",
+                "failure_message": "Credential document is invalid",
             },
         }
     ]
@@ -1862,28 +1862,46 @@ def test_missing_managed_secret_reference_fails_without_local_fallback(
     assert managed_service.secret_requests == managed_service.handoffs == []
     assert (
         state.collector_job_end_requests[0]["body"]["failure_message"]
-        == "Credential validation failed"
+        == "Credential document is invalid"
     )
 
 
 @pytest.mark.parametrize(
-    "error",
+    "error,summary",
     [
-        ClientError(
-            {
-                "Error": {
-                    "Code": "AccessDeniedException",
-                    "Message": "private-credential-value",
-                }
-            },
-            "GetSecretValue",
+        (
+            ClientError(
+                {
+                    "Error": {
+                        "Code": "AccessDeniedException",
+                        "Message": "The workload role cannot read openhound/job",
+                    }
+                },
+                "GetSecretValue",
+            ),
+            "AWS secret access denied",
         ),
-        RuntimeError("private-credential-value"),
+        (
+            ClientError(
+                {
+                    "Error": {
+                        "Code": "ResourceNotFoundException",
+                        "Message": "Secret does not exist in this region",
+                    }
+                },
+                "GetSecretValue",
+            ),
+            "Credential secret not found",
+        ),
+        (
+            RuntimeError("private-credential-value"),
+            "Credential secret retrieval failed",
+        ),
     ],
-    ids=["aws-permission-error", "unexpected-reader-error"],
+    ids=["aws-permission-error", "aws-missing-secret", "unexpected-reader-error"],
 )
-def test_secret_retrieval_failure_is_redacted_and_reported_as_failed(
-    managed_service, mock_bloodhound_api, caplog, error
+def test_secret_retrieval_failure_keeps_local_cause_and_reports_safe_summary(
+    managed_service, mock_bloodhound_api, caplog, error, summary
 ):
     state = mock_bloodhound_api.app.state
 
@@ -1900,9 +1918,18 @@ def test_secret_retrieval_failure_is_redacted_and_reported_as_failed(
     assert state.managed_events == ["claim", "retrieve", "end"]
     assert state.collector_job_end_requests[0]["body"] == {
         "outcome": "failed",
-        "failure_message": "Credential validation failed",
+        "failure_message": summary,
     }
     assert managed_service.handoffs == []
+    assert "Reporting this job failed" in caplog.text
+    failure_log = next(
+        r for r in caplog.records if "Cannot prepare managed job" in r.getMessage()
+    )
+    assert failure_log.secret_id == state.collector_job_claim_response["secret_key_id"]
+    if isinstance(error, ClientError):
+        assert error.response["Error"]["Message"] in caplog.text
+        assert "GetSecretValue" in caplog.text
+        assert failure_log.getMessage().count(failure_log.secret_id) == 1
     assert "private-credential-value" not in caplog.text
     assert all(
         "private-credential-value" not in repr(r.__dict__) for r in caplog.records
@@ -1997,7 +2024,14 @@ def test_exhausted_credential_failure_end_is_retained_and_retried_before_discove
     managed_service, mock_bloodhound_api, monkeypatch, caplog, resolved_status
 ):
     state = mock_bloodhound_api.app.state
-    state.collector_job_claim_response["secret_key_id"] = None
+    from botocore.exceptions import NoCredentialsError
+
+    def unavailable(**kwargs):
+        raise NoCredentialsError()
+
+    managed_service.secrets_manager = AWSSecretsManager(
+        SimpleNamespace(get_secret_value=unavailable)
+    )
     max_attempts = bloodhound_enterprise.MANAGED_JOB_END_MAX_ATTEMPTS
     state.collector_job_end_statuses = [503] * max_attempts
     delays = []
@@ -2024,6 +2058,10 @@ def test_exhausted_credential_failure_end_is_retained_and_retried_before_discove
     state.collector_job_end_statuses = [resolved_status]
     managed_service._poll()
     assert managed_service._pending_managed_failure is None
+    assert all(
+        request["body"]["failure_message"] == "AWS credentials unavailable"
+        for request in state.collector_job_end_requests
+    )
     assert (
         len(state.collector_job_queue_requests)
         == len(state.collector_job_claim_requests)
@@ -2153,13 +2191,94 @@ def test_managed_scheduler_logs_failure_once_and_retries_reporting_next_poll(
     assert managed_service.handoffs == []
     assert [
         r.getMessage() for r in caplog.records if "poll failed" in r.getMessage()
-    ] == ["Managed scheduler poll failed; retrying next poll."]
+    ] == [
+        f"Managed scheduler poll failed; retrying next poll in {managed_service.interval} seconds."
+    ]
     assert not any(
         r.getMessage() == "Managed collector job processing failed."
         for r in caplog.records
     )
     assert "raw-provider-secret" not in caplog.text
     assert all("raw-provider-secret" not in repr(r.__dict__) for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "stage,failure,expected",
+    [
+        ("poll", "region", "AWS_DEFAULT_REGION"),
+        ("metadata", "provider", "custom-process"),
+        ("end", "document", "non-empty token_id"),
+    ],
+)
+def test_managed_401_refresh_failure_is_visible_without_debug_logging(
+    managed_service, mock_bloodhound_api, monkeypatch, caplog, stage, failure, expected
+):
+    from botocore.exceptions import CredentialRetrievalError, NoRegionError
+
+    secret_requests = []
+
+    def retrieve(*, SecretId):
+        secret_requests.append(SecretId)
+        if failure == "region":
+            raise NoRegionError()
+        if failure == "provider":
+            raise CredentialRetrievalError(
+                provider="custom-process", error_msg="private-refresh-token"
+            )
+        return {"SecretString": '{"token_key":"private-refresh-token"}'}
+
+    provider = AWSBHECredentials(
+        "openhound/bhe", AWSSecretsManager(SimpleNamespace(get_secret_value=retrieve))
+    )
+    managed_service.client._credential_refresh = provider.refresh
+    requests_made = []
+
+    def unauthorized(self, **kwargs):
+        requests_made.append(kwargs["path"])
+        raise BloodHoundHTTPError("API token expired", 401)
+
+    def next_poll(seconds):
+        assert seconds == managed_service.interval
+        managed_service.exit = True
+
+    monkeypatch.setattr(bloodhound.BloodHound, "request", unauthorized)
+    monkeypatch.setattr(managed_service, "_poll_management", lambda: False)
+    monkeypatch.setattr(scheduler_service.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(scheduler_service.time, "sleep", next_poll)
+    if stage == "metadata":
+        managed_service.exit = True
+    else:
+        monkeypatch.setattr(
+            managed_service.client, "update_client_metadata", lambda: None
+        )
+    if stage == "end":
+        managed_service._pending_managed_failure = (
+            "11111111-1111-1111-1111-111111111111"
+        )
+
+    with caplog.at_level(logging.INFO):
+        managed_service.start()
+
+    assert len(requests_made) == 1
+    assert secret_requests == ["openhound/bhe"]
+    failures = [
+        r for r in caplog.records if "Cannot refresh BHE credentials" in r.getMessage()
+    ]
+    assert len(failures) == 1
+    assert expected in failures[0].getMessage()
+    assert "openhound/bhe" in failures[0].getMessage()
+    assert all(r.exc_info is None for r in caplog.records)
+    assert "private-refresh-token" not in repr([r.__dict__ for r in caplog.records])
+    assert managed_service.handoffs == []
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == []
+    if stage == "metadata":
+        assert "Unable to update client metadata" in caplog.text
+    else:
+        assert (
+            f"retrying next poll in {managed_service.interval} seconds" in caplog.text
+        )
+    if stage == "end":
+        assert managed_service._pending_managed_failure is not None
 
 
 @pytest.fixture
@@ -2398,7 +2517,7 @@ def test_managed_recovery_precedes_management_then_allows_support_work(
     assert len(sent) == 1
 
 
-def test_support_bundle_tracebacks_keep_aws_auth_errors_redacted(
+def test_support_bundle_tracebacks_preserve_aws_auth_context(
     mock_service, monkeypatch, caplog
 ):
     secret_reference = "private-bootstrap-secret-reference"
@@ -2424,13 +2543,13 @@ def test_support_bundle_tracebacks_keep_aws_auth_errors_redacted(
     with caplog.at_level(logging.DEBUG), pytest.raises(SecretPermissionError) as raised:
         mock_service._send_support_bundle(operation)
 
-    assert "AWS Secrets Manager denied access to the secret" in caplog.text
+    assert "Secrets Manager GetSecretValue" in caplog.text
+    assert "AccessDeniedException" in caplog.text
     assert any(record.exc_info is not None for record in caplog.records)
     formatted_error = "".join(traceback.format_exception(raised.value))
-    for forbidden in (secret_reference, provider_message):
-        assert forbidden not in caplog.text
-        assert forbidden not in formatted_error
-        assert all(forbidden not in repr(record.__dict__) for record in caplog.records)
+    for context in (secret_reference, provider_message):
+        assert context in caplog.text
+        assert context in formatted_error
 
 
 def test_managed_worker_sets_dlt_environment_before_pipeline(monkeypatch, caplog):
