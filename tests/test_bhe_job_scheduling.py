@@ -122,7 +122,9 @@ def mock_bloodhound_api():
 
     @app.get("/api/v2/collector-job-queue/available")
     async def collector_job_queue(request: Request):
-        app.state.collector_job_queue_requests.append(dict(request.query_params))
+        query_params = dict(request.query_params)
+        query_params["sort_by"] = request.query_params.getlist("sort_by")
+        app.state.collector_job_queue_requests.append(query_params)
         if app.state.collector_job_queue_error_status is not None:
             return Response(status_code=app.state.collector_job_queue_error_status)
         if app.state.collector_job_stateful_claims:
@@ -795,7 +797,11 @@ def test_managed_collector_job_check_requests_first_queue_job(
     assert job is not None
     assert job.id == UUID("11111111-1111-1111-1111-111111111111")
     assert mock_bloodhound_api.app.state.collector_job_queue_requests == [
-        {"limit": "1", "job_key": "eq:openhound-faker"}
+        {
+            "limit": "1",
+            "job_key": "eq:openhound-faker",
+            "sort_by": ["-priority", "created_at"],
+        }
     ]
     assert mock_bloodhound_api.app.state.jobs_available_requests == 0
 
