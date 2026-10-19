@@ -107,6 +107,9 @@ def mock_bloodhound_api():
     app.state.uploaded_parts = []
     app.state.artifact_completed = False
     app.state.ingested_nodes = 0
+    app.state.managed_ingest_requests = []
+    app.state.managed_ingested_nodes = 0
+    app.state.managed_ingested_edges = 0
 
     @app.get("/api/v2/jobs/available")
     async def jobs_available():
@@ -227,6 +230,16 @@ def mock_bloodhound_api():
         app.state.ingested_edges += len(validate_graph.graph.edges)
         return {"status": "success"}
 
+    @app.post("/api/v2/collector-job-queue/{job_id}/ingest")
+    async def ingest_managed_job(job_id: str, request: Request):
+        assert not app.state.collector_job_end_requests
+        assert request.headers["content-type"] == "application/json"
+        graph = Graph.model_validate_json(await request.body())
+        app.state.managed_ingest_requests.append(job_id)
+        app.state.managed_ingested_nodes += len(graph.graph.nodes)
+        app.state.managed_ingested_edges += len(graph.graph.edges)
+        return Response(status_code=202)
+
     @app.put("/api/v2/clients/update")
     async def update_client(body: dict):
         app.state.client_update_payload = body
@@ -343,6 +356,9 @@ def mock_service(mock_bloodhound_api, monkeypatch):
             return None
 
     def mock_request(method, url, **kwargs):
+        body = kwargs.get("data")
+        if body is not None and hasattr(body, "read"):
+            kwargs["data"] = body.read()
         parsed_url = urlsplit(url)
         path = parsed_url.path
         if parsed_url.query:
@@ -1090,6 +1106,18 @@ def test_scheduler_ingest_opengraph(
     assert result.job_id == 123
     assert mock_bloodhound_api.app.state.ingested_nodes == 1000
     assert mock_bloodhound_api.app.state.ingested_edges == 10000
+    assert result.output_path is None
+    assert result.data_files == []
+
+    future = Future()
+    future.set_result(result)
+    mock_service.job_running = 123
+    mock_service.future = future
+    mock_service._shutdown()
+
+    assert mock_bloodhound_api.app.state.job_ended is True
+    assert mock_bloodhound_api.app.state.managed_ingest_requests == []
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == []
 
 
 def _support_bundle_operation() -> dict:
@@ -1609,6 +1637,7 @@ def test_managed_poll_starts_claimed_job_and_tracks_worker(
             job_id,
             {"claimed_parameter": True},
             {"credential": "private-credential-value"},
+            True,
         )
     ]
     assert service.job_running == service.managed_job_id == job_id
@@ -1707,6 +1736,7 @@ def test_managed_start_failure_retries_prepared_job_before_discovery(
         job_id,
         {"claimed_parameter": True},
         {"credential": "private-credential-value"},
+        True,
     )
     assert service.future is future
     for forbidden in ("raw-provider-secret", "private-credential-value"):
@@ -2562,6 +2592,7 @@ def test_managed_job_uses_shared_poll_loop_without_polling_for_new_jobs(
         "collector-job-123",
         {"node_count": 4},
         {"token": "secret-value"},
+        True,
     )
     assert mock_bloodhound_api.app.state.collector_job_start_requests == [
         ("collector-job-123", b"")
@@ -2821,3 +2852,662 @@ def test_shutdown_keeps_heartbeating_until_managed_worker_finishes(
         {"job_id": "collector-job-123", "body": {"outcome": "succeeded"}}
     ]
     assert mock_service.future is None
+
+
+@pytest.mark.parametrize("failure_phase", ["upload", "success_report", "failure_report"])
+def test_managed_shutdown_retries_completion_and_renews_claim(
+    mock_service, mock_bloodhound_api, monkeypatch, tmp_path, caplog, failure_phase
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    output = tmp_path / "output"
+    output.mkdir()
+    files = [output / f"part-{index}.json" for index in range(2)]
+    for index, path in enumerate(files):
+        path.write_bytes(f"file-{index}".encode())
+    result = Result(results={}, job_id=job_id, output_path=output, data_files=files)
+    future = Future()
+    future.set_result(result)
+    mock_service.managed = True
+    mock_service.job_running = mock_service.managed_job_id = job_id
+    mock_service.future = future
+    mock_service.interval = 300
+    mock_service.next_heartbeat_at = 300
+    clock = FakeClock()
+    monkeypatch.setattr(scheduler_service, "time", clock)
+    uploads = []
+    ends = []
+    original_end = mock_service.client.end_managed_job
+
+    def upload(job, data):
+        assert job == job_id
+        uploads.append(data.read())
+        if len(uploads) == 2:
+            if failure_phase == "upload":
+                raise requests.Timeout("sensitive-response-body")
+            if failure_phase == "failure_report":
+                raise BloodHoundHTTPError("sensitive-response-body", 415)
+
+    def end(job, outcome, **kwargs):
+        ends.append(outcome)
+        if failure_phase != "upload" and len(ends) == 1:
+            raise BloodHoundHTTPError("sensitive-response-body", 500)
+        return original_end(job, outcome, **kwargs)
+
+    def check_retry_state(now):
+        assert now == 300  # Only one retry delay should be needed.
+        assert mock_service.future is future
+        assert mock_service.job_running == job_id
+        assert result.uploaded_files == (2 if failure_phase == "success_report" else 1)
+        assert output.exists()
+        assert mock_bloodhound_api.app.state.collector_job_end_requests == []
+
+    clock.on_sleep = check_retry_state
+    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", upload)
+    monkeypatch.setattr(mock_service.client, "end_managed_job", end)
+
+    mock_service._shutdown()
+
+    expected_outcome = (
+        ManagedJobOutcome.FAILED
+        if failure_phase == "failure_report"
+        else ManagedJobOutcome.SUCCEEDED
+    )
+    assert uploads == [b"file-0", b"file-1"] + (
+        [b"file-1"] if failure_phase == "upload" else []
+    )
+    assert ends == [expected_outcome] * (1 if failure_phase == "upload" else 2)
+    body = {"outcome": expected_outcome.value}
+    if failure_phase == "failure_report":
+        body["failure_message"] = "Collector data upload rejected (HTTP 415)"
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == [
+        {"job_id": job_id, "body": body}
+    ]
+    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == [(job_id, b"")]
+    assert mock_bloodhound_api.app.state.job_ended is False
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert not output.exists()
+    assert "sensitive-response-body" not in caplog.text
+
+
+def test_managed_completion_fails_job_when_remaining_staged_file_disappears(
+    mock_service, monkeypatch, tmp_path
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    output = tmp_path / "output"
+    output.mkdir()
+    files = [output / f"part-{index}.json" for index in range(2)]
+    for index, path in enumerate(files):
+        path.write_bytes(f"file-{index}".encode())
+    result = Result(results={}, job_id=job_id, output_path=output, data_files=files)
+    future = Future()
+    future.set_result(result)
+    mock_service.managed = True
+    mock_service.job_running = mock_service.managed_job_id = job_id
+    mock_service.future = future
+    uploads = []
+    ends = []
+    monkeypatch.setattr(scheduler_service, "time", FakeClock())
+    monkeypatch.setattr(mock_service, "_poll_management", lambda: False)
+    monkeypatch.setattr(mock_service, "_poll_managed_jobs", lambda: None)
+
+    def upload(job, data):
+        assert job == job_id
+        uploads.append(data.read())
+        # Lose the remaining file after the first upload has been accepted.
+        files[1].unlink()
+
+    def end(job, outcome, **kwargs):
+        ends.append((job, outcome, kwargs))
+
+    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", upload)
+    monkeypatch.setattr(mock_service.client, "end_managed_job", end)
+
+    mock_service._poll()
+    mock_service._poll()
+
+    assert uploads == [b"file-0"]
+    assert len(ends) == 1, "Missing staged data must fail the job instead of retrying forever"
+    assert ends[0][:2] == (job_id, ManagedJobOutcome.FAILED)
+    assert ends[0][2]["failure_message"]
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert not output.exists()
+
+
+def test_managed_poll_cleans_partial_upload_output_after_heartbeat_claim_loss(
+    mock_service, monkeypatch, tmp_path
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    output = tmp_path / "output"
+    output.mkdir()
+    files = [output / f"part-{index}.json" for index in range(2)]
+    for index, path in enumerate(files):
+        path.write_bytes(f"file-{index}".encode())
+    result = Result(results={}, job_id=job_id, output_path=output, data_files=files)
+    future = Future()
+    future.set_result(result)
+    mock_service.managed = True
+    mock_service.job_running = mock_service.managed_job_id = job_id
+    mock_service.future = future
+    mock_service.next_heartbeat_at = 300
+    clock = FakeClock()
+    clock.now = 300
+    monkeypatch.setattr(scheduler_service, "time", clock)
+    monkeypatch.setattr(mock_service, "_poll_management", lambda: False)
+    monkeypatch.setattr(mock_service, "_poll_managed_jobs", lambda: None)
+    events = []
+    ends = []
+
+    def upload(job, data):
+        assert job == job_id
+        content = data.read()
+        events.append(content)
+        if content == b"file-1":
+            raise requests.Timeout("upload interrupted")
+
+    def lose_claim(job):
+        assert job == job_id
+        events.append("heartbeat")
+        raise BloodHoundHTTPError("claim lost", 404)
+
+    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", upload)
+    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
+    monkeypatch.setattr(
+        mock_service.client, "end_managed_job",
+        lambda *args, **kwargs: ends.append((args, kwargs)),
+    )
+
+    mock_service._poll()
+    mock_service._poll()
+
+    assert events == [b"file-0", b"file-1", "heartbeat"]
+    assert result.uploaded_files == 1
+    assert ends == []
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert mock_service.next_heartbeat_at is None
+    assert not output.exists(), "Claim loss must also remove partially uploaded staged data"
+
+
+def test_managed_shutdown_retries_upload_across_multiple_heartbeat_intervals(
+    mock_service, mock_bloodhound_api, monkeypatch, tmp_path
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    output = tmp_path / "output"
+    output.mkdir()
+    files = [output / f"part-{index}.json" for index in range(2)]
+    for index, path in enumerate(files):
+        path.write_bytes(f"file-{index}".encode())
+    result = Result(results={}, job_id=job_id, output_path=output, data_files=files)
+    future = Future()
+    future.set_result(result)
+    mock_service.managed = True
+    mock_service.job_running = mock_service.managed_job_id = job_id
+    mock_service.future = future
+    mock_service.interval = 30
+    mock_service.next_heartbeat_at = 300
+    clock = FakeClock()
+    monkeypatch.setattr(scheduler_service, "time", clock)
+    uploads = []
+    heartbeats = []
+    retry_times = []
+    original_heartbeat = mock_service.client.heartbeat_collector_job
+
+    def upload(job, data):
+        assert job == job_id
+        content = data.read()
+        uploads.append((clock.now, content))
+        if content == b"file-1" and clock.now < 930:
+            raise BloodHoundHTTPError("temporary outage", 503)
+
+    def heartbeat(job):
+        heartbeats.append(clock.now)
+        return original_heartbeat(job)
+
+    def check_retry_state(now):
+        assert now <= 930, "Shutdown should finish once the outage ends"
+        retry_times.append(now)
+        assert mock_service.future is future
+        assert mock_service.job_running == job_id
+        assert result.uploaded_files == 1
+        assert output.exists()
+        assert mock_bloodhound_api.app.state.collector_job_end_requests == []
+
+    clock.on_sleep = check_retry_state
+    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", upload)
+    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", heartbeat)
+
+    mock_service._shutdown()
+
+    assert retry_times == list(range(30, 931, 30))
+    assert uploads == [(0, b"file-0")] + [
+        (now, b"file-1") for now in range(0, 931, 30)
+    ]
+    assert heartbeats == [300, 600, 900]
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == [
+        {"job_id": job_id, "body": {"outcome": "succeeded"}}
+    ]
+    assert result.uploaded_files == 2
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert not output.exists()
+
+
+def test_managed_shutdown_cleans_staged_output_when_heartbeat_loses_claim(
+    mock_service, mock_bloodhound_api, monkeypatch, tmp_path
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    data_file = tmp_path / "output" / "graph.json"
+    data_file.parent.mkdir()
+    data_file.write_bytes(b"graph")
+    future = Future()
+    future.set_result(
+        Result(results={}, job_id=job_id, output_path=data_file.parent, data_files=[data_file])
+    )
+    mock_service.managed = True
+    mock_service.job_running = mock_service.managed_job_id = job_id
+    mock_service.future = future
+    mock_service.next_heartbeat_at = 0
+    monkeypatch.setattr(scheduler_service, "time", FakeClock())
+
+    def lose_claim(job):
+        assert job == job_id
+        raise BloodHoundHTTPError("claim lost", 404)
+
+    def unexpected_upload(*args, **kwargs):
+        raise AssertionError("A lost claim must not upload data")
+
+    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
+    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", unexpected_upload)
+    mock_service._shutdown()
+
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert not data_file.parent.exists()
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == []
+
+
+@pytest.mark.parametrize("end_fails", [False, True])
+def test_unmanaged_shutdown_waits_for_worker_and_attempts_completion_once(
+    mock_service, mock_bloodhound_api, monkeypatch, end_fails
+):
+    future = Future()
+    mock_service.job_running = 123
+    mock_service.future = future
+    ends = []
+    checkins = []
+    original_end = mock_service.client.end_job
+    original_checkin = mock_service._poll_running_job
+
+    def finish_worker(now):
+        assert now == mock_service.interval
+        future.set_result(Result(results={}, job_id=123))
+
+    clock = FakeClock(finish_worker)
+    monkeypatch.setattr(scheduler_service, "time", clock)
+
+    def end(status, message):
+        assert future.done()
+        ends.append(status)
+        if end_fails:
+            raise BloodHoundHTTPError("temporary failure", 500)
+        return original_end(status, message)
+
+    def checkin():
+        checkins.append(clock.now)
+        original_checkin()
+
+    def unexpected_managed_completion():
+        raise AssertionError("Unmanaged jobs must retain their existing shutdown path")
+
+    monkeypatch.setattr(mock_service.client, "end_job", end)
+    monkeypatch.setattr(mock_service, "_poll_running_job", checkin)
+    monkeypatch.setattr(
+        mock_service, "_finish_managed_job_on_shutdown", unexpected_managed_completion
+    )
+    mock_service._shutdown()
+
+    assert ends == [JobStatus.COMPLETE]
+    assert checkins == [0]
+    assert mock_bloodhound_api.app.state.job_ended is (not end_fails)
+    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == []
+    assert mock_bloodhound_api.app.state.collector_job_end_requests == []
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+
+
+@pytest.mark.parametrize(
+    "upload_error",
+    [
+        BloodHoundHTTPError("temporary error", 500),
+        BloodHoundHTTPError("rate limited", 429),
+        requests.ConnectionError("connection interrupted"),
+        requests.Timeout("upload timed out"),
+    ],
+)
+def test_managed_completion_retries_remaining_uploads_before_ending(
+    mock_service, monkeypatch, tmp_path, upload_error
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    output = tmp_path / "output"
+    output.mkdir()
+    files = [output / "nodes.json", output / "edges.json"]
+    for index, path in enumerate(files):
+        path.write_bytes(f"file-{index}".encode())
+    result = Result(results={}, job_id=job_id, output_path=output, data_files=files)
+    future = Future()
+    future.set_result(result)
+    mock_service.managed = True
+    mock_service.job_running = job_id
+    mock_service.managed_job_id = job_id
+    mock_service.future = future
+    calls = []
+
+    def upload(job, data):
+        assert job == job_id
+        calls.append(data.read())
+        if len(calls) == 2:
+            raise upload_error
+
+    def end(job, outcome, **kwargs):
+        calls.append((job, outcome))
+
+    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", upload)
+    monkeypatch.setattr(mock_service.client, "end_managed_job", end)
+
+    with pytest.raises(type(upload_error)):
+        mock_service._handle_completed_job(future)
+    assert result.uploaded_files == 1
+    assert mock_service.future is future
+    assert mock_service.job_running == job_id
+    assert output.exists()
+
+    mock_service._handle_completed_job(future)
+    assert calls == [
+        b"file-0", b"file-1", b"file-1",
+        (str(job_id), ManagedJobOutcome.SUCCEEDED),
+    ]
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 415])
+@pytest.mark.parametrize("retry_end", [False, True])
+def test_permanent_upload_rejection_ends_failed_without_retrying_upload(
+    mock_service, monkeypatch, tmp_path, caplog, status, retry_end
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    output = tmp_path / "output"
+    output.mkdir()
+    files = [output / f"part-{index}.json" for index in range(3)]
+    for index, path in enumerate(files):
+        path.write_bytes(f"file-{index}".encode())
+    result = Result(results={}, job_id=job_id, output_path=output, data_files=files)
+    future = Future()
+    future.set_result(result)
+    mock_service.managed = True
+    mock_service.job_running = mock_service.managed_job_id = job_id
+    mock_service.future = future
+    uploads = []
+    ends = []
+
+    def upload(job, data):
+        uploads.append((job, data.read()))
+        if len(uploads) == 2:
+            raise BloodHoundHTTPError("sensitive-response-body", status)
+
+    def end(job, outcome, **kwargs):
+        ends.append((job, outcome, kwargs))
+        if retry_end and len(ends) == 1:
+            raise BloodHoundHTTPError("temporary error", 500)
+
+    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", upload)
+    monkeypatch.setattr(mock_service.client, "end_managed_job", end)
+
+    if retry_end:
+        with pytest.raises(BloodHoundHTTPError):
+            mock_service._handle_completed_job(future)
+        assert mock_service.future is future
+        assert mock_service.job_running == job_id
+        assert output.exists()
+
+    mock_service._handle_completed_job(future)
+
+    assert uploads == [(job_id, b"file-0"), (job_id, b"file-1")]
+    assert ends == [
+        (
+            job_id,
+            ManagedJobOutcome.FAILED,
+            {"failure_message": f"Collector data upload rejected (HTTP {status})"},
+        )
+    ] * (2 if retry_end else 1)
+    assert "sensitive-response-body" not in caplog.text
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("status", [404, 409])
+def test_upload_for_missing_or_stopped_job_aborts_without_reporting_outcome(
+    mock_service, monkeypatch, tmp_path, caplog, status
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    output = tmp_path / "output"
+    output.mkdir()
+    data_file = output / "graph.json"
+    data_file.write_bytes(b"graph")
+    future = Future()
+    future.set_result(
+        Result(results={}, job_id=job_id, output_path=output, data_files=[data_file])
+    )
+    mock_service.managed = True
+    mock_service.job_running = mock_service.managed_job_id = job_id
+    mock_service.future = future
+
+    def upload(job, data):
+        raise BloodHoundHTTPError("sensitive-response-body", status)
+
+    def unexpected_end(*args, **kwargs):
+        raise AssertionError("A missing or stopped job must not receive an outcome")
+
+    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", upload)
+    monkeypatch.setattr(mock_service.client, "end_managed_job", unexpected_end)
+    mock_service._handle_completed_job(future)
+
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+    assert mock_service.managed_job_id is None
+    assert mock_service.next_heartbeat_at is None
+    assert not output.exists()
+    assert "sensitive-response-body" not in caplog.text
+
+
+def test_managed_end_retry_does_not_upload_accepted_files_again(
+    mock_service, monkeypatch, tmp_path
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    output = tmp_path / "output"
+    output.mkdir()
+    data_file = output / "nodes.json"
+    data_file.write_bytes(b"graph")
+    result = Result(results={}, job_id=job_id, output_path=output, data_files=[data_file])
+    future = Future()
+    future.set_result(result)
+    mock_service.managed = True
+    mock_service.job_running = job_id
+    mock_service.managed_job_id = job_id
+    mock_service.future = future
+    uploads = []
+    ends = []
+    monkeypatch.setattr(
+        mock_service.client, "upload_collector_job_data",
+        lambda job, data: uploads.append(data.read()),
+    )
+
+    def end(job, outcome, **kwargs):
+        ends.append((job, outcome))
+        if len(ends) == 1:
+            raise BloodHoundHTTPError("temporary error", 500)
+
+    monkeypatch.setattr(mock_service.client, "end_managed_job", end)
+    with pytest.raises(BloodHoundHTTPError):
+        mock_service._handle_completed_job(future)
+    assert output.exists()
+    assert mock_service.future is future
+    mock_service._handle_completed_job(future)
+    assert uploads == [b"graph"]
+    assert ends == [(str(job_id), ManagedJobOutcome.SUCCEEDED)] * 2
+    assert not output.exists()
+
+
+def test_managed_collection_failure_ends_failed_without_upload(
+    mock_service, monkeypatch
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    future = Future()
+    future.set_exception(ExtensionNotFoundError("missing collector"))
+    mock_service.managed = True
+    mock_service.job_running = job_id
+    mock_service.managed_job_id = job_id
+    mock_service.future = future
+    ends = []
+    monkeypatch.setattr(
+        mock_service.client, "end_managed_job",
+        lambda *args, **kwargs: ends.append((args, kwargs)),
+    )
+
+    def unexpected_upload(*args, **kwargs):
+        raise AssertionError("Failed collections must not upload")
+
+    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", unexpected_upload)
+    mock_service._handle_completed_job(future)
+    assert ends[0][0] == (str(job_id), ManagedJobOutcome.FAILED)
+    assert ends[0][1]["failure_message"] == "Collector 'openhound-faker' not found"
+    assert mock_service.future is None
+    assert mock_service.job_running is None
+
+
+def test_managed_collection_stages_then_uploads_before_job_end(
+    mock_service, mock_bloodhound_api
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    result = _subprocess_collect("faker", job_id, managed=True)
+    assert result.data_files
+    assert mock_bloodhound_api.app.state.managed_ingest_requests == []
+    assert mock_bloodhound_api.app.state.ingested_nodes == 0
+    assert mock_bloodhound_api.app.state.ingested_edges == 0
+
+    future = Future()
+    future.set_result(result)
+    mock_service.managed = True
+    mock_service.job_running = job_id
+    mock_service.managed_job_id = job_id
+    mock_service.future = future
+    mock_service._handle_completed_job(future)
+
+    state = mock_bloodhound_api.app.state
+    assert state.managed_ingest_requests == [str(job_id)] * len(result.data_files)
+    assert state.managed_ingested_nodes == 1000
+    assert state.managed_ingested_edges == 10000
+    assert state.collector_job_end_requests == [
+        {"job_id": str(job_id), "body": {"outcome": "succeeded"}}
+    ]
+    assert state.job_ended is False
+    assert not result.output_path.exists()
+
+
+def test_start_claimed_managed_job_passes_uuid_and_staging_mode_to_worker(mock_service):
+    job = CollectorJob.model_validate(
+        load_json("collector_jobs_available_with_job.json")["data"]["jobs"][0]
+    )
+    job.status = "running"
+    job.claimed_by = UUID("c894ea20-8c11-49bd-83f8-5550c8255148")
+    mock_service.managed = True
+    mock_service.start_claimed_managed_job(job)
+    args, _kwargs, future = mock_service.executor.submitted[0]
+    assert args == (
+        _subprocess_collect, "openhound-faker", str(job.id), None, None, True
+    )
+    assert mock_service.future is future
+    assert mock_service.job_running == str(job.id)
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_start_claimed_managed_job_rejects_unclaimed_jobs(mock_service, managed):
+    job = CollectorJob.model_validate(
+        load_json("collector_jobs_available_with_job.json")["data"]["jobs"][0]
+    )
+    mock_service.managed = managed
+    with pytest.raises(ValueError):
+        mock_service.start_claimed_managed_job(job)
+    assert mock_service.executor.submitted == []
+    assert mock_service.job_running is None
+
+
+def test_failed_managed_conversion_cleans_up_staged_files(monkeypatch, tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    monkeypatch.setattr(scheduler_service.tempfile, "mkdtemp", lambda **kwargs: str(output))
+    collector = SimpleNamespace(name="example", package_version="1", metadata=None)
+    monkeypatch.setattr(
+        scheduler_service.CollectorManager, "from_entrypoint",
+        lambda: SimpleNamespace(collectors=[collector]),
+    )
+
+    def fail(extension, output_path):
+        (output_path / "partial.json").write_text("partial")
+        raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr(scheduler_service.dataflow, "pipeline", fail)
+    with pytest.raises(RuntimeError, match="conversion failed"):
+        _subprocess_collect(
+            "example", "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d", managed=True
+        )
+    assert not output.exists()
+
+
+def test_managed_completion_streams_graph_to_api_before_ending(
+    mock_service, mock_bloodhound_api, tmp_path
+):
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    output = tmp_path / "output"
+    output.mkdir()
+    data_file = output / "graph.json"
+    payload = json.loads(
+        (Path(__file__).parent / "test_data" / "sample_graph.json").read_text()
+    )
+    for node in payload["graph"]["nodes"]:
+        node["properties"]["environmentid"] = "test-environment"
+    content = json.dumps(payload).encode()
+    data_file.write_bytes(content)
+    graph = Graph.model_validate_json(content)
+    future = Future()
+    future.set_result(
+        Result(results={}, job_id=job_id, output_path=output, data_files=[data_file])
+    )
+    mock_service.managed = True
+    mock_service.job_running = job_id
+    mock_service.managed_job_id = job_id
+    mock_service.future = future
+
+    mock_service._handle_completed_job(future)
+
+    state = mock_bloodhound_api.app.state
+    assert state.managed_ingest_requests == [str(job_id)]
+    assert state.managed_ingested_nodes == len(graph.graph.nodes)
+    assert state.managed_ingested_edges == len(graph.graph.edges)
+    assert state.collector_job_end_requests == [
+        {"job_id": str(job_id), "body": {"outcome": "succeeded"}}
+    ]
+    assert state.ingested_nodes == 0
+    assert state.ingested_edges == 0
+    assert state.job_ended is False
+    assert not output.exists()
