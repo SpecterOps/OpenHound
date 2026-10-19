@@ -1,4 +1,5 @@
 import base64
+import errno
 import json
 import logging
 import traceback
@@ -14,9 +15,12 @@ from botocore.exceptions import (
     ConfigNotFound,
     CredentialRetrievalError,
     EndpointConnectionError,
+    HTTPClientError,
     InvalidConfigError,
+    MetadataRetrievalError,
     NoCredentialsError,
     NoRegionError,
+    ParamValidationError,
     PartialCredentialsError,
     ProfileNotFound,
 )
@@ -31,9 +35,11 @@ from openhound.core.clients.aws_secrets_manager import (
 )
 
 LOGGER_NAME = "openhound.core.clients.aws_secrets_manager"
-SECRET_ID = "secret-id-that-must-not-be-logged"
+SECRET_ID = "openhound/bhe"
 SECRET_VALUE = "secret-value-that-must-not-be-logged"
-PROVIDER_MESSAGE = "provider message that must not be exposed"
+PROVIDER_MESSAGE = (
+    "role arn:aws:iam::123456789012:role/openhound cannot read the secret"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -226,7 +232,7 @@ def test_get_secrets_continues_and_aggregates_typed_failures_safely(
             ),
         ]
     )
-    forbidden = set(secret_ids) | {SECRET_VALUE, PROVIDER_MESSAGE}
+    forbidden = {SECRET_VALUE}
 
     with (
         caplog.at_level(logging.DEBUG, logger=LOGGER_NAME),
@@ -251,9 +257,12 @@ def test_get_secrets_continues_and_aggregates_typed_failures_safely(
     error_records = [
         cast(Any, record)
         for record in caplog.records
-        if record.levelno == logging.ERROR
+        if getattr(record, "outcome", None) == "failure"
     ]
     assert len(error_records) == 2
+    assert first_failure in caplog.text
+    assert "ResourceNotFoundException" in caplog.text
+    assert PROVIDER_MESSAGE in caplog.text
     assert all(
         record.failure_category == "SecretBatchError" for record in error_records
     )
@@ -286,7 +295,11 @@ def test_get_secret_classifies_aws_errors(
     with pytest.raises(expected_type) as raised:
         AWSSecretsManager(client).get_secret(SECRET_ID)
 
-    assert_safe_failure(raised.value, {SECRET_ID, PROVIDER_MESSAGE})
+    assert raised.value.context["sdk_exception_type"] == type(error).__name__
+    if isinstance(error, ClientError):
+        assert PROVIDER_MESSAGE in str(raised.value)
+    else:
+        assert "https://secretsmanager.example" in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -314,8 +327,15 @@ def test_client_creation_configuration_failures_are_classified(
         "openhound.core.clients.aws_secrets_manager.boto3.client", fail_client
     )
 
-    with pytest.raises(AWSConfigurationError):
+    with pytest.raises(AWSConfigurationError) as raised:
         AWSSecretsManager().get_secret(SECRET_ID)
+    assert type(sdk_error).__name__ in str(raised.value)
+    assert raised.value.context["sdk_exception_type"] == type(sdk_error).__name__
+    if isinstance(sdk_error, NoRegionError):
+        assert "AWS_DEFAULT_REGION" in str(raised.value)
+        assert "selected AWS profile" in str(raised.value)
+    elif not isinstance(sdk_error, CredentialRetrievalError):
+        assert str(sdk_error) in str(raised.value)
 
 
 def test_successful_retrieval_logs_safe_attempt_and_result_records(
@@ -437,7 +457,7 @@ def test_real_sdk_http_pipeline_does_not_expose_secrets(
     if response_kind == "provider_error":
         response_body = {
             "__type": "AccessDeniedException",
-            "message": f"{PROVIDER_MESSAGE}: {SECRET_ID} {SECRET_VALUE}",
+            "message": f"{PROVIDER_MESSAGE}: {SECRET_ID}",
         }
         status = 400
     else:
@@ -449,9 +469,7 @@ def test_real_sdk_http_pipeline_does_not_expose_secrets(
         status = 200
     raw_body = json.dumps(response_body).encode()
     forbidden = {
-        SECRET_ID,
         SECRET_VALUE,
-        PROVIDER_MESSAGE,
         encoded_document,
         raw_body.decode(),
     }
@@ -568,3 +586,352 @@ def test_real_sdk_http_pipeline_does_not_expose_secrets(
     assert not any(
         record.name.startswith(("boto3", "botocore")) for record in caplog.records
     )
+
+
+@pytest.mark.parametrize("during_construction", [False, True])
+def test_sts_failure_retains_actual_operation_and_metadata(
+    monkeypatch, caplog, during_construction
+):
+    error = aws_error(
+        "AccessDenied",
+        "Role trust condition did not match",
+        "AssumeRoleWithWebIdentity",
+    )
+    error.response["ResponseMetadata"].update(
+        RequestId="request-123", HTTPStatusCode=403, RetryAttempts=2
+    )
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr("openhound.core.clients.aws_secrets_manager.boto3.client", fail)
+    manager = AWSSecretsManager(
+        None if during_construction else FakeSecretsManagerClient(get_error=error)
+    )
+    with caplog.at_level(logging.DEBUG), pytest.raises(AWSConfigurationError) as raised:
+        manager.get_secret(SECRET_ID)
+    text = str(raised.value)
+    for expected in (
+        "STS AssumeRoleWithWebIdentity",
+        "AccessDenied",
+        "Role trust condition",
+        "role trust",
+        "request-123",
+        "HTTP 403",
+        "SDK retries 2",
+    ):
+        assert expected in text
+    assert "Secrets Manager denied" not in text
+    assert raised.value.context["aws_operation"] == "AssumeRoleWithWebIdentity"
+    assert raised.value.context["RetryAttempts"] == 2
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_unrelated_runtime_errors_are_classified_without_provider_output(caplog, batch):
+    error = RuntimeError(SECRET_VALUE)
+    client = FakeSecretsManagerClient(get_error=error, batch_responses=[error])
+    manager = AWSSecretsManager(client)
+    with caplog.at_level(logging.DEBUG):
+        if batch:
+            with pytest.raises(SecretBatchError) as raised:
+                manager.get_secrets([SECRET_ID])
+            failure = raised.value.failures[SECRET_ID]
+        else:
+            with pytest.raises(SecretRequestError) as raised:
+                manager.get_secret(SECRET_ID)
+            failure = raised.value
+
+    assert isinstance(failure, SecretRequestError)
+    assert str(failure) == "AWS secret retrieval failed (RuntimeError)"
+    assert failure.context["sdk_exception_type"] == "RuntimeError"
+    assert SECRET_VALUE not in "".join(traceback.format_exception(raised.value))
+    assert_safe_logs(caplog, {SECRET_VALUE})
+
+
+@pytest.mark.parametrize(
+    "code,expected_type",
+    [
+        ("ExpiredTokenException", AWSConfigurationError),
+        ("UnrecognizedClientException", AWSConfigurationError),
+        ("ThrottlingException", SecretRequestError),
+        ("InternalServiceError", SecretRequestError),
+    ],
+)
+def test_service_failures_preserve_code_message_region_and_secret(code, expected_type):
+    from types import SimpleNamespace
+
+    client = FakeSecretsManagerClient(get_error=aws_error(code, PROVIDER_MESSAGE + "."))
+    client.meta = SimpleNamespace(region_name="us-west-2")
+    with pytest.raises(expected_type) as raised:
+        AWSSecretsManager(client).get_secret(SECRET_ID)
+    for expected in (code, PROVIDER_MESSAGE, "GetSecretValue", SECRET_ID, "us-west-2"):
+        assert expected in str(raised.value)
+    assert raised.value.context["region"] == "us-west-2"
+    assert "all attempts" not in str(raised.value)
+    assert ".." not in str(raised.value)
+
+
+@pytest.mark.parametrize("code", ["SignatureDoesNotMatch", "InvalidSignatureException"])
+def test_signature_diagnostics_exclude_authentication_material_from_normal_logs(
+    caplog, code
+):
+    from openhound.core.clients.bhe_credentials import AWSBHECredentials
+
+    error = aws_error(
+        code,
+        "The request signature we calculated does not match the signature you provided. "
+        "The Canonical String for this request should have been\n"
+        f"GET\n/\n\nhost:secretsmanager.example\nx-amz-security-token:{SECRET_VALUE}\n"
+        f"Authorization: AWS4-HMAC-SHA256 Credential={SECRET_VALUE}",
+    )
+    error.response["ResponseMetadata"].update(RequestId="request-123", RetryAttempts=2)
+    manager = AWSSecretsManager(FakeSecretsManagerClient(get_error=error))
+    with caplog.at_level(logging.ERROR), pytest.raises(AWSConfigurationError) as raised:
+        AWSBHECredentials(SECRET_ID, manager).refresh()
+
+    assert len(caplog.records) == 1
+    for expected in (
+        code,
+        "GetSecretValue",
+        "request signature",
+        "request-123",
+        "SDK retries 2",
+    ):
+        assert expected in caplog.text
+    assert "Canonical String" not in caplog.text
+    assert SECRET_VALUE not in "".join(traceback.format_exception(raised.value))
+    assert_safe_logs(caplog, {SECRET_VALUE})
+
+
+@pytest.mark.parametrize(
+    "failure,expected",
+    [
+        ("invalid-json", "unable to parse JSON"),
+        ("timeout", "ReadTimeoutError"),
+        ("http-error", "HTTP 403"),
+    ],
+)
+def test_container_provider_failures_keep_safe_cause(caplog, failure, expected):
+    from types import SimpleNamespace
+
+    from botocore.credentials import ContainerProvider
+    from botocore.exceptions import ReadTimeoutError
+    from botocore.utils import ContainerMetadataFetcher
+
+    from openhound.core.clients.bhe_credentials import AWSBHECredentials
+
+    endpoint = "http://localhost/credentials"
+
+    def send(request):
+        if failure == "timeout":
+            raise ReadTimeoutError(endpoint_url=f"{endpoint}?token={SECRET_VALUE}")
+        return SimpleNamespace(
+            status_code=403 if failure == "http-error" else 200,
+            content=SECRET_VALUE.encode(),
+        )
+
+    fetcher = ContainerMetadataFetcher(
+        session=SimpleNamespace(send=send), sleep=lambda _: None
+    )
+    fetcher.RETRY_ATTEMPTS = 1
+    provider = ContainerProvider(
+        environ={"AWS_CONTAINER_CREDENTIALS_FULL_URI": endpoint}, fetcher=fetcher
+    )
+
+    def retrieve(**kwargs):
+        return provider.load()
+
+    manager = AWSSecretsManager(SimpleNamespace(get_secret_value=retrieve))
+    with caplog.at_level(logging.ERROR), pytest.raises(AWSConfigurationError) as raised:
+        AWSBHECredentials(SECRET_ID, manager).refresh()
+
+    assert len(caplog.records) == 1
+    assert expected in caplog.text
+    assert "container-role" in caplog.text
+    if failure == "timeout":
+        assert raised.value.context["transport_exception_type"] == "ReadTimeoutError"
+    assert SECRET_VALUE not in "".join(traceback.format_exception(raised.value))
+    assert_safe_logs(caplog, {SECRET_VALUE})
+
+
+@pytest.mark.parametrize(
+    "parameter,constraint",
+    [
+        ("RoleArn", "valid min length: 20"),
+        ("WebIdentityToken", "valid types: <class 'str'>"),
+    ],
+)
+def test_validation_keeps_parameter_and_rule_without_values(
+    caplog, parameter, constraint
+):
+    from botocore.session import get_session
+    from botocore.validate import validate_parameters
+
+    from openhound.core.clients.bhe_credentials import AWSBHECredentials
+
+    shape = (
+        get_session()
+        .get_service_model("sts")
+        .operation_model("AssumeRoleWithWebIdentity")
+        .input_shape
+    )
+    params: dict[str, Any] = {
+        "RoleArn": "arn:aws:iam::123456789012:role/openhound",
+        "RoleSessionName": "openhound",
+        "WebIdentityToken": SECRET_VALUE,
+    }
+    params[parameter] = "x" if parameter == "RoleArn" else {"token": SECRET_VALUE}
+    with pytest.raises(ParamValidationError) as sdk_error:
+        validate_parameters(params, shape)
+
+    manager = AWSSecretsManager(FakeSecretsManagerClient(get_error=sdk_error.value))
+    caplog.clear()
+    with caplog.at_level(logging.ERROR), pytest.raises(SecretRequestError) as raised:
+        AWSBHECredentials(SECRET_ID, manager).refresh()
+
+    assert len(caplog.records) == 1
+    assert f"parameter {parameter}" in caplog.text
+    assert constraint in caplog.text
+    assert "value:" not in str(raised.value)
+    assert SECRET_VALUE not in "".join(traceback.format_exception(raised.value))
+    assert_safe_logs(caplog, {SECRET_VALUE})
+
+
+@pytest.mark.parametrize(
+    "error,explanation",
+    [
+        (
+            CredentialRetrievalError(provider="custom-process", error_msg=SECRET_VALUE),
+            "custom-process",
+        ),
+        (
+            CredentialRetrievalError(
+                provider="container-role",
+                error_msg=f"Received non 200 response 403 from container metadata: {SECRET_VALUE}",
+            ),
+            "container-role",
+        ),
+        (
+            ParamValidationError(report=f"Invalid WebIdentityToken: {SECRET_VALUE}"),
+            "parameter validation",
+        ),
+        (
+            MetadataRetrievalError(
+                error_msg=f"Received non 200 response 401 from container metadata: {SECRET_VALUE}"
+            ),
+            "HTTP 401",
+        ),
+        (HTTPClientError(error=ValueError(SECRET_VALUE)), "ValueError"),
+    ],
+)
+def test_unsafe_provider_and_validation_details_are_omitted(error, explanation, caplog):
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises((AWSConfigurationError, SecretRequestError)) as raised,
+    ):
+        AWSSecretsManager(FakeSecretsManagerClient(get_error=error)).get_secret(
+            SECRET_ID
+        )
+    assert explanation in str(raised.value)
+    assert "omitted" not in str(raised.value)
+    if (
+        isinstance(error, CredentialRetrievalError)
+        and error.kwargs["provider"] == "container-role"
+    ):
+        assert "HTTP 403" in str(raised.value)
+        assert raised.value.context["credential_endpoint_http_status"] == 403
+    assert SECRET_VALUE not in "".join(traceback.format_exception(raised.value))
+    assert_safe_logs(caplog, {SECRET_VALUE})
+
+
+@pytest.mark.parametrize(
+    "flag,retries,explanation",
+    [
+        ("MaxAttemptsReached", 3, "SDK maximum attempts reached"),
+        ("RetryQuotaReached", 1, "SDK retry quota exhausted"),
+    ],
+)
+def test_sdk_retry_exhaustion_is_reported_only_when_supplied(
+    flag, retries, explanation
+):
+    error = aws_error("ThrottlingException", "Rate exceeded")
+    error.response["ResponseMetadata"].update({"RetryAttempts": retries, flag: True})
+    manager = AWSSecretsManager(FakeSecretsManagerClient(get_error=error))
+    with pytest.raises(SecretRequestError) as raised:
+        manager.get_secret(SECRET_ID)
+    assert explanation in str(raised.value)
+    assert f"SDK retries {retries}" in str(raised.value)
+    assert raised.value.context[flag] is True
+
+    del error.response["ResponseMetadata"][flag]
+    with pytest.raises(SecretRequestError) as raised:
+        manager.get_secret(SECRET_ID)
+    assert explanation not in str(raised.value)
+    assert flag not in raised.value.context
+
+
+@pytest.mark.parametrize(
+    "error_type,error_number,during_construction",
+    [
+        (FileNotFoundError, errno.ENOENT, False),
+        (PermissionError, errno.EACCES, True),
+    ],
+)
+def test_aws_file_access_failures_retain_path_and_reason_in_bootstrap_logs(
+    monkeypatch, caplog, error_type, error_number, during_construction
+):
+    import os
+    from types import SimpleNamespace
+
+    from botocore.utils import FileWebIdentityTokenLoader
+
+    from openhound.core.clients.bhe_credentials import AWSBHECredentials
+
+    token_path = "/var/run/secrets/eks.amazonaws.com/serviceaccount/token"
+
+    def fail_open(path):
+        raise error_type(error_number, os.strerror(error_number), path) from ValueError(
+            SECRET_VALUE
+        )
+
+    token_loader = FileWebIdentityTokenLoader(token_path, _open=fail_open)
+
+    def fail(*args, **kwargs):
+        return token_loader()
+
+    monkeypatch.setattr("openhound.core.clients.aws_secrets_manager.boto3.client", fail)
+    manager = AWSSecretsManager(
+        None if during_construction else SimpleNamespace(get_secret_value=fail)
+    )
+    with pytest.raises(AWSConfigurationError) as raised:
+        manager.get_secret(SECRET_ID)
+    assert raised.value.context["file_path"] == token_path
+    assert raised.value.context["os_errno"] == error_number
+    assert SECRET_VALUE not in "".join(traceback.format_exception(raised.value))
+    assert_safe_logs(caplog, {SECRET_VALUE})
+    caplog.clear()
+
+    def stop_polling(interval):
+        assert interval == 17
+        raise RuntimeError("stop bootstrap polling")
+
+    monkeypatch.setattr(
+        "openhound.core.clients.bhe_credentials.time.sleep", stop_polling
+    )
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(RuntimeError, match="stop bootstrap polling"),
+    ):
+        AWSBHECredentials(SECRET_ID, manager).poll_until_available(17)
+    assert len(caplog.records) == 1
+    for expected in (
+        error_type.__name__,
+        token_path,
+        os.strerror(error_number),
+        "Retrying bootstrap retrieval in 17 seconds",
+    ):
+        assert expected in caplog.text
+    assert "mounts and permissions" in caplog.text
+    assert_safe_logs(caplog, {SECRET_VALUE})
+    assert all(record.exc_info is None for record in caplog.records)
