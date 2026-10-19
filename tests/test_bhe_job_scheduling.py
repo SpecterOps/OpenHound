@@ -120,7 +120,7 @@ def mock_bloodhound_api():
         app.state.jobs_current_requests += 1
         return Response(status_code=404)
 
-    @app.get("/api/v2/collector-job-queue/available")
+    @app.get("/api/v2/collie-job-queue/available")
     async def collector_job_queue(request: Request):
         query_params = dict(request.query_params)
         query_params["sort_by"] = request.query_params.getlist("sort_by")
@@ -147,7 +147,7 @@ def mock_bloodhound_api():
         app.state.start_payload = body
         return load_json("job_start.json")
 
-    @app.post("/api/v2/collector-job-queue/{job_id}/claim")
+    @app.post("/api/v2/collie-job-queue/{job_id}/claim")
     async def claim_managed_job(job_id: str, request: Request):
         app.state.managed_events.append("claim")
         app.state.collector_job_claim_requests.append(
@@ -178,7 +178,7 @@ def mock_bloodhound_api():
         app.state.end_payload = body
         return load_json("job_end.json")
 
-    @app.post("/api/v2/collector-job-queue/{job_id}/end")
+    @app.post("/api/v2/collie-job-queue/{job_id}/end")
     async def end_managed_job(job_id: str, body: dict):
         app.state.managed_events.append("end")
         app.state.collector_job_end_requests.append({"job_id": job_id, "body": body})
@@ -191,7 +191,7 @@ def mock_bloodhound_api():
             "raw-provider-secret" if status != 200 else "", status_code=status
         )
 
-    @app.post("/api/v2/collector-job-queue/{job_id}/start")
+    @app.post("/api/v2/collie-job-queue/{job_id}/start")
     async def start_collector_job(job_id: str, request: Request):
         app.state.collector_job_start_requests.append((job_id, await request.body()))
         if app.state.collector_job_start_statuses:
@@ -213,7 +213,7 @@ def mock_bloodhound_api():
                 ).isoformat()
         return Response(status_code=200)
 
-    @app.post("/api/v2/collector-job-queue/{job_id}/heartbeat")
+    @app.post("/api/v2/collie-job-queue/{job_id}/heartbeat")
     async def heartbeat_collector_job(job_id: str, request: Request):
         app.state.collector_job_heartbeat_requests.append(
             (job_id, await request.body())
@@ -683,7 +683,7 @@ def test_end_managed_job_retries_transient_errors(
     assert any(
         record.levelno == logging.DEBUG
         and getattr(record, "endpoint", None)
-        == "/api/v2/collector-job-queue/collector-job-123/end"
+        == "/api/v2/collie-job-queue/collector-job-123/end"
         for record in caplog.records
     )
 
@@ -1540,7 +1540,7 @@ def test_claim_request_is_bodyless_and_parses_data_job(
     assert captured == [
         {
             "method": "POST",
-            "path": f"/api/v2/collector-job-queue/{job_id}/claim",
+            "path": f"/api/v2/collie-job-queue/{job_id}/claim",
             "timeout": (
                 bloodhound_enterprise.MANAGED_JOB_CLAIM_CONNECT_TIMEOUT_SECONDS,
                 bloodhound_enterprise.MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS,
@@ -1696,7 +1696,7 @@ def test_managed_start_failure_retries_prepared_job_before_discovery(
         # Recovery must repeat start, not claim: BHE rejects re-claim of a running job.
         service._poll()
 
-    assert starts == [f"/api/v2/collector-job-queue/{job_id}/start"] * 4
+    assert starts == [f"/api/v2/collie-job-queue/{job_id}/start"] * 4
     assert state.collector_job_claim_requests == [{"job_id": job_id, "body": b""}]
     assert len(state.collector_job_queue_requests) == 1
     assert state.management_available_requests == 1
@@ -2320,7 +2320,7 @@ def test_committed_claim_with_lost_responses_is_reconciled_before_discovery(
 
     # A fresh discovery would offer B, which this client cannot claim while
     # holding A. Recovery must use A's retained ID instead of this result.
-    available = mock_bloodhound_api.get("/api/v2/collector-job-queue/available").json()
+    available = mock_bloodhound_api.get("/api/v2/collie-job-queue/available").json()
     assert [job["id"] for job in available["data"]["jobs"]] == [
         "22222222-2222-2222-2222-222222222222"
     ]
