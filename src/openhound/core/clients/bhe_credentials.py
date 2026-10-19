@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
-from .aws_secrets_manager import AWSSecretsManager, SecretValue
+from .aws_secrets_manager import AWSSecretsManager, SecretRetrievalError, SecretValue
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,23 @@ class AWSBHECredentials:
         startup or in response to a 401 and continue its original operation as
         soon as this method returns.
         """
+        try:
+            return self._load_credentials()
+        except Exception as error:
+            # BHE request wrappers can replace this exception before the scheduler
+            # sees it. Report the safe cause here; the caller owns retry decisions.
+            logger.error(
+                "Cannot refresh BHE credentials from secret %s: %s.",
+                self.secret_name,
+                str(error).rstrip(".")
+                if isinstance(
+                    error, (SecretRetrievalError, InvalidBHECredentialsSecret)
+                )
+                else f"Unexpected credential reader failure ({type(error).__name__})",
+            )
+            raise
 
+    def _load_credentials(self) -> BHECredentials:
         secret = self._secrets_manager.get_secret(self.secret_name)
         # TODO: The BHE secret payload format is still in flight. It may be JSON
         # with token_id/token_key fields or an encoded binary value to decode
@@ -78,12 +94,19 @@ class AWSBHECredentials:
 
         while True:
             try:
-                return self.refresh()
-            except Exception:
+                return self._load_credentials()
+            except Exception as error:  # noqa: BLE001 - bootstrap retries all reader failures
                 # AWS errors can be transient, and an absent or not-yet-populated
                 # secret is expected while a managed deployment is provisioning.
                 logger.warning(
-                    "BHE credentials are unavailable; retrying in %s seconds.",
+                    "Cannot load bootstrap BHE credentials from secret %s: %s. "
+                    "Retrying bootstrap retrieval in %s seconds.",
+                    self.secret_name,
+                    str(error).rstrip(".")
+                    if isinstance(
+                        error, (SecretRetrievalError, InvalidBHECredentialsSecret)
+                    )
+                    else f"Unexpected credential reader failure ({type(error).__name__})",
                     interval,
                 )
                 time.sleep(interval)
