@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any, Protocol
 
@@ -10,17 +11,32 @@ from botocore.exceptions import (
     ClientError,
     ConfigNotFound,
     CredentialRetrievalError,
+    HTTPClientError,
     InvalidConfigError,
+    MetadataRetrievalError,
     NoCredentialsError,
     NoRegionError,
+    ParamValidationError,
     PartialCredentialsError,
     ProfileNotFound,
+    TokenRetrievalError,
 )
 
 logger = logging.getLogger(__name__)
 
 MAX_BATCH_SIZE = 20
 _PROVIDER = "aws.secretsmanager"
+_PROVIDER_ERROR_TYPES = (
+    ConfigNotFound,
+    CredentialRetrievalError,
+    InvalidConfigError,
+    MetadataRetrievalError,
+    NoCredentialsError,
+    NoRegionError,
+    PartialCredentialsError,
+    ProfileNotFound,
+    TokenRetrievalError,
+)
 
 # Bounded defaults for AWS control-plane requests. Client construction reuses
 # this policy; injected clients retain their caller-supplied configuration.
@@ -66,17 +82,29 @@ class SecretsManagerClient(Protocol):
 class SecretRetrievalError(Exception):
     """Base class for errors retrieving a secret."""
 
+    failure_summary = "AWS secret retrieval failed"
+
+    def __init__(self, message: str, **context: Any) -> None:
+        super().__init__(message)
+        self.context = context
+
 
 class SecretNotFoundError(SecretRetrievalError):
     """The requested secret does not exist."""
+
+    failure_summary = "Credential secret not found"
 
 
 class SecretPermissionError(SecretRetrievalError):
     """The configured AWS identity cannot read the requested secret."""
 
+    failure_summary = "AWS secret access denied"
+
 
 class AWSConfigurationError(SecretRetrievalError):
     """The AWS SDK or Secrets Manager client is not configured correctly."""
+
+    failure_summary = "AWS credentials unavailable"
 
 
 class SecretRequestError(SecretRetrievalError):
@@ -88,7 +116,11 @@ class SecretBatchError(SecretRetrievalError):
 
     def __init__(self, failures: Mapping[str, SecretRetrievalError]) -> None:
         self.failures = dict(failures)
-        super().__init__("One or more AWS secret retrievals failed")
+        super().__init__(
+            "; ".join(
+                f"secret {secret_id}: {error}" for secret_id, error in failures.items()
+            )
+        )
 
 
 SecretValue = str | dict[str, Any]
@@ -137,12 +169,20 @@ class AWSSecretsManager:
             _log_debug("batch_get_secret_value", "attempt", len(chunk), chunk_index + 1)
             try:
                 response = client.batch_get_secret_value(SecretIdList=chunk)
-            except (ClientError, BotoCoreError) as error:
-                classified = _classify_aws_error(error)
+            except (
+                ClientError,
+                BotoCoreError,
+                FileNotFoundError,
+                PermissionError,
+                RuntimeError,
+            ) as error:
+                classified = _classify_aws_error(error, region=_client_region(client))
                 chunk_values: dict[str, SecretValue] = {}
                 chunk_failures = {secret_id: classified for secret_id in chunk}
             else:
-                chunk_values, chunk_failures = _parse_batch_response(response, chunk)
+                chunk_values, chunk_failures = _parse_batch_response(
+                    response, chunk, _client_region(client)
+                )
 
             values.update(chunk_values)
             failures.update(chunk_failures)
@@ -177,7 +217,13 @@ class AWSSecretsManager:
                 "secretsmanager",
                 config=DEFAULT_AWS_CLIENT_CONFIG,
             )
-        except BotoCoreError as error:
+        except (
+            ClientError,
+            BotoCoreError,
+            FileNotFoundError,
+            PermissionError,
+            RuntimeError,
+        ) as error:
             raise _classify_aws_error(error) from None
 
     def _retrieve_secret(
@@ -187,8 +233,16 @@ class AWSSecretsManager:
         try:
             response = client.get_secret_value(SecretId=secret_id)
             value = _parse_secret_value(response)
-        except (ClientError, BotoCoreError) as error:
-            classified = _classify_aws_error(error)
+        except (
+            ClientError,
+            BotoCoreError,
+            FileNotFoundError,
+            PermissionError,
+            RuntimeError,
+        ) as error:
+            classified = _classify_aws_error(
+                error, secret_id=secret_id, region=_client_region(client)
+            )
             _log_failure("get_secret_value", classified, 1, 1)
             raise classified from None
         except SecretRetrievalError as error:
@@ -202,6 +256,10 @@ class AWSSecretsManager:
 def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
+
+
+def _client_region(client: SecretsManagerClient) -> str | None:
+    return getattr(getattr(client, "meta", None), "region_name", None)
 
 
 def _parse_secret_value(response: Mapping[str, Any]) -> SecretValue:
@@ -233,6 +291,7 @@ def _parse_secret_value(response: Mapping[str, Any]) -> SecretValue:
 def _parse_batch_response(
     response: Mapping[str, Any],
     requested_ids: list[str],
+    region: str | None = None,
 ) -> tuple[dict[str, SecretValue], dict[str, SecretRetrievalError]]:
     values: dict[str, SecretValue] = {}
     failures: dict[str, SecretRetrievalError] = {}
@@ -255,7 +314,20 @@ def _parse_batch_response(
     for entry in response.get("Errors", []):
         secret_id = entry.get("SecretId")
         if isinstance(secret_id, str) and secret_id in requested_ids:
-            failures[secret_id] = _classify_aws_error(entry.get("ErrorCode"))
+            failures[secret_id] = _classify_aws_error(
+                ClientError(
+                    {
+                        "Error": {
+                            "Code": entry.get("ErrorCode"),
+                            "Message": entry.get("Message", ""),
+                        },
+                        "ResponseMetadata": response.get("ResponseMetadata", {}),
+                    },
+                    "BatchGetSecretValue",
+                ),
+                secret_id=secret_id,
+                region=region,
+            )
 
     for secret_id in requested_ids:
         if secret_id not in values and secret_id not in failures:
@@ -267,37 +339,259 @@ def _parse_batch_response(
 
 
 def _classify_aws_error(
-    error: ClientError | BotoCoreError | str | None,
+    error: ClientError
+    | BotoCoreError
+    | FileNotFoundError
+    | PermissionError
+    | RuntimeError,
+    *,
+    secret_id: str | None = None,
+    region: str | None = None,
 ) -> SecretRetrievalError:
-    """Map a boto error or AWS error code to a public retrieval exception."""
+    """Map AWS SDK/provider failures to payload-free retrieval exceptions."""
+    context: dict[str, Any] = {"sdk_exception_type": type(error).__name__}
+    location = ""
+    if secret_id is not None:
+        context["secret_id"] = secret_id
+        location += f" for secret {secret_id}"
+    if region is not None:
+        context["region"] = region
+        location += f" in {region}"
+    if isinstance(error, RuntimeError):
+        return _classify_runtime_error(error, context)
+    if isinstance(error, (FileNotFoundError, PermissionError)):
+        return _classify_file_error(error, context, location)
     if isinstance(error, ClientError):
-        error = error.response.get("Error", {}).get("Code")
-    elif isinstance(
-        error,
-        (
-            ConfigNotFound,
-            CredentialRetrievalError,
-            InvalidConfigError,
-            NoCredentialsError,
-            NoRegionError,
-            PartialCredentialsError,
-            ProfileNotFound,
-        ),
-    ):
+        return _classify_client_error(error, context, location)
+    if isinstance(error, _PROVIDER_ERROR_TYPES):
+        return _classify_provider_error(error, context)
+    return _classify_transport_error(error, context, location)
+
+
+def _classify_runtime_error(
+    error: RuntimeError, context: dict[str, Any]
+) -> SecretRetrievalError:
+    # Botocore uses a plain RuntimeError for this credential refresh failure.
+    expired_refresh_message = (
+        "Credentials were refreshed, but the refreshed credentials are still expired."
+    )
+    if str(error) == expired_refresh_message:
         return AWSConfigurationError(
-            "AWS Secrets Manager client configuration is invalid"
+            f"{expired_refresh_message} Check the credential provider and system clock.",
+            **context,
         )
-    if error == "ResourceNotFoundException":
-        return SecretNotFoundError("AWS secret was not found")
-    if error in {
-        "AccessDenied",
-        "AccessDeniedException",
-        "AuthorizationError",
-        "UnauthorizedOperation",
-        "UnrecognizedClientException",
-    }:
-        return SecretPermissionError("AWS Secrets Manager denied access to the secret")
-    return SecretRequestError("AWS Secrets Manager request could not be completed")
+    return SecretRequestError(
+        f"AWS secret retrieval failed ({type(error).__name__})",
+        **context,
+    )
+
+
+def _classify_file_error(
+    error: FileNotFoundError | PermissionError, context: dict[str, Any], location: str
+) -> AWSConfigurationError:
+    reason = error.strerror or (
+        "File not found"
+        if isinstance(error, FileNotFoundError)
+        else "Permission denied"
+    )
+    if error.filename is not None:
+        context["file_path"] = error.filename
+        reason += f": {error.filename}"
+    if error.errno is not None:
+        context["os_errno"] = error.errno
+    return AWSConfigurationError(
+        f"AWS file access{location} failed ({type(error).__name__}): {reason}. "
+        "Check the configured file path, mounts and permissions.",
+        **context,
+    )
+
+
+def _classify_client_error(
+    error: ClientError, context: dict[str, Any], location: str
+) -> SecretRetrievalError:
+    code = error.response.get("Error", {}).get("Code", "Unknown")
+    message = error.response.get("Error", {}).get("Message") or ""
+    if code in {"SignatureDoesNotMatch", "InvalidSignatureException"}:
+        # Signature diagnostics may echo canonical requests and session tokens.
+        message = (
+            "AWS could not validate the request signature; "
+            "check signing configuration, credentials and system clock"
+        )
+    operation = error.operation_name
+    context.update(aws_error_code=code, aws_operation=operation)
+    details = _aws_response_details(error.response.get("ResponseMetadata", {}), context)
+    credential_operation = operation in {
+        "AssumeRole",
+        "AssumeRoleWithWebIdentity",
+        "AssumeRoleWithSAML",
+        "GetSessionToken",
+        "GetRoleCredentials",
+        "CreateToken",
+    }
+    error_type: type[SecretRetrievalError] = SecretRequestError
+    guidance = ""
+    if credential_operation:
+        error_type = AWSConfigurationError
+        service = (
+            "STS "
+            if operation.startswith("AssumeRole") or operation == "GetSessionToken"
+            else "AWS "
+        )
+        action = f"Cannot acquire AWS credentials: {service}{operation}"
+        if operation == "AssumeRoleWithWebIdentity" and code in {
+            "AccessDenied",
+            "AccessDeniedException",
+        }:
+            guidance = (
+                " Check workload identity configuration and role trust conditions."
+            )
+    else:
+        # Only label the service when the operation identifies it unambiguously.
+        service = (
+            "Secrets Manager"
+            if operation in {"GetSecretValue", "BatchGetSecretValue"}
+            else "AWS"
+        )
+        action = f"{service} {operation}"
+        if code == "ResourceNotFoundException":
+            error_type = SecretNotFoundError
+            guidance = " Check the secret identifier and region."
+        elif code in {
+            "AccessDenied",
+            "AccessDeniedException",
+            "AuthorizationError",
+            "UnauthorizedOperation",
+        }:
+            error_type = SecretPermissionError
+            guidance = " Check the AWS identity and resource permissions."
+        elif code in {
+            "UnrecognizedClientException",
+            "InvalidClientTokenId",
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "InvalidSignatureException",
+            "SignatureDoesNotMatch",
+        }:
+            error_type = AWSConfigurationError
+            guidance = " Check AWS credential validity and expiration."
+    explanation = f"{action}{location} returned {code}"
+    if message:
+        explanation += f": {message.rstrip('.')}"
+    return error_type(
+        f"{explanation}.{guidance}"
+        + (" " + ", ".join(details) + "." if details else ""),
+        **context,
+    )
+
+
+def _aws_response_details(
+    metadata: Mapping[str, Any], context: dict[str, Any]
+) -> list[str]:
+    """Preserve only diagnostic response metadata in the message and context."""
+    details = []
+    for key, label in (
+        ("RequestId", "Request ID"),
+        ("HTTPStatusCode", "HTTP"),
+        ("RetryAttempts", "SDK retries"),
+    ):
+        if metadata.get(key) not in (None, ""):
+            context[key] = metadata[key]
+            details.append(f"{label} {metadata[key]}")
+    for key, label in (
+        ("MaxAttemptsReached", "SDK maximum attempts reached"),
+        ("RetryQuotaReached", "SDK retry quota exhausted"),
+    ):
+        if key in metadata:
+            context[key] = metadata[key]
+            if metadata[key] is True:
+                details.append(label)
+    return details
+
+
+def _classify_provider_error(
+    error: BotoCoreError, context: dict[str, Any]
+) -> AWSConfigurationError:
+    provider = error.kwargs.get("provider")
+    if isinstance(error, MetadataRetrievalError) or (
+        isinstance(error, CredentialRetrievalError) and provider == "container-role"
+    ):
+        # Container metadata errors can embed the entire credential response body.
+        provider_message = error.kwargs.get("error_msg", "")
+        status = re.search(
+            r"Received non 200 response (\d{3}) from container metadata:",
+            provider_message,
+        )
+        explanation = "AWS credential metadata retrieval failed"
+        if provider is not None:
+            explanation += f" from provider {provider}"
+        if status is not None:
+            context["credential_endpoint_http_status"] = int(status[1])
+            explanation += f": credential endpoint returned HTTP {status[1]}"
+        elif provider_message.removeprefix("Error retrieving metadata: ") == (
+            "Unable to parse JSON returned from container metadata services"
+        ):
+            explanation += (
+                ": unable to parse JSON returned from the credential endpoint"
+            )
+        else:
+            # The SDK wraps transport errors in metadata/provider exceptions.
+            # Preserve the underlying type without echoing URLs or response bodies.
+            cause = error.__cause__ or error.__context__
+            if isinstance(cause, MetadataRetrievalError):
+                cause = cause.__cause__ or cause.__context__
+            if isinstance(cause, Exception):
+                context["transport_exception_type"] = type(cause).__name__
+                explanation += f": credential endpoint failure ({type(cause).__name__})"
+        explanation += (
+            ". Check the metadata endpoint and workload credential configuration."
+        )
+    elif isinstance(error, CredentialRetrievalError) and provider == "custom-process":
+        # credential_process failures can embed helper stderr.
+        explanation = "AWS credential_process helper failed to provide credentials. Check the helper command and its configuration (provider custom-process)."
+    elif isinstance(error, NoRegionError):
+        explanation = "AWS region is missing. Set AWS_DEFAULT_REGION or configure region in the selected AWS profile."
+    elif isinstance(error, NoCredentialsError):
+        explanation = f"{error}. Check AWS credential provider configuration (workload role, environment or selected AWS profile)."
+    else:
+        explanation = str(error)
+    return AWSConfigurationError(f"{explanation} ({type(error).__name__})", **context)
+
+
+def _classify_transport_error(
+    error: BotoCoreError, context: dict[str, Any], location: str
+) -> SecretRequestError:
+    if isinstance(error, ParamValidationError):
+        # Validation reports can echo WebIdentityToken and other authentication inputs.
+        explanation = "AWS SDK parameter validation failed; check the parameters for secret retrieval or credential acquisition."
+        # Retain known SDK parameter/rule fields, excluding the supplied value.
+        valid_types = r"<class '[\w.]+'>" + r"(?:, <class '[\w.]+'>)*"
+        details = re.findall(
+            r"^(Invalid (?:length|value|type) for (?:document )?parameter [\w.\[\]]+), "
+            r"value: [^\n]*, (?:type: <class '[\w.]+'>, )?"
+            rf"(valid min (?:length|value): -?\d+(?:\.\d+)?|valid types: {valid_types})$",
+            error.kwargs.get("report", ""),
+            re.MULTILINE,
+        )
+        if details:
+            explanation = "AWS SDK parameter validation failed: " + "; ".join(
+                f"{parameter}, {constraint}" for parameter, constraint in details
+            )
+    elif type(error) is HTTPClientError:
+        # The generic HTTP wrapper echoes arbitrary nested exceptions; specific
+        # SDK transport errors retain useful endpoint/TLS/timeout explanations.
+        explanation = "AWS HTTP transport failed."
+        transport_error = error.kwargs.get("error")
+        if isinstance(transport_error, Exception):
+            context["transport_exception_type"] = type(transport_error).__name__
+            explanation = (
+                f"AWS HTTP transport failed: {type(transport_error).__name__}."
+            )
+    else:
+        explanation = str(error)
+    return SecretRequestError(
+        f"AWS secret retrieval{location} failed ({type(error).__name__}): {explanation}",
+        **context,
+    )
 
 
 def _log_debug(
@@ -339,4 +633,6 @@ def _log_failure(
     }
     if batch_number is not None:
         extra["batch_number"] = batch_number
-    logger.error("Secret retrieval failed", extra=extra)
+    extra.update(error.context)
+    # Managed credential callers report the cause at normal logging levels.
+    logger.debug("AWS %s failed: %s", operation, error, extra=extra)
