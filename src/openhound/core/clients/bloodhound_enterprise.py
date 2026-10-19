@@ -137,7 +137,7 @@ class BloodHoundEnterprise(BloodHound):
         encoded_job_key = quote(f"eq:{job_key}", safe="")
         path = (
             "/api/v2/collector-job-queue/available?limit=1&job_key="
-            f"{encoded_job_key}"
+            f"{encoded_job_key}&sort_by=-priority&sort_by=created_at"
         )
         logger.debug(
             "Polling managed collector job queue.",
