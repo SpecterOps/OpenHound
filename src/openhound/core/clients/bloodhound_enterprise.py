@@ -136,7 +136,7 @@ class BloodHoundEnterprise(BloodHound):
         """
         encoded_job_key = quote(f"eq:{job_key}", safe="")
         path = (
-            "/api/v2/collector-job-queue/available?limit=1&job_key="
+            "/api/v2/collie-job-queue/available?limit=1&job_key="
             f"{encoded_job_key}&sort_by=-priority&sort_by=created_at"
         )
         logger.debug(
@@ -169,7 +169,7 @@ class BloodHoundEnterprise(BloodHound):
         This is used only by managed OpenHound deployments and is not
         part of the standard open-source/self-hosted collector workflow.
         """
-        path = f"/api/v2/collector-job-queue/{job_id}/claim"
+        path = f"/api/v2/collie-job-queue/{job_id}/claim"
         for attempt in range(1, MANAGED_JOB_CLAIM_MAX_ATTEMPTS + 1):
             context = {
                 "endpoint": path,
@@ -227,7 +227,7 @@ class BloodHoundEnterprise(BloodHound):
         """Move a claimed managed collector job to running."""
         self.request(
             method="POST",
-            path=f"/api/v2/collector-job-queue/{job_id}/start",
+            path=f"/api/v2/collie-job-queue/{job_id}/start",
             timeout=(
                 MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
                 MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
@@ -238,7 +238,7 @@ class BloodHoundEnterprise(BloodHound):
         """Renew the claim for a running managed collector job."""
         self.request(
             method="POST",
-            path=f"/api/v2/collector-job-queue/{job_id}/heartbeat",
+            path=f"/api/v2/collie-job-queue/{job_id}/heartbeat",
             timeout=(
                 MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
                 MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
@@ -253,7 +253,7 @@ class BloodHoundEnterprise(BloodHound):
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """End a claimed managed collector job."""
-        path = f"/api/v2/collector-job-queue/{job_id}/end"
+        path = f"/api/v2/collie-job-queue/{job_id}/end"
         payload: dict[str, Any] = {"outcome": outcome.value}
         if failure_message is not None:
             payload["failure_message"] = failure_message
