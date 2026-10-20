@@ -33,8 +33,8 @@
       },
       {
         "id": "22222222-2222-2222-2222-222222222222",
-        "job_schedule_id": 42,
-        "job_profile_id": 84,
+        "job_schedule_id": "44444444-4444-4444-4444-444444444444",
+        "job_profile_id": "55555555-5555-5555-5555-555555555555",
         "job_type_id": 8,
         "job_key": "openhound-faker",
         "params_version": "v3",
