@@ -9,8 +9,9 @@ import time
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, BinaryIO, TypeVar
 from urllib.parse import quote
+from uuid import UUID
 
 import requests
 
@@ -87,11 +88,14 @@ class BloodHoundEnterprise(BloodHound):
         self,
         method: str,
         path: str,
-        body: bytes | None = None,
+        body: bytes | BinaryIO | None = None,
         extra_headers: dict[str, str] | None = None,
         timeout: tuple[float, float] | None = None,
     ):
         """Make a BHE request, refreshing managed credentials once after a 401."""
+        position = (
+            body.tell() if body is not None and not isinstance(body, bytes) else None
+        )
         try:
             return super().request(
                 method=method,
@@ -104,6 +108,8 @@ class BloodHoundEnterprise(BloodHound):
             if error.code != 401 or self._credential_refresh is None:
                 raise
 
+        if body is not None and not isinstance(body, bytes) and position is not None:
+            body.seek(position)
         logger.info("BHE authentication failed; refreshing managed credentials.")
         credentials = self._credential_refresh()
         self.token_key = credentials.token_key
@@ -348,6 +354,30 @@ class BloodHoundEnterprise(BloodHound):
         compressed_data = gzip.compress(data.encode())
         self.request(
             method="POST", path=path, body=compressed_data, extra_headers=headers
+        )
+
+    def upload_collector_job_data(
+        self,
+        collector_job_id: UUID | str,
+        data: bytes | BinaryIO,
+        content_type: str = "application/json",
+        content_encoding: str | None = None,
+    ) -> None:
+        """Upload one data file before ending a running managed queue job.
+
+        Media type and encoding must match the supplied file. Credentials are
+        refreshed through the same request path used by other managed calls.
+        """
+        job_id = UUID(str(collector_job_id))
+        headers = {"Content-Type": content_type}
+        if content_encoding is not None:
+            headers["Content-Encoding"] = content_encoding
+        self.request(
+            method="POST",
+            path=f"/api/v2/collie-job-queue/{job_id}/ingest",
+            body=data,
+            extra_headers=headers,
+            timeout=(10, 120),
         )
 
     @property
