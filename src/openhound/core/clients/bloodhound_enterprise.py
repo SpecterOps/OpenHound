@@ -374,7 +374,7 @@ class BloodHoundEnterprise(BloodHound):
             headers["Content-Encoding"] = content_encoding
         self.request(
             method="POST",
-            path=f"/api/v2/collector-job-queue/{job_id}/ingest",
+            path=f"/api/v2/collie-job-queue/{job_id}/ingest",
             body=data,
             extra_headers=headers,
             timeout=(10, 120),

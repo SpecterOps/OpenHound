@@ -36,7 +36,7 @@ def test_upload_uses_job_endpoint_and_accepts_empty_202(monkeypatch, encoding):
     call = calls[0]
     assert call["method"] == "POST"
     assert call["url"] == (
-        f"https://bhe.example/api/v2/collector-job-queue/{JOB_ID}/ingest"
+        f"https://bhe.example/api/v2/collie-job-queue/{JOB_ID}/ingest"
     )
     assert call["data"] == data
     assert call["headers"]["Content-Type"] == "application/json"
@@ -93,7 +93,7 @@ def test_stream_upload_signs_entire_body_and_rewinds_after_401(monkeypatch):
         headers = kwargs["headers"]
         token_key = "old-key" if not calls else "new-key"
         digest = hmac.new(token_key.encode(), None, hashlib.sha256)
-        digest.update(f"POST/api/v2/collector-job-queue/{JOB_ID}/ingest".encode())
+        digest.update(f"POST/api/v2/collie-job-queue/{JOB_ID}/ingest".encode())
         digest = hmac.new(digest.digest(), None, hashlib.sha256)
         digest.update(headers["RequestDate"][:13].encode())
         digest = hmac.new(digest.digest(), uploaded, hashlib.sha256)

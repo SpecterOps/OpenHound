@@ -230,7 +230,7 @@ def mock_bloodhound_api():
         app.state.ingested_edges += len(validate_graph.graph.edges)
         return {"status": "success"}
 
-    @app.post("/api/v2/collector-job-queue/{job_id}/ingest")
+    @app.post("/api/v2/collie-job-queue/{job_id}/ingest")
     async def ingest_managed_job(job_id: str, request: Request):
         assert not app.state.collector_job_end_requests
         assert request.headers["content-type"] == "application/json"
