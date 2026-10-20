@@ -791,6 +791,7 @@ def test_jobs_starts_new_job(mock_service, mock_bloodhound_api):
     job = mock_service.check_jobs()
     assert job is not None
     assert job.id == 123
+    assert isinstance(job.id, int)
     assert mock_bloodhound_api.app.state.job_started is False
 
 
@@ -822,9 +823,13 @@ def test_managed_collector_job_check_requests_first_queue_job(
     assert mock_bloodhound_api.app.state.jobs_available_requests == 0
 
 
-def test_collector_job_queue_response_parses_contract_fields():
+def test_collector_job_queue_response_parses_contract_fields(
+    mock_service, mock_bloodhound_api
+):
     payload = load_json("collector_jobs_available_with_jobs.json")
-    response = CollectorJobsAvailable.model_validate(payload)
+    mock_bloodhound_api.app.state.collector_job_queue_response = payload
+
+    response = mock_service.client.available_collector_jobs("openhound-faker")
     job = response.data.jobs[0]
 
     assert response.count == 2
@@ -835,6 +840,7 @@ def test_collector_job_queue_response_parses_contract_fields():
     assert job.job_schedule_id is None
     assert job.job_profile_id is None
     assert job.job_type_id == 7
+    assert isinstance(job.job_type_id, int)
     assert job.job_key == "openhound-faker"
     assert job.params_version == "v2"
     assert job.params == {
@@ -857,8 +863,20 @@ def test_collector_job_queue_response_parses_contract_fields():
     assert job.created_at.isoformat() == "2026-02-20T09:00:00+00:00"
     assert job.updated_at.isoformat() == "2026-02-20T09:30:00+00:00"
 
+    associated_job = response.data.jobs[1]
+    assert associated_job.id == UUID("22222222-2222-2222-2222-222222222222")
+    assert associated_job.job_schedule_id == UUID(
+        "44444444-4444-4444-4444-444444444444"
+    )
+    assert associated_job.job_profile_id == UUID("55555555-5555-5555-5555-555555555555")
+    assert associated_job.job_type_id == 8
+    assert isinstance(associated_job.job_type_id, int)
 
-@pytest.mark.parametrize("field", ["id", "scope_client_id", "claimed_by"])
+
+@pytest.mark.parametrize(
+    "field",
+    ["id", "job_schedule_id", "job_profile_id", "scope_client_id", "claimed_by"],
+)
 def test_collector_job_queue_response_rejects_invalid_uuids(field):
     payload = load_json("collector_jobs_available_with_jobs.json")
 
@@ -868,7 +886,9 @@ def test_collector_job_queue_response_rejects_invalid_uuids(field):
         CollectorJobsAvailable.model_validate(payload)
 
 
-@pytest.mark.parametrize("field", ["scope_client_id", "claimed_by"])
+@pytest.mark.parametrize(
+    "field", ["job_schedule_id", "job_profile_id", "scope_client_id", "claimed_by"]
+)
 def test_collector_job_queue_response_requires_nullable_uuid_fields(field):
     payload = load_json("collector_jobs_available_with_jobs.json")
 
@@ -876,6 +896,35 @@ def test_collector_job_queue_response_requires_nullable_uuid_fields(field):
 
     with pytest.raises(ValueError):
         CollectorJobsAvailable.model_validate(payload)
+
+
+@pytest.mark.parametrize("operation", ["available", "claim"])
+@pytest.mark.parametrize("field", ["job_schedule_id", "job_profile_id"])
+@pytest.mark.parametrize(
+    "value", ["not-a-uuid", 42, "42"], ids=["malformed", "integer", "numeric-string"]
+)
+def test_managed_queue_clients_reject_invalid_associations(
+    mock_service, mock_bloodhound_api, operation, field, value
+):
+    state = mock_bloodhound_api.app.state
+    payload = load_json("collector_jobs_available_with_job.json")
+    job = payload["data"]["jobs"][0]
+    job[field] = value
+    state.collector_job_queue_response = payload
+    state.collector_job_claim_response = job
+
+    if operation == "available":
+        with pytest.raises(
+            RuntimeError, match="^Invalid managed collector queue response$"
+        ):
+            mock_service.client.available_collector_jobs("openhound-faker")
+        assert len(state.collector_job_queue_requests) == 1
+    else:
+        with pytest.raises(
+            RuntimeError, match="^Invalid managed collector claim response$"
+        ):
+            mock_service.client.claim_managed_job(job["id"])
+        assert len(state.collector_job_claim_requests) == 1
 
 
 def test_managed_collector_job_check_returns_no_job_for_empty_queue(
@@ -921,8 +970,10 @@ def test_poll_starts_new_job(mock_service, mock_bloodhound_api, monkeypatch):
     mock_service._poll()
 
     assert mock_service.job_running == 123
+    assert isinstance(mock_service.job_running, int)
     assert mock_service.future is submitted
     assert submitted_args[0][1:] == ("openhound-faker", 123, None, None)
+    assert isinstance(submitted_args[0][2], int)
     assert mock_bloodhound_api.app.state.job_started is True
     assert mock_bloodhound_api.app.state.start_payload == {"id": 123}
     assert mock_bloodhound_api.app.state.collector_job_queue_requests == []
@@ -1515,9 +1566,9 @@ def managed_service(mock_service, mock_bloodhound_api):
         "collector_jobs_available_with_job.json"
     )
     # Discovery is intentionally stale. Only the claimed snapshot is authoritative.
-    state.collector_job_queue_response["data"]["jobs"][0]["secret_key_id"] = (
-        "stale-reference"
-    )
+    state.collector_job_queue_response["data"]["jobs"][0][
+        "secret_key_id"
+    ] = "stale-reference"
     claimed_at = datetime.now(UTC)
     state.collector_job_claim_response.update(
         secret_key_id="private-secret-reference",
@@ -1548,9 +1599,20 @@ def managed_service(mock_service, mock_bloodhound_api):
     return mock_service
 
 
+@pytest.mark.parametrize("has_schedule", [False, True], ids=["no-schedule", "schedule"])
+@pytest.mark.parametrize("has_profile", [False, True], ids=["no-profile", "profile"])
 def test_claim_request_is_bodyless_and_parses_data_job(
-    managed_service, mock_bloodhound_api, monkeypatch
+    managed_service, mock_bloodhound_api, monkeypatch, has_schedule, has_profile
 ):
+    state = mock_bloodhound_api.app.state
+    associated_job = load_json("collector_jobs_available_with_jobs.json")["data"][
+        "jobs"
+    ][1]
+    schedule_id = associated_job["job_schedule_id"] if has_schedule else None
+    profile_id = associated_job["job_profile_id"] if has_profile else None
+    state.collector_job_claim_response.update(
+        job_schedule_id=schedule_id, job_profile_id=profile_id
+    )
     captured = []
     original = managed_service.client.request
 
@@ -1565,6 +1627,11 @@ def test_claim_request_is_bodyless_and_parses_data_job(
     assert claimed == CollectorJob.model_validate(
         mock_bloodhound_api.app.state.collector_job_claim_response
     )
+    assert claimed.id == UUID(job_id)
+    assert claimed.job_schedule_id == (UUID(schedule_id) if schedule_id else None)
+    assert claimed.job_profile_id == (UUID(profile_id) if profile_id else None)
+    assert claimed.job_type_id == 7
+    assert isinstance(claimed.job_type_id, int)
     assert captured == [
         {
             "method": "POST",
@@ -1612,11 +1679,22 @@ def test_managed_poll_claims_retrieves_and_hands_off_authoritative_job(
         assert all(forbidden not in repr(r.__dict__) for r in caplog.records)
 
 
+@pytest.mark.parametrize(
+    "association_index", [0, 1], ids=["null-associations", "uuid-associations"]
+)
 def test_managed_poll_starts_claimed_job_and_tracks_worker(
-    managed_service, mock_bloodhound_api, monkeypatch
+    managed_service, mock_bloodhound_api, monkeypatch, association_index
 ):
     service = managed_service
     state = mock_bloodhound_api.app.state
+    associated_job = load_json("collector_jobs_available_with_jobs.json")["data"][
+        "jobs"
+    ][association_index]
+    for field in ("job_schedule_id", "job_profile_id"):
+        state.collector_job_queue_response["data"]["jobs"][0][field] = associated_job[
+            field
+        ]
+        state.collector_job_claim_response[field] = associated_job[field]
     service.managed_job_runner = service._run_prepared_managed_job
     future = Future()
     submitted = []
@@ -3001,7 +3079,10 @@ def test_shutdown_keeps_heartbeating_until_managed_worker_finishes(
     assert mock_service.future is None
 
 
-@pytest.mark.parametrize("failure_phase", ["upload", "success_report", "failure_report"])
+@pytest.mark.parametrize(
+    "failure_phase", ["upload", "success_report", "failure_report"]
+)
+@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_shutdown_retries_completion_and_renews_claim(
     mock_service, mock_bloodhound_api, monkeypatch, tmp_path, caplog, failure_phase
 ):
@@ -3069,7 +3150,9 @@ def test_managed_shutdown_retries_completion_and_renews_claim(
     assert mock_bloodhound_api.app.state.collector_job_end_requests == [
         {"job_id": job_id, "body": body}
     ]
-    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == [(job_id, b"")]
+    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == [
+        (job_id, b"")
+    ]
     assert mock_bloodhound_api.app.state.job_ended is False
     assert mock_service.future is None
     assert mock_service.job_running is None
@@ -3115,7 +3198,9 @@ def test_managed_completion_fails_job_when_remaining_staged_file_disappears(
     mock_service._poll()
 
     assert uploads == [b"file-0"]
-    assert len(ends) == 1, "Missing staged data must fail the job instead of retrying forever"
+    assert (
+        len(ends) == 1
+    ), "Missing staged data must fail the job instead of retrying forever"
     assert ends[0][:2] == (job_id, ManagedJobOutcome.FAILED)
     assert ends[0][2]["failure_message"]
     assert mock_service.future is None
@@ -3124,6 +3209,7 @@ def test_managed_completion_fails_job_when_remaining_staged_file_disappears(
     assert not output.exists()
 
 
+@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_poll_cleans_partial_upload_output_after_heartbeat_claim_loss(
     mock_service, monkeypatch, tmp_path
 ):
@@ -3163,7 +3249,8 @@ def test_managed_poll_cleans_partial_upload_output_after_heartbeat_claim_loss(
     monkeypatch.setattr(mock_service.client, "upload_collector_job_data", upload)
     monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
     monkeypatch.setattr(
-        mock_service.client, "end_managed_job",
+        mock_service.client,
+        "end_managed_job",
         lambda *args, **kwargs: ends.append((args, kwargs)),
     )
 
@@ -3177,9 +3264,12 @@ def test_managed_poll_cleans_partial_upload_output_after_heartbeat_claim_loss(
     assert mock_service.job_running is None
     assert mock_service.managed_job_id is None
     assert mock_service.next_heartbeat_at is None
-    assert not output.exists(), "Claim loss must also remove partially uploaded staged data"
+    assert (
+        not output.exists()
+    ), "Claim loss must also remove partially uploaded staged data"
 
 
+@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_shutdown_retries_upload_across_multiple_heartbeat_intervals(
     mock_service, mock_bloodhound_api, monkeypatch, tmp_path
 ):
@@ -3231,9 +3321,7 @@ def test_managed_shutdown_retries_upload_across_multiple_heartbeat_intervals(
     mock_service._shutdown()
 
     assert retry_times == list(range(30, 931, 30))
-    assert uploads == [(0, b"file-0")] + [
-        (now, b"file-1") for now in range(0, 931, 30)
-    ]
+    assert uploads == [(0, b"file-0")] + [(now, b"file-1") for now in range(0, 931, 30)]
     assert heartbeats == [300, 600, 900]
     assert mock_bloodhound_api.app.state.collector_job_end_requests == [
         {"job_id": job_id, "body": {"outcome": "succeeded"}}
@@ -3245,6 +3333,7 @@ def test_managed_shutdown_retries_upload_across_multiple_heartbeat_intervals(
     assert not output.exists()
 
 
+@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_shutdown_cleans_staged_output_when_heartbeat_loses_claim(
     mock_service, mock_bloodhound_api, monkeypatch, tmp_path
 ):
@@ -3254,7 +3343,12 @@ def test_managed_shutdown_cleans_staged_output_when_heartbeat_loses_claim(
     data_file.write_bytes(b"graph")
     future = Future()
     future.set_result(
-        Result(results={}, job_id=job_id, output_path=data_file.parent, data_files=[data_file])
+        Result(
+            results={},
+            job_id=job_id,
+            output_path=data_file.parent,
+            data_files=[data_file],
+        )
     )
     mock_service.managed = True
     mock_service.job_running = mock_service.managed_job_id = job_id
@@ -3270,7 +3364,9 @@ def test_managed_shutdown_cleans_staged_output_when_heartbeat_loses_claim(
         raise AssertionError("A lost claim must not upload data")
 
     monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
-    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", unexpected_upload)
+    monkeypatch.setattr(
+        mock_service.client, "upload_collector_job_data", unexpected_upload
+    )
     mock_service._shutdown()
 
     assert mock_service.future is None
@@ -3377,7 +3473,9 @@ def test_managed_completion_retries_remaining_uploads_before_ending(
 
     mock_service._handle_completed_job(future)
     assert calls == [
-        b"file-0", b"file-1", b"file-1",
+        b"file-0",
+        b"file-1",
+        b"file-1",
         (str(job_id), ManagedJobOutcome.SUCCEEDED),
     ]
     assert mock_service.future is None
@@ -3485,7 +3583,9 @@ def test_managed_end_retry_does_not_upload_accepted_files_again(
     output.mkdir()
     data_file = output / "nodes.json"
     data_file.write_bytes(b"graph")
-    result = Result(results={}, job_id=job_id, output_path=output, data_files=[data_file])
+    result = Result(
+        results={}, job_id=job_id, output_path=output, data_files=[data_file]
+    )
     future = Future()
     future.set_result(result)
     mock_service.managed = True
@@ -3495,7 +3595,8 @@ def test_managed_end_retry_does_not_upload_accepted_files_again(
     uploads = []
     ends = []
     monkeypatch.setattr(
-        mock_service.client, "upload_collector_job_data",
+        mock_service.client,
+        "upload_collector_job_data",
         lambda job, data: uploads.append(data.read()),
     )
 
@@ -3527,14 +3628,17 @@ def test_managed_collection_failure_ends_failed_without_upload(
     mock_service.future = future
     ends = []
     monkeypatch.setattr(
-        mock_service.client, "end_managed_job",
+        mock_service.client,
+        "end_managed_job",
         lambda *args, **kwargs: ends.append((args, kwargs)),
     )
 
     def unexpected_upload(*args, **kwargs):
         raise AssertionError("Failed collections must not upload")
 
-    monkeypatch.setattr(mock_service.client, "upload_collector_job_data", unexpected_upload)
+    monkeypatch.setattr(
+        mock_service.client, "upload_collector_job_data", unexpected_upload
+    )
     mock_service._handle_completed_job(future)
     assert ends[0][0] == (str(job_id), ManagedJobOutcome.FAILED)
     assert ends[0][1]["failure_message"] == "Collector 'openhound-faker' not found"
@@ -3543,8 +3647,15 @@ def test_managed_collection_failure_ends_failed_without_upload(
 
 
 def test_managed_collection_stages_then_uploads_before_job_end(
-    mock_service, mock_bloodhound_api
+    mock_service, mock_bloodhound_api, monkeypatch, tmp_path
 ):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / ".dlt"))
+    monkeypatch.setattr(
+        scheduler_service.dataflow,
+        "Path",
+        lambda value: tmp_path if value == "/tmp/openhound" else Path(value),
+    )
     job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
     result = _subprocess_collect("faker", job_id, managed=True)
     assert result.data_files
@@ -3581,7 +3692,12 @@ def test_start_claimed_managed_job_passes_uuid_and_staging_mode_to_worker(mock_s
     mock_service.start_claimed_managed_job(job)
     args, _kwargs, future = mock_service.executor.submitted[0]
     assert args == (
-        _subprocess_collect, "openhound-faker", str(job.id), None, None, True
+        _subprocess_collect,
+        "openhound-faker",
+        str(job.id),
+        None,
+        None,
+        True,
     )
     assert mock_service.future is future
     assert mock_service.job_running == str(job.id)
@@ -3602,10 +3718,13 @@ def test_start_claimed_managed_job_rejects_unclaimed_jobs(mock_service, managed)
 def test_failed_managed_conversion_cleans_up_staged_files(monkeypatch, tmp_path):
     output = tmp_path / "output"
     output.mkdir()
-    monkeypatch.setattr(scheduler_service.tempfile, "mkdtemp", lambda **kwargs: str(output))
+    monkeypatch.setattr(
+        scheduler_service.tempfile, "mkdtemp", lambda **kwargs: str(output)
+    )
     collector = SimpleNamespace(name="example", package_version="1", metadata=None)
     monkeypatch.setattr(
-        scheduler_service.CollectorManager, "from_entrypoint",
+        scheduler_service.CollectorManager,
+        "from_entrypoint",
         lambda: SimpleNamespace(collectors=[collector]),
     )
 
