@@ -2,7 +2,9 @@ import json
 import logging
 import math
 import os
+import shutil
 import signal
+import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -111,6 +113,10 @@ def _usable_credential_value(value: Any) -> bool:
 class Result:
     results: dict
     job_id: int | str
+    output_path: Path | None = None
+    data_files: list[Path] = field(default_factory=list)
+    uploaded_files: int = 0
+    upload_failure: str | None = None
 
 
 def _set_managed_source_environment(
@@ -141,6 +147,7 @@ def _subprocess_collect(
     job_id: int | str,
     params: dict[str, Any] | None = None,
     secrets: dict[str, Any] | None = None,
+    managed: bool = False,
 ) -> Result:
     """A subprocess which runs the DLT pipeline for the specified collector.
 
@@ -149,6 +156,7 @@ def _subprocess_collect(
     Args:
         collector_name: The name of the extension to run.
         job_id: The Job ID as returned by BHE.
+        managed: Stage OpenGraph files for upload after collection completes.
 
     Returns:
         Result: The result of the collection, including the collected data and the job ID.
@@ -189,13 +197,30 @@ def _subprocess_collect(
                 job_id,
                 extra=log_fields,
             )
-            results = dataflow.pipeline(extension=collector)
+            output_path = (
+                Path(tempfile.mkdtemp(prefix="openhound-job-")) if managed else None
+            )
+            try:
+                results = (
+                    dataflow.pipeline(extension=collector)
+                    if output_path is None
+                    else dataflow.pipeline(extension=collector, output_path=output_path)
+                )
+            except BaseException:
+                if output_path is not None:
+                    shutil.rmtree(output_path)
+                raise
             logger.info(
                 "Collection for job %s completed successfully.",
                 job_id,
                 extra=log_fields,
             )
-            return Result(results=results, job_id=job_id)
+            return Result(
+                results=results,
+                job_id=job_id,
+                output_path=output_path,
+                data_files=sorted(output_path.glob("*.json")) if output_path else [],
+            )
 
     logger.error(f"Collector '{collector_name}' not found in available collectors.")
     raise ExtensionNotFoundError(f"Collector '{collector_name}' not found.")
@@ -266,13 +291,15 @@ class Service:
         logger.warning(f"Received signal {sig}, shutting down gracefully.")
 
     def _shutdown(self) -> None:
-        """Finish the active job and keep checking in until its worker stops."""
+        """Wait for the worker and finish any pending managed uploads."""
         logger.info("Collection service stopping.")
         while self.future is not None and not self.future.done():
             self._poll_running_job()
             if self.future is not None:
                 time.sleep(self.interval)
-        if self.future is not None:
+        if self.managed_job_id is not None:
+            self._finish_managed_job_on_shutdown()
+        elif self.future is not None:
             try:
                 self._handle_completed_job(self.future)
             except Exception:
@@ -282,6 +309,22 @@ class Service:
                 self._clear_running_job()
         self.executor.shutdown(wait=True, cancel_futures=True)
         logger.info("Collection service stopped.")
+
+    def _finish_managed_job_on_shutdown(self) -> None:
+        """Retry a completed managed job while maintaining its claim."""
+        while self.future is not None:
+            self._poll_running_job()
+            if self.future is None:
+                return
+            try:
+                self._handle_completed_job(self.future)
+            except Exception:  # noqa: BLE001 - retain managed work and redact sensitive errors
+                logger.error(
+                    "Error reporting completed managed job during shutdown; "
+                    "retaining result for retry."
+                )
+            if self.future is not None:
+                time.sleep(self.interval)
 
     def _clear_running_job(self) -> None:
         self.future = None
@@ -592,6 +635,7 @@ class Service:
                 job_id,
                 dict(params or {}) if managed else None,
                 dict(secrets or {}) if managed else None,
+                *((True,) if managed else ()),
             )
         except BrokenProcessPool:
             logger.exception("Failed to submit job %s: process pool is broken.", job_id)
@@ -661,6 +705,7 @@ class Service:
         logger.warning(
             "Managed collector job %s claim lost; stopping collection.", job_id
         )
+        future = self.future
         processes = list((self.executor._processes or {}).values())
         try:
             for process in processes:
@@ -672,11 +717,21 @@ class Service:
         except Exception:
             logger.exception("Error shutting down executor after claim loss.")
         finally:
+            # Completed workers can leave staged output awaiting upload. Clean
+            # it before discarding the result, regardless of how claim loss arose.
+            if (
+                future is not None
+                and future.done()
+                and not future.cancelled()
+                and future.exception() is None
+            ):
+                self._remove_job_output(future.result())
             self._clear_running_job()
             self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
         """Report the completed worker's outcome through the active job API."""
+        result: Result | None = None
         try:
             result = future.result()
             logger.info(f"Job {result.job_id} completed successfully, notifying BHE.")
@@ -705,10 +760,54 @@ class Service:
                 f"Unexpected error while running '{self.collector_name}' collector"
             )
         else:
-            status = JobStatus.COMPLETE
-            message = f"Collector '{self.collector_name}' completed successfully"
+            if self.managed_job_id is not None and result.output_path is not None:
+                if result.job_id != self.job_running:
+                    raise ValueError("Managed collection result does not match the running job")
+                while (
+                    result.upload_failure is None
+                    and result.uploaded_files < len(result.data_files)
+                ):
+                    data_file = result.data_files[result.uploaded_files]
+                    try:
+                        data = data_file.open("rb")
+                    except FileNotFoundError:
+                        result.upload_failure = (
+                            "Collector data upload failed: staged file is missing"
+                        )
+                        break
+                    try:
+                        with data:
+                            self.client.upload_collector_job_data(self.managed_job_id, data)
+                    except BloodHoundHTTPError as error:
+                        if error.code in (404, 409):
+                            self._abort_managed_job(self.managed_job_id)
+                            return
+                        if error.code not in (400, 401, 403, 415):
+                            raise
+                        # Retain the failure across polls if reporting it fails.
+                        # Response bodies can contain sensitive collected data.
+                        result.upload_failure = (
+                            f"Collector data upload rejected (HTTP {error.code})"
+                        )
+                        break
+                    result.uploaded_files += 1
+            if result.upload_failure is not None:
+                status = JobStatus.FAILED
+                message = result.upload_failure
+            else:
+                status = JobStatus.COMPLETE
+                message = f"Collector '{self.collector_name}' completed successfully"
         self._end_job(status, message)
+        if self.managed_job_id is not None and result is not None:
+            self._remove_job_output(result)
         self._clear_running_job()
+
+    def _remove_job_output(self, result: Result) -> None:
+        if result.output_path is not None:
+            try:
+                shutil.rmtree(result.output_path)
+            except OSError:
+                logger.exception("Unable to remove output for job %s.", result.job_id)
 
     def _poll_running_job(self) -> None:
         if self.managed_job_id is not None:
@@ -724,6 +823,28 @@ class Service:
                 _ = self.client.jobs_current
             except Exception:
                 logger.exception("Error checking in-progress job.")
+
+    def start_claimed_managed_job(self, job: CollectorJob) -> None:
+        """Run a managed job after the queue caller has claimed it.
+
+        Claiming and renewing the job belongs to the queue scheduling flow.
+        """
+        if not self.managed:
+            raise ValueError("Managed collections are not enabled")
+        if self.job_running is not None or self.future is not None:
+            raise ValueError("A collector job is already running")
+        if job.status != "running" or job.claimed_by is None:
+            raise ValueError("The managed collector job must be claimed and running")
+        self.job_running = str(job.id)
+        self.managed_job_id = str(job.id)
+        self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
+        try:
+            self.future = self.executor.submit(
+                _subprocess_collect, self.collector_name, str(job.id), None, None, True
+            )
+        except BrokenProcessPool as error:
+            self.future = Future()
+            self.future.set_exception(error)
 
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
