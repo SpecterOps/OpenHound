@@ -58,8 +58,8 @@ class JobsEnd(BaseModel):
 
 class CollectorJob(BaseModel):
     id: UUID
-    job_schedule_id: int | None
-    job_profile_id: int | None
+    job_schedule_id: UUID | None
+    job_profile_id: UUID | None
     job_type_id: int
     job_key: str
     params_version: str
