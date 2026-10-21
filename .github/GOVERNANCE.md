@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://community.specterops.io/" target="_blank">
-    <img alt="Community of SpecterOps - Creators of BloodHound" src=".github/GitHub-GOV-Header.png" width="100%" style="max-width: 100%;">
+    <img alt="Community of SpecterOps - Creators of BloodHound" src="https://raw.githubusercontent.com/SpecterOps/OpenHound/refs/heads/main/.github/GitHub-GOV-Header.png" width="100%" style="max-width: 100%;">
   </a>
 </p>
 
