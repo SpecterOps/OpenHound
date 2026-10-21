@@ -46,6 +46,10 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_aws_secrets_manager.py -v
 
+      - name: Run managed configuration and AWS profile adapter tests
+        run: |
+          .venv/bin/pytest tests/test_managed_configuration.py tests/test_aws_profile_adapter.py -v
+
       - name: Run log handling tests
         run: |
           .venv/bin/pytest tests/test_log_handlers.py -v
