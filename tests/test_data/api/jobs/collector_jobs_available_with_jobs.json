@@ -10,11 +10,17 @@
         "job_profile_id": null,
         "job_type_id": 7,
         "job_key": "openhound-faker",
-        "params_version": "v2",
+        "version": "v2",
         "params": {
-          "domains": ["example.com", "example.org"],
-          "include_deleted": false,
-          "nested": {"depth": 2}
+          "sources": {
+            "source": {
+              "random": {
+                "domains": ["example.com", "example.org"],
+                "include_deleted": false,
+                "nested": {"depth": 2}
+              }
+            }
+          }
         },
         "scope_client_id": null,
         "secret_key_id": null,
@@ -37,8 +43,8 @@
         "job_profile_id": "55555555-5555-5555-5555-555555555555",
         "job_type_id": 8,
         "job_key": "openhound-faker",
-        "params_version": "v3",
-        "params": {"mode": "full"},
+        "version": "v3",
+        "params": {"sources": {"source": {"random": {"mode": "full"}}}},
         "scope_client_id": "33333333-3333-3333-3333-333333333333",
         "secret_key_id": "secret-1",
         "priority": 5,
