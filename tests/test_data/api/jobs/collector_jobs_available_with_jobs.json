@@ -23,6 +23,7 @@
           }
         },
         "scope_client_id": null,
+        "external_secret_key_id": null,
         "secret_key_id": null,
         "priority": 10,
         "status": "ready",
@@ -46,6 +47,7 @@
         "version": "v3",
         "params": {"sources": {"source": {"random": {"mode": "full"}}}},
         "scope_client_id": "33333333-3333-3333-3333-333333333333",
+        "external_secret_key_id": "external-key",
         "secret_key_id": "secret-1",
         "priority": 5,
         "status": "ready",
