@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import tempfile
+import traceback
 from collections.abc import Callable, Iterator
 from configparser import ConfigParser
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from botocore.exceptions import BotoCoreError, ClientError
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.providers.provider import ConfigProvider
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
@@ -27,6 +29,7 @@ from filelock import FileLock, Timeout
 from openhound.core.clients.aws_secrets_manager import (
     SecretRetrievalError,
     SecretValue,
+    _classify_aws_error,
     _configure_safe_sdk_logging,
 )
 from openhound.core.clients.models.jobs import CollectorJob
@@ -335,6 +338,33 @@ def _safe_sdk_logging() -> Iterator[None]:
             sdk_logger.disabled = disabled
 
 
+def _log_collection_failure(error: Exception) -> None:
+    # Collector/DLT wrappers can copy SDK messages into their own text. If an
+    # SDK cause exists, report only classified diagnostics, never either message:
+    # they can include temporary STS credentials not covered by pair redaction.
+    cause: BaseException | None = error
+    seen: set[int] = set()
+    while isinstance(cause, BaseException) and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, (BotoCoreError, ClientError)):
+            diagnostics = _classify_aws_error(cause).safe_diagnostics
+            assert diagnostics is not None  # Always supplied by the SDK classifier.
+            message, context = diagnostics
+            logger.error(
+                "Managed AWS collection failed (%s): %s\n"
+                "Traceback (most recent call last):\n%s",
+                type(error).__name__,
+                message,
+                "".join(traceback.format_tb(error.__traceback__)),
+                extra=context,
+            )
+            return
+        cause = (
+            getattr(cause, "exception", None) or cause.__cause__ or cause.__context__
+        )
+    logger.exception("Managed AWS collection failed")
+
+
 @contextmanager
 def managed_aws_profile(
     params: dict[str, Any], credentials: AWSAccessKeyCredentials, directory: Path
@@ -362,29 +392,32 @@ def managed_aws_profile(
             ),
             _safe_sdk_logging(),
         ):
-            _write_ini(
-                files["AWS_SHARED_CREDENTIALS_FILE"],
-                {
-                    profile: {
-                        "aws_access_key_id": credentials.access_key_id,
-                        "aws_secret_access_key": credentials.secret_access_key,
-                    }
-                },
-            )
-            _write_ini(files["AWS_CONFIG_FILE"], {f"profile {profile}": {}})
-            os.environ.update({key: str(path) for key, path in files.items()})
-            providers.providers = [
-                _SourceCredentialFallback(p) for p in previous_providers
-            ]
-            with managed_job_configuration(document, {}):
-                yield profile
-    except ManagedConfigurationError:
-        raise
-    except Exception:  # noqa: BLE001 - sanitize arbitrary collector/SDK failures
-        # Worker exception messages and remote tracebacks may contain SDK values.
-        raise ManagedConfigurationError(
-            "Managed AWS collection failed; check worker logs"
-        ) from None
+            try:
+                _write_ini(
+                    files["AWS_SHARED_CREDENTIALS_FILE"],
+                    {
+                        profile: {
+                            "aws_access_key_id": credentials.access_key_id,
+                            "aws_secret_access_key": credentials.secret_access_key,
+                        }
+                    },
+                )
+                _write_ini(files["AWS_CONFIG_FILE"], {f"profile {profile}": {}})
+                os.environ.update({key: str(path) for key, path in files.items()})
+                providers.providers = [
+                    _SourceCredentialFallback(p) for p in previous_providers
+                ]
+                with managed_job_configuration(document, {}):
+                    yield profile
+            except ManagedConfigurationError:
+                raise
+            except Exception as error:  # noqa: BLE001 - collector/SDK failures
+                _log_collection_failure(error)
+                # Keep remote tracebacks payload-free after logging locally
+                # while the worker's redaction and SDK controls are active.
+                raise ManagedConfigurationError(
+                    "Managed AWS collection failed; check worker logs"
+                ) from None
     finally:
         providers.providers = previous_providers
         for key, previous in previous_environment.items():

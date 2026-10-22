@@ -385,6 +385,7 @@ def _safe_aws_diagnostics(
         if operation not in {
             "GetSecretValue",
             "BatchGetSecretValue",
+            "GetCallerIdentity",
             "AssumeRole",
             "AssumeRoleWithWebIdentity",
             "AssumeRoleWithSAML",
@@ -422,9 +423,19 @@ def _safe_aws_diagnostics(
                 " Check workload identity configuration and role trust conditions."
             )
         elif isinstance(classified, SecretPermissionError):
-            reason += " Check the runtime AWS identity and secret permissions."
+            resource = (
+                "secret"
+                if operation in {"GetSecretValue", "BatchGetSecretValue"}
+                else "resource"
+            )
+            reason += f" Check the runtime AWS identity and {resource} permissions."
         elif isinstance(classified, SecretNotFoundError):
-            reason += " Check the secret identifier and runtime AWS region."
+            resource = (
+                "secret"
+                if operation in {"GetSecretValue", "BatchGetSecretValue"}
+                else "resource"
+            )
+            reason += f" Check the {resource} identifier and runtime AWS region."
         elif isinstance(classified, AWSConfigurationError):
             reason += " Check runtime AWS credential validity, signing and expiration."
     elif type(error) in (NoRegionError, NoCredentialsError, RuntimeError):

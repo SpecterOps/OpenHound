@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import boto3
 import dlt
 import pytest
+from botocore.exceptions import ClientError, ParamValidationError
 from botocore.httpsession import URLLib3Session
 from botocore.stub import Stubber
 from dlt.common.configuration.container import Container
@@ -107,7 +108,9 @@ def test_boto3_file_provider_uses_exact_pair_without_a_session_token(
             assert sts.get_caller_identity()["Account"] == SOURCE_ACCOUNT
 
 
-def test_partial_profile_write_failure_restores_worker_state(workspace, monkeypatch):
+def test_partial_profile_write_failure_restores_worker_state(
+    workspace, monkeypatch, caplog
+):
     original_environment = dict(os.environ)
     providers = Container()[PluggableRunContext].providers
     original_providers = providers.providers
@@ -125,9 +128,77 @@ def test_partial_profile_write_failure_restores_worker_state(workspace, monkeypa
     ):
         pytest.fail("partial profile cannot run collection")
     assert SECRET_KEY not in "".join(traceback.format_exception(error.value))
+    assert "OSError: [REDACTED]" in caplog.text
+    assert "fail_config_write" in caplog.text
+    assert SECRET_KEY not in caplog.text
     assert not (workspace.directory / "credentials").exists()
     assert dict(os.environ) == original_environment
     assert providers.providers is original_providers
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "wrapped"])
+@pytest.mark.parametrize("sdk_error", [False, True], ids=["client", "botocore"])
+def test_unlogged_sdk_failures_keep_safe_diagnostics(
+    workspace, caplog, wrapped, sdk_error
+):
+    temporary_secret = "temporary-secret-not-in-raw-pair"
+    payload = f"{ACCESS_KEY} {SECRET_KEY} {temporary_secret}"
+    failure = (
+        ParamValidationError(report=payload)
+        if sdk_error
+        else ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": payload}},
+            "GetCallerIdentity",
+        )
+    )
+    with (
+        pytest.raises(ManagedConfigurationError) as error,
+        caplog.at_level(logging.INFO),
+        managed_aws_profile({}, PAIR, workspace.directory),
+    ):
+        try:
+            raise failure
+        except Exception as cause:
+            if wrapped:
+                raise RuntimeError(f"Collector failed: {payload}") from cause
+            raise
+
+    record = next(
+        record
+        for record in caplog.records
+        if "Managed AWS collection failed" in record.getMessage()
+    )
+    assert record.levelno == logging.ERROR
+    assert record.sdk_exception_type == type(failure).__name__
+    assert "test_unlogged_sdk_failures_keep_safe_diagnostics" in record.getMessage()
+    if sdk_error:
+        assert "parameter validation failed" in record.getMessage()
+    else:
+        assert "GetCallerIdentity returned AccessDenied" in record.getMessage()
+        assert "resource permissions" in record.getMessage()
+    if wrapped:
+        assert "RuntimeError" in record.getMessage()
+    for value in (ACCESS_KEY, SECRET_KEY, temporary_secret):
+        assert value not in caplog.text
+        assert all(value not in repr(record.__dict__) for record in caplog.records)
+        assert value not in "".join(traceback.format_exception(error.value))
+    assert str(error.value) == "Managed AWS collection failed; check worker logs"
+    assert not (workspace.directory / "credentials").exists()
+
+
+def test_unlogged_import_failure_keeps_redacted_traceback(workspace, caplog):
+    with (
+        pytest.raises(ManagedConfigurationError),
+        managed_aws_profile({}, PAIR, workspace.directory),
+    ):
+        raise ModuleNotFoundError(f"Missing extension for {ACCESS_KEY}: {SECRET_KEY}")
+
+    assert "ModuleNotFoundError: Missing extension for [REDACTED]: [REDACTED]" in (
+        caplog.text
+    )
+    assert "Traceback (most recent call last)" in caplog.text
+    assert ACCESS_KEY not in caplog.text
+    assert SECRET_KEY not in caplog.text
 
 
 def test_sdk_debug_responses_are_suppressed_and_logging_state_restored(
