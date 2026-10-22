@@ -44,13 +44,24 @@ class _ValueRedactor(logging.Filter):
         return self._redact(str(value))
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # Preserve argument types during interpolation, then redact the result.
+        record.msg = self._redact(record.getMessage())
+        record.args = ()
         if record.exc_info:
             record.exc_text = self._redact(
                 "".join(traceback.format_exception(*record.exc_info))
             )
             # Rich handlers can format the exception again, including locals.
             record.exc_info = None
-        record.__dict__.update(self._redact(record.__dict__))
+        record.__dict__.update(
+            self._redact(
+                {
+                    key: value
+                    for key, value in record.__dict__.items()
+                    if key not in ("msg", "args")
+                }
+            )
+        )
         return True
 
 

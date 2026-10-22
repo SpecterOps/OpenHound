@@ -1,6 +1,7 @@
 import json
 import logging
 from contextlib import nullcontext
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from openhound.core.logging import (
     OpenHoundRichFormatter,
     OpenHoundTextFormatter,
     RotatingFileHandler,
+    _ValueRedactor,
     redact_log_values,
 )
 
@@ -297,6 +299,46 @@ def test_text_formatter_produces_plain_text():
 
     with pytest.raises(json.JSONDecodeError):
         json.loads(output)
+
+
+@pytest.mark.parametrize(
+    "message,args,secret,expected",
+    [
+        ("Key %d", (12345,), "12345", "Key [REDACTED]"),
+        (
+            "Key %s costs %.2f",
+            ("example-secret-key", Decimal("12.34")),
+            "example-secret-key",
+            "Key [REDACTED] costs 12.34",
+        ),
+        (
+            "Key %(key)s costs %(cost).2f",
+            ({"key": "example-secret-key", "cost": Decimal("12.34")},),
+            "example-secret-key",
+            "Key [REDACTED] costs 12.34",
+        ),
+        (
+            "Key %r",
+            (Path("example-secret-key"),),
+            "example-secret-key",
+            f"Key {Path('[REDACTED]')!r}",
+        ),
+    ],
+    ids=["numeric-secret", "typed-positional", "typed-mapping", "object-repr"],
+)
+def test_redaction_formats_original_arguments(message, args, secret, expected):
+    record = logging.LogRecord("test", logging.INFO, __file__, 1, message, args, None)
+    record.response = {"credential": secret, "count": 7}
+    redactor = _ValueRedactor((secret,))
+
+    for formatter in (OpenHoundTextFormatter(), OpenHoundJSONFormatter()):
+        # Each handler filters the same record; subsequent passes must be safe.
+        assert redactor.filter(record)
+        assert record.msg == record.getMessage() == expected
+        assert record.args == ()
+        assert record.response == {"credential": "[REDACTED]", "count": 7}
+        assert secret not in repr(record.__dict__)
+        assert secret not in formatter.format(record)
 
 
 @pytest.mark.parametrize("redacted", [False, True], ids=["original", "redacted"])
