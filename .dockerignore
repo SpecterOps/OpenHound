@@ -1,0 +1,15 @@
+.git
+.venv
+.env
+.env.*
+.dlt
+.idea
+.intent
+**/__pycache__
+.*_cache
+.benchmark-results
+dist
+output
+logs
+*.duckdb
+*.duckdb.*

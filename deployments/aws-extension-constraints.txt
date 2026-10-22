@@ -1,0 +1,30 @@
+# Additional packages resolved with AWS commit b5a5041367fa603c9b159479a3aa327fa3f0059f.
+# OpenHound's existing runtime packages are constrained separately from uv.lock.
+anyio==4.15.1
+ast-serialize==0.13.1
+boto3-stubs==1.43.68
+botocore-stubs==1.43.118
+cfgv==3.5.0
+deepmerge==3.0.1
+distlib==0.4.4
+h11==0.16.0
+httpcore2==2.12.0
+httpx2==2.12.0
+identify==2.6.20
+ijson==3.5.1
+iniconfig==2.3.1
+librt==0.16.0
+mypy==2.3.0
+mypy-extensions==1.1.0
+nodeenv==1.11.0
+pre-commit==4.6.2
+pyarrow==25.0.1
+pyroaring==1.1.0
+pytest==9.1.1
+python-discovery==1.6.4
+ruff==0.16.2
+tomli==2.5.0
+truststore==0.10.5
+types-s3transfer==0.19.3
+virtualenv==21.14.5
+zensical==0.0.53
