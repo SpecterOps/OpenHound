@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 from uuid import UUID
 
+import dlt
 import pytest
 import requests
 from botocore.exceptions import ClientError
@@ -41,6 +42,7 @@ from openhound.core.clients.models.jobs import (
 )
 from openhound.core.models.graph import Graph
 from openhound.scheduler import service as scheduler_service
+from openhound.scheduler.configuration import ManagedConfigurationError
 from openhound.scheduler.service import (
     ExtensionNotFoundError,
     ManagedJobProcessingError,
@@ -52,6 +54,12 @@ from openhound.scheduler.service import (
 
 TEST_DATA_DIR = Path(__file__).parent / "test_data" / "api" / "jobs"
 MANAGEMENT_DATA_DIR = Path(__file__).parent / "test_data" / "api" / "management"
+CLAIMED_PARAMS = {"sources": {"source": {"random": {"node_count": 4}}}}
+COLLECTOR_SECRETS = {
+    "sources": {
+        "source": {"random": {"credentials": {"token": "private-credential-value"}}}
+    }
+}
 
 
 def load_json(filename: str) -> dict:
@@ -872,11 +880,17 @@ def test_collector_job_queue_response_parses_contract_fields(
     assert job.job_type_id == 7
     assert isinstance(job.job_type_id, int)
     assert job.job_key == "openhound-faker"
-    assert job.params_version == "v2"
+    assert job.version == "v2"
     assert job.params == {
-        "domains": ["example.com", "example.org"],
-        "include_deleted": False,
-        "nested": {"depth": 2},
+        "sources": {
+            "source": {
+                "random": {
+                    "domains": ["example.com", "example.org"],
+                    "include_deleted": False,
+                    "nested": {"depth": 2},
+                }
+            }
+        }
     }
     assert job.scope_client_id is None
     assert job.secret_key_id is None
@@ -1601,7 +1615,7 @@ def managed_service(mock_service, mock_bloodhound_api):
     state.collector_job_claim_response.update(
         secret_key_id="private-secret-reference",
         status="claimed",
-        params={"claimed_parameter": True},
+        params=CLAIMED_PARAMS,
         claimed_by="33333333-3333-3333-3333-333333333333",
         claimed_at=claimed_at.isoformat(),
         claim_expires_at=(claimed_at + timedelta(minutes=15)).isoformat(),
@@ -1613,7 +1627,7 @@ def managed_service(mock_service, mock_bloodhound_api):
     def get_secret_value(*, SecretId):
         state.managed_events.append("retrieve")
         mock_service.secret_requests.append(SecretId)
-        return {"SecretString": '{"credential":"private-credential-value"}'}
+        return {"SecretString": json.dumps(COLLECTOR_SECRETS)}
 
     mock_service.secrets_manager = AWSSecretsManager(
         SimpleNamespace(get_secret_value=get_secret_value)
@@ -1660,6 +1674,8 @@ def test_claim_request_is_bodyless_and_parses_data_job(
     assert claimed.job_profile_id == (UUID(profile_id) if profile_id else None)
     assert claimed.job_type_id == 7
     assert isinstance(claimed.job_type_id, int)
+    assert claimed.version == "v2"
+    assert claimed.params == CLAIMED_PARAMS
     assert captured == [
         {
             "method": "POST",
@@ -1685,9 +1701,9 @@ def test_managed_poll_claims_retrieves_and_hands_off_authoritative_job(
     assert state.managed_events == ["claim", "retrieve", "start_handoff"]
     assert managed_service.secret_requests == ["private-secret-reference"]
     (prepared,) = managed_service.handoffs
-    assert prepared.job.params == {"claimed_parameter": True}
+    assert prepared.job.params == CLAIMED_PARAMS
     assert prepared.job.status == "claimed"
-    assert prepared.credentials == {"credential": "private-credential-value"}
+    assert prepared.credentials == COLLECTOR_SECRETS
     assert state.job_started is False
     assert state.jobs_available_requests == state.jobs_current_requests == 0
     assert state.collector_job_end_requests == []
@@ -1705,6 +1721,74 @@ def test_managed_poll_claims_retrieves_and_hands_off_authoritative_job(
         assert forbidden not in caplog.text
         assert forbidden not in repr(prepared)
         assert all(forbidden not in repr(r.__dict__) for r in caplog.records)
+
+
+def test_managed_job_retrieves_full_hierarchy_secret_before_dlt_resolution(
+    managed_service, mock_bloodhound_api, monkeypatch, caplog
+):
+    service = managed_service
+    bhe_credentials = (service.client.token_id, service.client.token_key)
+    state = mock_bloodhound_api.app.state
+    data_dir = Path(__file__).parent / "test_data"
+    params = json.loads((data_dir / "managed_aws_configuration.json").read_text())
+    secret_document = (data_dir / "managed_aws_secrets.json").read_text()
+    service.collector_name = "aws"
+    state.collector_job_queue_response["data"]["jobs"][0]["job_key"] = "aws"
+    state.collector_job_claim_response.update(job_key="aws", params=params)
+    requests_seen = []
+
+    def get_secret_value(*, SecretId):
+        requests_seen.append(SecretId)
+        return {"SecretString": secret_document}
+
+    service.secrets_manager = AWSSecretsManager(
+        SimpleNamespace(get_secret_value=get_secret_value)
+    )
+    service.managed_job_runner = service._run_prepared_managed_job
+    collector = SimpleNamespace(
+        name="aws", dlt_source=SimpleNamespace(), package_version="test", metadata=None
+    )
+    monkeypatch.setattr(
+        scheduler_service.CollectorManager,
+        "from_entrypoint",
+        lambda: SimpleNamespace(collectors=[collector]),
+    )
+    resolved = {}
+
+    def collect(extension, output_path):
+        resolved.update(
+            profiles=dlt.secrets.get(
+                "sources.source.aws.credentials.profile_names", list
+            ),
+            region=dlt.secrets.get("sources.source.aws.credentials.region_name", str),
+            max_objects=dlt.config.get(
+                "sources.source.aws.bucket_policy.max_objects", int
+            ),
+        )
+        return {"collect": []}
+
+    monkeypatch.setattr(scheduler_service.dataflow, "pipeline", collect)
+
+    def submit(function, *args):
+        future = Future()
+        future.set_result(function(*args))
+        return future
+
+    monkeypatch.setattr(service.executor, "submit", submit)
+    with caplog.at_level(logging.DEBUG):
+        service._poll()
+        service._handle_completed_job(service.future)
+
+    assert requests_seen == ["private-secret-reference"]
+    assert resolved == {
+        "profiles": ["retrieved-profile-a", "retrieved-profile-b"],
+        "region": "us-west-2",
+        "max_objects": 50,
+    }
+    assert (service.client.token_id, service.client.token_key) == bhe_credentials
+    assert state.collector_job_end_requests[0]["body"] == {"outcome": "succeeded"}
+    for credential in ("retrieved-profile-a", "retrieved-profile-b"):
+        assert credential not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -1745,8 +1829,8 @@ def test_managed_poll_starts_claimed_job_and_tracks_worker(
             scheduler_service._subprocess_collect,
             "openhound-faker",
             job_id,
-            {"claimed_parameter": True},
-            {"credential": "private-credential-value"},
+            CLAIMED_PARAMS,
+            COLLECTOR_SECRETS,
             True,
         )
     ]
@@ -1844,8 +1928,8 @@ def test_managed_start_failure_retries_prepared_job_before_discovery(
     assert args[1:] == (
         "openhound-faker",
         job_id,
-        {"claimed_parameter": True},
-        {"credential": "private-credential-value"},
+        CLAIMED_PARAMS,
+        COLLECTOR_SECRETS,
         True,
     )
     assert service.future is future
@@ -2285,7 +2369,11 @@ def test_runtime_failure_is_sanitized_and_not_reported_as_credential_failure(
 
 
 def test_valid_generic_nested_json_is_handed_off_without_field_schema(managed_service):
-    credentials = {"arbitrary_field": {"nested": ["value", False, 0, 1.5]}}
+    credentials = {
+        "sources": {
+            "source": {"aws": {"arbitrary_field": {"nested": ["value", False, 0, 1.5]}}}
+        }
+    }
     managed_service.secrets_manager = AWSSecretsManager(
         SimpleNamespace(
             get_secret_value=lambda **kwargs: {"SecretString": json.dumps(credentials)}
@@ -2456,7 +2544,7 @@ def test_committed_claim_with_lost_responses_is_reconciled_before_discovery(
     assert service.secret_requests == ["private-secret-reference"]
     (prepared,) = service.handoffs
     assert str(prepared.job.id) == job_id
-    assert prepared.job.params == {"claimed_parameter": True}
+    assert prepared.job.params == CLAIMED_PARAMS
 
     assert len(state.collector_job_queue_requests) == discovery_count
     assert state.collector_job_claim_requests == [{"job_id": job_id, "body": b""}] * 5
@@ -2681,26 +2769,28 @@ def test_support_bundle_tracebacks_preserve_aws_auth_context(
         assert context in formatted_error
 
 
-def test_managed_worker_sets_dlt_environment_before_pipeline(monkeypatch, caplog):
+def test_managed_worker_resolves_nested_configuration_before_pipeline(
+    monkeypatch, caplog
+):
     collector = SimpleNamespace(
         name="faker",
         dlt_source=SimpleNamespace(section="source", name="random"),
         package_version="1.0.0",
         metadata=None,
     )
-    worker_environment = {}
-    observed_environment = {}
+    observed_configuration = {}
     monkeypatch.setattr(
         scheduler_service.CollectorManager,
         "from_entrypoint",
         lambda: SimpleNamespace(collectors=[collector]),
     )
-    monkeypatch.setattr(
-        scheduler_service, "os", SimpleNamespace(environ=worker_environment)
-    )
 
     def capture_pipeline(extension):
-        observed_environment.update(worker_environment)
+        observed_configuration.update(
+            node_count=dlt.config.get("sources.source.random.node_count", int),
+            filters=dlt.config.get("sources.source.random.filters", list),
+            token=dlt.secrets.get("sources.source.random.credentials.token", str),
+        )
         return {"collect": []}
 
     monkeypatch.setattr(scheduler_service.dataflow, "pipeline", capture_pipeline)
@@ -2709,24 +2799,135 @@ def test_managed_worker_sets_dlt_environment_before_pipeline(monkeypatch, caplog
         result = _subprocess_collect(
             "faker",
             "collector-job-123",
-            {"node_count": 4, "filters": ["one", "two"]},
-            {"token": "secret-value"},
+            {
+                "sources": {
+                    "source": {"random": {"node_count": 4, "filters": ["one", "two"]}}
+                }
+            },
+            {
+                "sources": {
+                    "source": {"random": {"credentials": {"token": "secret-value"}}}
+                }
+            },
         )
 
     assert result.job_id == "collector-job-123"
-    assert observed_environment == {
-        "SOURCES__SOURCE__RANDOM__NODE_COUNT": "4",
-        "SOURCES__SOURCE__RANDOM__FILTERS": '["one", "two"]',
-        "SOURCES__SOURCE__RANDOM__CREDENTIALS__TOKEN": "secret-value",
+    assert observed_configuration == {
+        "node_count": 4,
+        "filters": ["one", "two"],
+        "token": "secret-value",
     }
     assert "secret-value" not in caplog.text
 
 
-def test_managed_environment_requires_a_registered_dlt_source():
-    collector = SimpleNamespace(name="example", dlt_source=None)
+@pytest.mark.parametrize(
+    "params,secrets,reason",
+    [
+        (
+            {"private-key": "private-credential-value"},
+            {},
+            "flat configuration is not supported",
+        ),
+        (
+            CLAIMED_PARAMS,
+            {"private-key": "private-credential-value"},
+            "flat configuration is not supported",
+        ),
+        (
+            {},
+            COLLECTOR_SECRETS,
+            "must be a non-empty nested JSON object",
+        ),
+        (
+            {
+                "sources": {
+                    "source": {"random": {"node_count": "private-credential-value"}}
+                }
+            },
+            {},
+            "could not be resolved; check setting types and required fields",
+        ),
+        (
+            CLAIMED_PARAMS,
+            {
+                "sources": {
+                    "source": {"random": {"node_count": "private-credential-value"}}
+                }
+            },
+            "could not be resolved; check setting types and required fields",
+        ),
+    ],
+    ids=[
+        "flat-params",
+        "flat-secrets",
+        "empty-params",
+        "params-resolution",
+        "secrets-resolution",
+    ],
+)
+def test_managed_configuration_failure_is_logged_and_reported_with_the_same_reason(
+    mock_service,
+    mock_bloodhound_api,
+    monkeypatch,
+    caplog,
+    params,
+    secrets,
+    reason,
+):
+    monkeypatch.setattr(
+        scheduler_service.dataflow,
+        "pipeline",
+        lambda extension: {
+            "node_count": dlt.config.get("sources.source.random.node_count", int)
+        },
+    )
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(ManagedConfigurationError) as error,
+    ):
+        _subprocess_collect(
+            "faker",
+            "collector-job-123",
+            params,
+            secrets,
+        )
 
-    with pytest.raises(ValueError, match="has no registered DLT source"):
-        scheduler_service._set_managed_source_environment(collector, {}, {})
+    future = Future()
+    future.set_exception(error.value)
+    mock_service.managed = True
+    mock_service.job_running = mock_service.managed_job_id = "collector-job-123"
+    mock_service.future = future
+    mock_service._handle_completed_job(future)
+
+    (request,) = mock_bloodhound_api.app.state.collector_job_end_requests
+    assert request["body"]["outcome"] == "failed"
+    message = request["body"]["failure_message"]
+    assert reason in message
+    (record,) = [
+        record
+        for record in caplog.records
+        if record.name == "openhound.scheduler.service"
+        and record.levelno == logging.ERROR
+    ]
+    assert record.getMessage() == (
+        f"Managed job collector-job-123 configuration is invalid: {message}"
+    )
+    assert record.job_id == "collector-job-123"
+    assert record.collector_extension == mock_service.collector_name
+    assert record.exc_info is None
+    assert (
+        mock_service.future
+        is mock_service.job_running
+        is mock_service.managed_job_id
+        is None
+    )
+    assert "private-key" not in caplog.text
+    assert "private-credential-value" not in caplog.text
+    assert all(
+        "private-credential-value" not in repr(record.__dict__)
+        for record in caplog.records
+    )
+    assert "private-credential-value" not in json.dumps(request)
 
 
 def test_managed_worker_registers_real_faker_source_in_a_fresh_process(monkeypatch):
@@ -2739,9 +2940,16 @@ def inspect_collection(extension):
 
 dataflow.pipeline = inspect_collection
 result = _subprocess_collect(
-    "faker", "e0d43dbd-2cdf-4d68-9a81-2f95cd58a92f", {"node_count": 4}, {}
+    "faker", "e0d43dbd-2cdf-4d68-9a81-2f95cd58a92f",
+    {"sources": {"source": {"random": {"node_count": 4}}}}, {}
 )
 assert result.results == {"node_count": 4}, result.results
+result = _subprocess_collect(
+    "faker", "second-job", {"sources": {"source": {"random": {"node_count": 2}}}}, {}
+)
+assert result.results == {"node_count": 2}, result.results
+import dlt
+assert dlt.config.get("sources.source.random.node_count", int) == 999
 """
     subprocess.run(
         [sys.executable, "-c", code], check=True, capture_output=True, timeout=30
