@@ -1,7 +1,5 @@
-import json
 import logging
 import math
-import os
 import shutil
 import signal
 import tempfile
@@ -9,6 +7,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import import_module
@@ -40,6 +39,10 @@ from openhound.core.clients.models.jobs import (
 from openhound.core.manager import CollectorManager
 from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import dataflow
+from openhound.scheduler.configuration import (
+    ManagedConfigurationError,
+    managed_job_configuration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,29 +122,6 @@ class Result:
     upload_failure: str | None = None
 
 
-def _set_managed_source_environment(
-    collector, params: dict[str, Any], secrets: dict[str, Any]
-) -> None:
-    """Provide one managed job's validated values to its DLT source."""
-    source = collector.dlt_source
-    if source is None:
-        raise ValueError(f"Collector '{collector.name}' has no registered DLT source")
-
-    section = source.section or source.__module__.rsplit(".", 1)[-1]
-    source_name = source.name or source.__name__
-    prefix = f"SOURCES__{section.upper()}__{source_name.upper()}"
-    for name, value in params.items():
-        if name.lower() == "credentials":
-            raise ValueError("Managed job parameters cannot contain credentials")
-        os.environ[f"{prefix}__{name.upper()}"] = (
-            value if isinstance(value, str) else json.dumps(value)
-        )
-    for name, value in secrets.items():
-        os.environ[f"{prefix}__CREDENTIALS__{name.upper()}"] = (
-            value if isinstance(value, str) else json.dumps(value)
-        )
-
-
 def _subprocess_collect(
     collector_name: str,
     job_id: int | str,
@@ -165,19 +145,35 @@ def _subprocess_collect(
         ExtensionNotFoundError: If the collector cannot be found via entrypoints.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    configured = params is not None or secrets is not None
+    configuration = (
+        managed_job_configuration(params or {}, secrets or {})
+        if configured
+        else nullcontext()
+    )
+    # Install configuration before importing collectors or constructing pipelines:
+    # both can resolve DLT settings. Always remove it, including on worker failure.
+    with configuration:
+        return _collect_in_worker(collector_name, job_id, managed, configured)
+
+
+def _collect_in_worker(
+    collector_name: str, job_id: int | str, managed: bool, configured: bool
+) -> Result:
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
-        if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
-            if params is not None or secrets is not None:
-                if (
-                    collector.dlt_source is None
-                    and collector.name in MANAGED_SOURCE_MODULES
-                ):
-                    collector.dlt_source = import_module(
-                        MANAGED_SOURCE_MODULES[collector.name]
-                    ).source
-                _set_managed_source_environment(collector, params or {}, secrets or {})
+        if (
+            collector.name == collector_name
+        ):  # pyright: ignore[reportAttributeAccessIssue]
+            if (
+                configured
+                and collector.dlt_source is None
+                and collector.name in MANAGED_SOURCE_MODULES
+            ):
+                collector.dlt_source = import_module(
+                    MANAGED_SOURCE_MODULES[collector.name]
+                ).source
             log_fields = {
                 "collector_extension": collector.name,
                 "collector_extension_version": (
@@ -318,7 +314,8 @@ class Service:
                 return
             try:
                 self._handle_completed_job(self.future)
-            except Exception:  # noqa: BLE001 - retain managed work and redact sensitive errors
+            except Exception:  # noqa: BLE001
+                # Retain managed work and redact sensitive errors.
                 logger.error(
                     "Error reporting completed managed job during shutdown; "
                     "retaining result for retry."
@@ -408,7 +405,8 @@ class Service:
                 return credentials
         except SecretRetrievalError as error:
             raise CredentialValidationError(str(error), error.failure_summary) from None
-        except Exception as error:  # noqa: BLE001 - unexpected readers can expose payloads
+        except Exception as error:  # noqa: BLE001
+            # Unexpected readers can expose payloads.
             raise CredentialValidationError(
                 f"Credential secret reader failed ({type(error).__name__})",
                 "Credential secret retrieval failed",
@@ -682,7 +680,8 @@ class Service:
 
         try:
             self.client.heartbeat_collector_job(job_id)
-        except Exception as error:  # noqa: BLE001 - transient heartbeat failures must not stop collection
+        except Exception as error:  # noqa: BLE001
+            # Transient heartbeat failures must not stop collection.
             if isinstance(error, BloodHoundHTTPError) and error.code == 404:
                 self._abort_managed_job(job_id)
                 return
@@ -741,6 +740,18 @@ class Service:
             )
             status = JobStatus.FAILED
             message = f"Collector '{self.collector_name}' not found"
+        except ManagedConfigurationError as error:
+            status = JobStatus.FAILED
+            message = str(error)
+            logger.error(
+                "Managed job %s configuration is invalid: %s",
+                self.job_running,
+                message,
+                extra={
+                    "job_id": self.job_running,
+                    "collector_extension": self.collector_name,
+                },
+            )
         except BrokenProcessPool:
             logger.exception(
                 "Collection worker was terminated abruptly; resetting process pool."

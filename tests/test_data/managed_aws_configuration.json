@@ -1,0 +1,21 @@
+{
+  "sources": {
+    "source": {
+      "aws": {
+        "credentials": {
+          "profile_names": ["bhe-profile"],
+          "region_name": "us-west-2",
+          "endpoint_url": "https://aws.example.test"
+        },
+        "bucket_policy": {
+          "include": true,
+          "max_objects": 50,
+          "rule": [
+            {"include": true, "match_bucket": ".*"},
+            {"include": false, "match_object": "private/.*"}
+          ]
+        }
+      }
+    }
+  }
+}
