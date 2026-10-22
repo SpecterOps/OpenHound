@@ -1,16 +1,22 @@
 import json
 import logging
+from contextlib import nullcontext
+from io import StringIO
 from pathlib import Path
 
 import dlt
 import pytest
+from rich.console import Console
+from rich.logging import RichHandler
 
 from openhound.core.logging import (
     CustomLogger,
     LogMode,
     OpenHoundJSONFormatter,
+    OpenHoundRichFormatter,
     OpenHoundTextFormatter,
     RotatingFileHandler,
+    redact_log_values,
 )
 
 
@@ -291,6 +297,65 @@ def test_text_formatter_produces_plain_text():
 
     with pytest.raises(json.JSONDecodeError):
         json.loads(output)
+
+
+@pytest.mark.parametrize("redacted", [False, True], ids=["original", "redacted"])
+@pytest.mark.parametrize("rich_first", [False, True], ids=["files-first", "rich-first"])
+def test_exception_diagnostics_survive_all_handlers(redacted, rich_first):
+    """One shared record keeps its traceback exactly once in every output."""
+    access_key, secret_key = "example-access-key", "example-secret-key"
+    outputs = {name: StringIO() for name in ("text", "json", "rich")}
+    handlers = []
+    for name, formatter in (
+        ("text", OpenHoundTextFormatter()),
+        ("json", OpenHoundJSONFormatter()),
+        ("rich", OpenHoundRichFormatter()),
+    ):
+        handler = (
+            RichHandler(
+                console=Console(file=outputs[name], width=240, color_system=None),
+                show_time=False,
+                show_path=False,
+                markup=True,
+                rich_tracebacks=True,
+            )
+            if name == "rich"
+            else logging.StreamHandler(outputs[name])
+        )
+        handler.setFormatter(formatter)
+        handlers.append(handler)
+    if rich_first:
+        handlers.reverse()
+    logger = logging.getLogger("exception-diagnostics-test")
+    previous = logger.handlers[:], logger.level, logger.propagate
+    logger.handlers = handlers
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+    try:
+        with redact_log_values((access_key, secret_key)) if redacted else nullcontext():
+            try:
+                raise RuntimeError(f"AccessDenied for {access_key}: {secret_key}")
+            except RuntimeError:
+                logger.exception("Collection failed")
+        for name, output in outputs.items():
+            rendered = output.getvalue()
+            if name == "json":
+                document = json.loads(rendered)
+                assert document["message"] == "Collection failed"
+                rendered = document["exception"]
+            assert rendered.count("RuntimeError: AccessDenied") == 1
+            assert rendered.count("Traceback (most recent call last)") == 1
+            if redacted:
+                assert access_key not in rendered
+                assert secret_key not in rendered
+                assert "[REDACTED]" in rendered
+            else:
+                assert access_key in rendered
+                assert secret_key in rendered
+    finally:
+        logger.handlers, logger.level, logger.propagate = previous
+        for handler in handlers:
+            handler.close()
 
 
 def test_get_file_handler_caches_handler_per_path(tmp_path):

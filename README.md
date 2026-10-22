@@ -138,6 +138,31 @@ use a private ephemeral temporary volume (for example a memory-backed `TMPDIR`);
 volume destruction removes material if the entire container terminates. On a
 persistent temporary volume, the next scheduler startup performs reclamation.
 
+### Temporary adapter boundary (developers)
+
+`src/openhound/scheduler/aws_profile.py` temporarily bridges BHE's beta raw-key
+contract to the AWS extension's existing named-profile authentication models.
+It lives in OpenHound so managed jobs can use those models while direct managed
+credential support is developed in the extension. The adapter owns raw-key versus
+nested-document selection, AWS validation, profile files, environment/DLT settings,
+and SDK logging controls; generic credential-document validation stays in the
+scheduler.
+
+The scheduler's explicit integration points are credential preparation from the
+authoritative claim, validation before `/start`, startup orphan sweeping, workspace
+creation/retention at launch, entering the worker context before collector imports,
+and workspace removal on completion or termination before upload/reporting retries.
+Workspace lifetime remains scheduler-owned because killed workers cannot run
+cleanup.
+
+AWS credential preparation, authentication-model configuration, profile handling,
+and worker SDK logging policy move into the AWS extension when it supports this
+contract directly. Extraction should replace these adapter integration points;
+claim reconciliation, polling, uploads, and outcome reporting remain reusable.
+Generic managed configuration (`scheduler/configuration.py`), value redaction
+(`core/logging.py`), and the BHE response fields in `CollectorJob` also remain in
+OpenHound. Collector-name dispatch can be revisited after the beta.
+
 ### Adapter verification
 
 Run the focused tests with the actual AWS extension checked out alongside

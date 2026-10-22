@@ -10,7 +10,7 @@ import re
 import shutil
 import stat
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from configparser import ConfigParser
 from contextlib import contextmanager
 from copy import deepcopy
@@ -24,7 +24,12 @@ from dlt.common.configuration.providers.provider import ConfigProvider
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
 from filelock import FileLock, Timeout
 
-from openhound.core.clients.aws_secrets_manager import _configure_safe_sdk_logging
+from openhound.core.clients.aws_secrets_manager import (
+    SecretRetrievalError,
+    SecretValue,
+    _configure_safe_sdk_logging,
+)
+from openhound.core.clients.models.jobs import CollectorJob
 from openhound.core.logging import redact_log_values
 from openhound.scheduler.configuration import (
     ManagedConfigurationError,
@@ -48,6 +53,14 @@ _CREDENTIAL_SETTINGS = {
 class AWSAccessKeyError(ManagedConfigurationError):
     """An AWS preparation error containing no supplied credential values."""
 
+    def __init__(
+        self,
+        message: str,
+        summary: str = "Managed AWS credentials or authentication settings are invalid",
+    ) -> None:
+        super().__init__(message)
+        self.summary = summary
+
 
 def validate_access_key_id(value: Any) -> None:
     # ASIA keys are temporary and require a session token, absent in BHE's beta
@@ -58,7 +71,7 @@ def validate_access_key_id(value: Any) -> None:
         )
 
 
-def validate_secret_reference(value: Any) -> None:
+def validate_secret_reference(value: Any) -> str:
     if (
         not isinstance(value, str)
         or re.fullmatch(r"[A-Za-z0-9/_+=.@:-]{1,2048}", value) is None
@@ -66,6 +79,7 @@ def validate_secret_reference(value: Any) -> None:
         raise AWSAccessKeyError(
             "Managed AWS job requires a valid secret_key_id reference"
         )
+    return value
 
 
 @dataclass(frozen=True)
@@ -84,8 +98,45 @@ class AWSAccessKeyCredentials:
             )
 
 
-def aws_profile_params(params: dict[str, Any]) -> dict[str, Any]:
+def prepare_aws_credentials(
+    job: CollectorJob, load_secret: Callable[[str], SecretValue]
+) -> dict[str, Any] | AWSAccessKeyCredentials:
+    """Prepare authoritative claimed inputs without installing worker state.
+
+    An explicit key ID selects the beta raw-key contract. Without it, retain
+    compatibility with nested credential documents; a raw payload still needs
+    a valid key ID and must never fall back to the scheduler's AWS identity.
+    """
+    reference = validate_secret_reference(job.secret_key_id)
+    raw_key = job.external_secret_key_id is not None
+    if raw_key:
+        validate_access_key_id(job.external_secret_key_id)
+        aws_profile_params(job.params)
+    try:
+        credentials = load_secret(reference)
+    except SecretRetrievalError as error:
+        # Reader diagnostics may include references or provider response bodies.
+        # Keep the classified outcome, never the reader's supplied message.
+        raise AWSAccessKeyError(
+            f"Managed AWS credential retrieval failed ({type(error).__name__})",
+            error.failure_summary,
+        ) from None
+    except Exception as error:  # noqa: BLE001 - arbitrary secret readers
+        raise AWSAccessKeyError(
+            f"Credential secret reader failed ({type(error).__name__})",
+            "Credential secret retrieval failed",
+        ) from None
+    if not raw_key and isinstance(credentials, dict):
+        return credentials  # Generic credential-document validation stays shared.
+    return AWSAccessKeyCredentials(job.external_secret_key_id, credentials)  # type: ignore[arg-type]
+
+
+def aws_profile_params(
+    params: dict[str, Any], *, collector_name: str = "aws"
+) -> dict[str, Any]:
     """Validate the raw-key mode and copy its full nested settings before /start."""
+    if collector_name != "aws":
+        raise AWSAccessKeyError("Managed AWS credentials require the AWS collector")
     if not isinstance(params, dict) or any(
         not isinstance(v, dict) for v in params.values()
     ):

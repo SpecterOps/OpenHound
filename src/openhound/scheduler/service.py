@@ -46,8 +46,7 @@ from openhound.scheduler.aws_profile import (
     aws_profile_params,
     cleanup_orphaned_aws_profiles,
     managed_aws_profile,
-    validate_access_key_id,
-    validate_secret_reference,
+    prepare_aws_credentials,
 )
 from openhound.scheduler.configuration import (
     ManagedConfigurationError,
@@ -181,9 +180,7 @@ def _collect_in_worker(
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
-        if (
-            collector.name == collector_name
-        ):  # pyright: ignore[reportAttributeAccessIssue]
+        if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
             if (
                 configured
                 and collector.dlt_source is None
@@ -415,23 +412,6 @@ class Service:
         self, job: CollectorJob
     ) -> dict[str, Any] | AWSAccessKeyCredentials:
         """Retrieve and validate credentials, exposing only a safe failure message."""
-        if job.secret_key_id is None or not job.secret_key_id.strip():
-            raise CredentialValidationError(
-                "Managed job has no credential secret identifier"
-            )
-
-        raw_aws = job.job_key == "aws" and job.external_secret_key_id is not None
-        if raw_aws:
-            try:
-                validate_access_key_id(job.external_secret_key_id)
-                validate_secret_reference(job.secret_key_id)
-                aws_profile_params(job.params)
-            except AWSAccessKeyError as error:
-                raise CredentialValidationError(
-                    str(error),
-                    "Managed AWS credentials or authentication settings are invalid",
-                ) from None
-
         logger.debug(
             "Retrieving managed collector credentials.",
             extra={
@@ -441,18 +421,24 @@ class Service:
             },
         )
         try:
-            credentials = self.secrets_manager.get_secret(job.secret_key_id)
-            if raw_aws or (job.job_key == "aws" and not isinstance(credentials, dict)):
-                validate_secret_reference(job.secret_key_id)
-                aws_profile_params(job.params)
-                return AWSAccessKeyCredentials(job.external_secret_key_id, credentials)  # type: ignore[arg-type]
+            if job.job_key == "aws":
+                credentials = prepare_aws_credentials(
+                    job, self.secrets_manager.get_secret
+                )
+            else:
+                if job.secret_key_id is None or not job.secret_key_id.strip():
+                    raise CredentialValidationError(
+                        "Managed job has no credential secret identifier"
+                    )
+                credentials = self.secrets_manager.get_secret(job.secret_key_id)
+            if isinstance(credentials, AWSAccessKeyCredentials):
+                return credentials
             if isinstance(credentials, dict) and _usable_credential_value(credentials):
                 return credentials
         except AWSAccessKeyError as error:
-            raise CredentialValidationError(
-                str(error),
-                "Managed AWS credentials or authentication settings are invalid",
-            ) from None
+            raise CredentialValidationError(str(error), error.summary) from None
+        except CredentialValidationError:
+            raise
         except SecretRetrievalError as error:
             raise CredentialValidationError(str(error), error.failure_summary) from None
         except Exception as error:  # noqa: BLE001
@@ -643,12 +629,6 @@ class Service:
         secrets: dict[str, Any] | AWSAccessKeyCredentials,
     ) -> None:
         """Start a validated managed job; the scheduler polls it until completion."""
-        if isinstance(secrets, AWSAccessKeyCredentials):
-            if self.collector_name != "aws":
-                raise AWSAccessKeyError(
-                    "Managed AWS credentials require the AWS collector"
-                )
-            params = aws_profile_params(params)
         # Normalize managed UUIDs once at the runtime boundary. Unmanaged IDs
         # remain integers throughout the shared lifecycle.
         self._launch_job(str(job_id), params=params, secrets=secrets, managed=True)
@@ -665,6 +645,10 @@ class Service:
         if self.job_running is not None:
             raise RuntimeError(f"Job {self.job_running} is already running")
 
+        if isinstance(secrets, AWSAccessKeyCredentials):
+            params = aws_profile_params(
+                {} if params is None else params, collector_name=self.collector_name
+            )
         logger.info("Starting job %s with collector '%s'.", job_id, self.collector_name)
         managed_job_id: str | None = None
         if managed:

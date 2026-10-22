@@ -437,7 +437,7 @@ def test_worker_logs_errors_and_support_bundle_are_redacted(
                 extra={"response": {"credential": SECRET_KEY}},
             )
             try:
-                raise RuntimeError(SECRET_KEY)
+                raise RuntimeError(f"AccessDenied for {ACCESS_KEY}: {SECRET_KEY}")
             except RuntimeError:
                 logger.exception("SDK failure")
             # Exercise a handler configured after the adapter was entered.
@@ -453,8 +453,10 @@ def test_worker_logs_errors_and_support_bundle_are_redacted(
             raise RuntimeError(SECRET_KEY)
         assert SECRET_KEY not in "".join(traceback.format_exception(error.value))
         assert SECRET_KEY not in caplog.text
+        assert ACCESS_KEY not in caplog.text
         assert all(SECRET_KEY not in repr(record.__dict__) for record in caplog.records)
         assert SECRET_KEY not in repr(PAIR)
+        assert "RuntimeError: AccessDenied" in (log_path / "openhound.log").read_text()
         bundle = create_support_bundle("aws", log_path)
         try:
             with zipfile.ZipFile(bundle) as archive:
@@ -463,6 +465,7 @@ def test_worker_logs_errors_and_support_bundle_are_redacted(
                     SECRET_KEY.encode() not in archive.read(name)
                     for name in archive.namelist()
                 )
+                assert b"RuntimeError: AccessDenied" in archive.read("openhound.log")
         finally:
             bundle.unlink()
             bundle.parent.rmdir()

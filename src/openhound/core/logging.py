@@ -18,6 +18,7 @@ from pathlib import Path
 import dlt
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markup import escape
 
 import openhound
 from openhound.config import get_mode_defaults
@@ -209,7 +210,9 @@ class OpenHoundJSONFormatter(logging.Formatter):
             "openhound_version": openhound.__version__,
         }
 
-        if record.exc_info:
+        if record.exc_text:
+            log_data["exception"] = record.exc_text
+        elif record.exc_info:
             log_data["exception"] = self.formatException(record.exc_info)
 
         for key, value in record.__dict__.items():
@@ -257,7 +260,9 @@ class OpenHoundTextFormatter(logging.Formatter):
             extra_str = " ".join(f"{key}={value}" for key, value in extras.items())
             log_line = f"{log_line} | {extra_str}"
 
-        if record.exc_info:
+        if record.exc_text:
+            log_line = f"{log_line}\n{record.exc_text}"
+        elif record.exc_info:
             log_line = f"{log_line}\n{self.formatException(record.exc_info)}"
 
         return log_line
@@ -276,6 +281,10 @@ class OpenHoundRichFormatter(logging.Formatter):
             str: A formatted string for Rich logging
         """
         log_fmt = f"time={self.formatTime(record, '%Y-%m-%d %H:%M:%S')}, msg={record.getMessage()} (openhound_version={openhound.__version__})"
+        if record.exc_text and not record.exc_info:
+            # The redactor cleared exc_info, so Rich cannot render the original.
+            # Treat the sanitized traceback (including [REDACTED]) as literal text.
+            log_fmt = f"{log_fmt}\n{escape(record.exc_text)}"
         return log_fmt
 
 

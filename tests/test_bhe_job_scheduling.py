@@ -45,7 +45,7 @@ from openhound.core.clients.models.jobs import (
 )
 from openhound.core.models.graph import Graph
 from openhound.scheduler import service as scheduler_service
-from openhound.scheduler.aws_profile import AWSAccessKeyCredentials
+from openhound.scheduler.aws_profile import AWSAccessKeyCredentials, AWSAccessKeyError
 from openhound.scheduler.configuration import ManagedConfigurationError
 from openhound.scheduler.service import (
     ExtensionNotFoundError,
@@ -1977,8 +1977,22 @@ def test_invalid_aws_metadata_fails_before_start_without_runtime_fallback(
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "scheduler-secret")
     state = mock_bloodhound_api.app.state
     state.collector_job_claim_response[field] = value
+    requests_seen = []
+    get_secret = aws_managed_service.secrets_manager.get_secret
+
+    def retrieve(reference):
+        requests_seen.append(reference)
+        return get_secret(reference)
+
+    monkeypatch.setattr(aws_managed_service.secrets_manager, "get_secret", retrieve)
     with caplog.at_level(logging.DEBUG):
         aws_managed_service._poll()
+    # A null key ID permits a legacy document, whose shape requires retrieval.
+    assert requests_seen == (
+        ["private-secret-reference"]
+        if field == "external_secret_key_id" and value is None
+        else []
+    )
     assert state.collector_job_start_requests == []
     assert aws_managed_service.executor.submitted == []
     assert aws_managed_service._aws_profile_workspace is None
@@ -2036,12 +2050,17 @@ def test_invalid_raw_aws_payloads_are_not_trimmed_wrapped_or_treated_as_document
     ],
 )
 def test_raw_aws_authentication_conflicts_fail_before_start(
-    aws_managed_service, mock_bloodhound_api, options
+    aws_managed_service, mock_bloodhound_api, options, monkeypatch
 ):
     state = mock_bloodhound_api.app.state
     state.collector_job_claim_response["params"] = {
         "sources": {"source": {"aws": {"credentials": options}}}
     }
+    monkeypatch.setattr(
+        aws_managed_service.secrets_manager,
+        "get_secret",
+        lambda _: pytest.fail("invalid authentication must fail before retrieval"),
+    )
     aws_managed_service._poll()
     assert state.collector_job_start_requests == []
     assert aws_managed_service.executor.submitted == []
@@ -2102,6 +2121,61 @@ def test_aws_missing_secret_reports_sanitized_failure_before_start(
         "failure_message": "Credential secret not found",
     }
     assert AWS_SECRET_KEY not in caplog.text
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, SecretPermissionError])
+def test_aws_preparation_does_not_expose_secret_reader_payloads(
+    aws_managed_service, mock_bloodhound_api, monkeypatch, caplog, error_type
+):
+    def fail_reader(reference):
+        raise error_type(f"AccessDenied for {AWS_ACCESS_KEY}: {AWS_SECRET_KEY}")
+
+    monkeypatch.setattr(aws_managed_service.secrets_manager, "get_secret", fail_reader)
+    with caplog.at_level(logging.DEBUG):
+        aws_managed_service._poll()
+    state = mock_bloodhound_api.app.state
+    assert state.collector_job_start_requests == []
+    assert aws_managed_service.executor.submitted == []
+    assert state.collector_job_end_requests[0]["body"] == {
+        "outcome": "failed",
+        "failure_message": (
+            "AWS secret access denied"
+            if error_type is SecretPermissionError
+            else "Credential secret retrieval failed"
+        ),
+    }
+    assert error_type.__name__ in caplog.text
+    for value in (AWS_ACCESS_KEY, AWS_SECRET_KEY):
+        assert value not in caplog.text
+        assert value not in repr(state.collector_job_end_requests)
+        assert all(value not in repr(record.__dict__) for record in caplog.records)
+
+
+@pytest.mark.parametrize("launch_path", ["run_claimed_job", "_launch_job"])
+@pytest.mark.parametrize("wrong_collector", [False, True])
+def test_aws_launch_paths_validate_before_start(
+    mock_service, mock_bloodhound_api, launch_path, wrong_collector
+):
+    mock_service.collector_name = "other" if wrong_collector else "aws"
+    params = (
+        {}
+        if wrong_collector
+        else {
+            "sources": {"source": {"aws": {"credentials": {"profile_name": "local"}}}}
+        }
+    )
+    kwargs = {"managed": True} if launch_path == "_launch_job" else {}
+    with pytest.raises(AWSAccessKeyError):
+        getattr(mock_service, launch_path)(
+            "job",
+            params=params,
+            secrets=AWSAccessKeyCredentials(AWS_ACCESS_KEY, AWS_SECRET_KEY),
+            **kwargs,
+        )
+    assert mock_bloodhound_api.app.state.collector_job_start_requests == []
+    assert mock_service.executor.submitted == []
+    assert mock_service._aws_profile_workspace is None
+    assert mock_service.future is mock_service.job_running is None
 
 
 @pytest.mark.parametrize(
