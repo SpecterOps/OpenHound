@@ -57,9 +57,11 @@ class AWSAccessKeyError(ManagedConfigurationError):
         self,
         message: str,
         summary: str = "Managed AWS credentials or authentication settings are invalid",
+        **context: Any,
     ) -> None:
         super().__init__(message)
         self.summary = summary
+        self.context = context
 
 
 def validate_access_key_id(value: Any) -> None:
@@ -115,11 +117,15 @@ def prepare_aws_credentials(
     try:
         credentials = load_secret(reference)
     except SecretRetrievalError as error:
-        # Reader diagnostics may include references or provider response bodies.
-        # Keep the classified outcome, never the reader's supplied message.
-        raise AWSAccessKeyError(
+        # A retrieval exception's type alone does not make its text safe to log.
+        message, context = error.safe_diagnostics or (
             f"Managed AWS credential retrieval failed ({type(error).__name__})",
+            {},
+        )
+        raise AWSAccessKeyError(
+            f"OpenHound runtime secret retrieval failed: {message}",
             error.failure_summary,
+            **context,
         ) from None
     except Exception as error:  # noqa: BLE001 - arbitrary secret readers
         raise AWSAccessKeyError(

@@ -87,6 +87,8 @@ class SecretRetrievalError(Exception):
     def __init__(self, message: str, **context: Any) -> None:
         super().__init__(message)
         self.context = context
+        # Only the SDK classifier supplies diagnostics suitable for propagation.
+        self.safe_diagnostics: tuple[str, dict[str, Any]] | None = None
 
 
 class SecretNotFoundError(SecretRetrievalError):
@@ -358,14 +360,120 @@ def _classify_aws_error(
         context["region"] = region
         location += f" in {region}"
     if isinstance(error, RuntimeError):
-        return _classify_runtime_error(error, context)
-    if isinstance(error, (FileNotFoundError, PermissionError)):
-        return _classify_file_error(error, context, location)
+        classified = _classify_runtime_error(error, context)
+    elif isinstance(error, (FileNotFoundError, PermissionError)):
+        classified = _classify_file_error(error, context, location)
+    elif isinstance(error, ClientError):
+        classified = _classify_client_error(error, context, location)
+    elif isinstance(error, _PROVIDER_ERROR_TYPES):
+        classified = _classify_provider_error(error, context)
+    else:
+        classified = _classify_transport_error(error, context, location)
+    classified.safe_diagnostics = _safe_aws_diagnostics(error, classified)
+    return classified
+
+
+def _safe_aws_diagnostics(
+    error: Exception, classified: SecretRetrievalError
+) -> tuple[str, dict[str, Any]]:
+    """Keep actionable causes without copying SDK messages, URLs or secret IDs."""
+    context = classified.context
+    safe: dict[str, Any] = {"sdk_exception_type": type(error).__name__}
+    reason = "AWS request failed; check endpoint, network and TLS configuration."
     if isinstance(error, ClientError):
-        return _classify_client_error(error, context, location)
-    if isinstance(error, _PROVIDER_ERROR_TYPES):
-        return _classify_provider_error(error, context)
-    return _classify_transport_error(error, context, location)
+        operation = context.get("aws_operation")
+        if operation not in {
+            "GetSecretValue",
+            "BatchGetSecretValue",
+            "AssumeRole",
+            "AssumeRoleWithWebIdentity",
+            "AssumeRoleWithSAML",
+            "GetSessionToken",
+            "GetRoleCredentials",
+            "CreateToken",
+        }:
+            operation = "AWS operation"
+        code = context.get("aws_error_code")
+        if code not in {
+            "AccessDenied",
+            "AccessDeniedException",
+            "AuthorizationError",
+            "UnauthorizedOperation",
+            "ResourceNotFoundException",
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "UnrecognizedClientException",
+            "InvalidClientTokenId",
+            "InvalidSignatureException",
+            "SignatureDoesNotMatch",
+            "DecryptionFailure",
+            "ThrottlingException",
+            "InternalServiceError",
+        }:
+            code = "Unknown"
+        safe.update(aws_operation=operation, aws_error_code=code)
+        reason = f"{operation} returned {code}."
+        if code == "DecryptionFailure" or "kms:Decrypt" in str(
+            error.response.get("Error", {}).get("Message", "")
+        ):
+            reason += " Check KMS key permissions and kms:Decrypt."
+        elif operation.startswith(("AssumeRole", "GetSessionToken")):
+            reason += (
+                " Check workload identity configuration and role trust conditions."
+            )
+        elif isinstance(classified, SecretPermissionError):
+            reason += " Check the runtime AWS identity and secret permissions."
+        elif isinstance(classified, SecretNotFoundError):
+            reason += " Check the secret identifier and runtime AWS region."
+        elif isinstance(classified, AWSConfigurationError):
+            reason += " Check runtime AWS credential validity, signing and expiration."
+    elif type(error) in (NoRegionError, NoCredentialsError, RuntimeError):
+        # These classifier branches produce fixed, payload-free explanations.
+        reason = str(classified)
+    elif isinstance(error, (FileNotFoundError, PermissionError)):
+        reason = "Runtime AWS credential file access failed; check paths, mounts and permissions."
+    elif isinstance(error, _PROVIDER_ERROR_TYPES):
+        reason = "Runtime AWS credential configuration failed; check the credential provider and workload identity."
+    elif isinstance(error, ParamValidationError):
+        reason = "AWS SDK parameter validation failed; check credential acquisition and secret retrieval parameters."
+    provider = (
+        error.kwargs.get("provider") if isinstance(error, BotoCoreError) else None
+    )
+    if provider in ("container-role", "custom-process"):
+        safe["credential_provider"] = provider
+    transport = context.get("transport_exception_type")
+    if transport in {
+        "ReadTimeoutError",
+        "ConnectTimeoutError",
+        "EndpointConnectionError",
+        "SSLError",
+        "TimeoutError",
+        "ConnectionError",
+        "ValueError",
+    }:
+        safe["transport_exception_type"] = transport
+    region = context.get("region")
+    if isinstance(region, str) and re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-\d+", region):
+        safe["region"] = region
+    request_id = context.get("RequestId")
+    if isinstance(request_id, str) and re.fullmatch(
+        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", request_id
+    ):
+        safe["RequestId"] = request_id
+    for key, maximum in (
+        ("HTTPStatusCode", 599),
+        ("RetryAttempts", 100),
+        ("credential_endpoint_http_status", 599),
+    ):
+        value = context.get(key)
+        if type(value) is int and 0 <= value <= maximum:
+            safe[key] = value
+    for key in ("MaxAttemptsReached", "RetryQuotaReached"):
+        if type(context.get(key)) is bool:
+            safe[key] = context[key]
+    if type(error) not in (NoRegionError, NoCredentialsError, RuntimeError):
+        reason = f"{reason} ({type(error).__name__})"
+    return reason, safe
 
 
 def _classify_runtime_error(
@@ -633,6 +741,7 @@ def _log_failure(
     }
     if batch_number is not None:
         extra["batch_number"] = batch_number
-    extra.update(error.context)
+    message, context = error.safe_diagnostics or (str(error), error.context)
+    extra.update(context)
     # Managed credential callers report the cause at normal logging levels.
-    logger.debug("AWS %s failed: %s", operation, error, extra=extra)
+    logger.debug("AWS %s failed: %s", operation, message, extra=extra)

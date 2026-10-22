@@ -81,9 +81,15 @@ class ManagedRuntimeUnavailableError(RuntimeError):
 class CredentialValidationError(ValueError):
     """A managed job's required credential document could not be loaded."""
 
-    def __init__(self, message: str, summary: str = "Credential document is invalid"):
+    def __init__(
+        self,
+        message: str,
+        summary: str = "Credential document is invalid",
+        **context: Any,
+    ):
         super().__init__(message)
         self.summary = summary
+        self.context = context
 
 
 class ManagedJobProcessingError(RuntimeError):
@@ -436,7 +442,9 @@ class Service:
             if isinstance(credentials, dict) and _usable_credential_value(credentials):
                 return credentials
         except AWSAccessKeyError as error:
-            raise CredentialValidationError(str(error), error.summary) from None
+            raise CredentialValidationError(
+                str(error), error.summary, **error.context
+            ) from None
         except CredentialValidationError:
             raise
         except SecretRetrievalError as error:
@@ -503,6 +511,7 @@ class Service:
                 job_id,
                 str(error).rstrip("."),
                 extra={
+                    **error.context,
                     **context,
                     **(
                         {} if job.job_key == "aws" else {"secret_id": job.secret_key_id}

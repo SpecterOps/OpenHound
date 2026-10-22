@@ -2128,7 +2128,12 @@ def test_aws_preparation_does_not_expose_secret_reader_payloads(
     aws_managed_service, mock_bloodhound_api, monkeypatch, caplog, error_type
 ):
     def fail_reader(reference):
-        raise error_type(f"AccessDenied for {AWS_ACCESS_KEY}: {AWS_SECRET_KEY}")
+        error = error_type(f"AccessDenied for {AWS_ACCESS_KEY}: {AWS_SECRET_KEY}")
+        if isinstance(error, SecretPermissionError):
+            error.context.update(
+                aws_error_code=AWS_SECRET_KEY, RequestId=AWS_ACCESS_KEY
+            )
+        raise error
 
     monkeypatch.setattr(aws_managed_service.secrets_manager, "get_secret", fail_reader)
     with caplog.at_level(logging.DEBUG):
@@ -2149,6 +2154,164 @@ def test_aws_preparation_does_not_expose_secret_reader_payloads(
         assert value not in caplog.text
         assert value not in repr(state.collector_job_end_requests)
         assert all(value not in repr(record.__dict__) for record in caplog.records)
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+@pytest.mark.parametrize("raw_key", [False, True], ids=["nested-document", "raw-key"])
+@pytest.mark.parametrize(
+    "failure,expected,summary",
+    [
+        ("region", "AWS_DEFAULT_REGION", "AWS credentials unavailable"),
+        ("credentials", "NoCredentialsError", "AWS credentials unavailable"),
+        (
+            "refresh",
+            "refreshed credentials are still expired",
+            "AWS credentials unavailable",
+        ),
+        (
+            "ExpiredTokenException",
+            "ExpiredTokenException",
+            "AWS credentials unavailable",
+        ),
+        ("AccessDeniedException", "secret permissions", "AWS secret access denied"),
+        ("kms", "kms:Decrypt", "AWS secret access denied"),
+        ("DecryptionFailure", "KMS key permissions", "AWS secret retrieval failed"),
+        (
+            "ResourceNotFoundException",
+            "secret identifier",
+            "Credential secret not found",
+        ),
+        ("sts", "role trust conditions", "AWS credentials unavailable"),
+        ("timeout", "ReadTimeoutError", "AWS secret retrieval failed"),
+        ("network", "EndpointConnectionError", "AWS secret retrieval failed"),
+        ("provider", "credential provider", "AWS credentials unavailable"),
+        ("metadata", "MetadataRetrievalError", "AWS credentials unavailable"),
+        ("parameter", "parameter validation", "AWS secret retrieval failed"),
+        ("tainted", "AWS operation returned Unknown", "AWS secret retrieval failed"),
+    ],
+)
+def test_aws_preparation_keeps_safe_runtime_diagnostics(
+    aws_managed_service,
+    mock_bloodhound_api,
+    monkeypatch,
+    caplog,
+    level,
+    raw_key,
+    failure,
+    expected,
+    summary,
+):
+    from botocore.exceptions import (
+        CredentialRetrievalError,
+        EndpointConnectionError,
+        MetadataRetrievalError,
+        NoCredentialsError,
+        NoRegionError,
+        ParamValidationError,
+        ReadTimeoutError,
+    )
+
+    payload = f"{AWS_ACCESS_KEY} {AWS_SECRET_KEY} private-runtime-session-token"
+    errors = {
+        "region": NoRegionError(),
+        "credentials": NoCredentialsError(),
+        "refresh": RuntimeError(
+            "Credentials were refreshed, but the refreshed credentials are still expired."
+        ),
+        "timeout": ReadTimeoutError(
+            endpoint_url=f"https://example.test/?token={payload}"
+        ),
+        "network": EndpointConnectionError(
+            endpoint_url=f"https://example.test/?token={payload}"
+        ),
+        "provider": CredentialRetrievalError(
+            provider="custom-process", error_msg=payload
+        ),
+        "metadata": MetadataRetrievalError(
+            error_msg=f"Received non 200 response 403 from container metadata: {payload}"
+        ),
+        "parameter": ParamValidationError(
+            report=f"Invalid WebIdentityToken: {payload}"
+        ),
+    }
+    request_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    operation = "AssumeRoleWithWebIdentity" if failure == "sts" else "GetSecretValue"
+    code = "AccessDeniedException" if failure in ("kms", "sts") else failure
+    if failure == "tainted":
+        operation, code, request_id = AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_SECRET_KEY
+    error = errors.get(failure) or ClientError(
+        {
+            "Error": {
+                "Code": code,
+                "Message": payload + (" kms:Decrypt" if failure == "kms" else ""),
+            },
+            "ResponseMetadata": {
+                "RequestId": request_id,
+                "HTTPStatusCode": AWS_SECRET_KEY if failure == "tainted" else 403,
+                "RetryAttempts": AWS_SECRET_KEY if failure == "tainted" else 2,
+            },
+        },
+        operation,
+    )
+
+    def fail(*args, **kwargs):
+        raise error
+
+    # Cover both SDK construction (including workload STS) and retrieval failures.
+    monkeypatch.setattr("openhound.core.clients.aws_secrets_manager.boto3.client", fail)
+    aws_managed_service.secrets_manager = AWSSecretsManager(
+        None
+        if failure in ("region", "sts")
+        else SimpleNamespace(
+            get_secret_value=fail,
+            meta=SimpleNamespace(
+                region_name=AWS_SECRET_KEY if failure == "tainted" else "us-west-2"
+            ),
+        )
+    )
+    state = mock_bloodhound_api.app.state
+    if not raw_key:
+        state.collector_job_claim_response["external_secret_key_id"] = None
+    with caplog.at_level(level):
+        aws_managed_service._poll()
+
+    record = next(
+        r for r in caplog.records if "Cannot prepare managed job" in r.getMessage()
+    )
+    assert record.levelno == logging.ERROR
+    assert "OpenHound runtime secret retrieval failed" in record.getMessage()
+    assert expected in record.getMessage()
+    assert record.sdk_exception_type == type(error).__name__
+    if failure == "tainted":
+        assert record.aws_operation == "AWS operation"
+        assert record.aws_error_code == "Unknown"
+        assert all(
+            key not in record.__dict__
+            for key in ("region", "RequestId", "HTTPStatusCode", "RetryAttempts")
+        )
+    elif isinstance(error, ClientError):
+        assert record.aws_operation == operation
+        assert record.aws_error_code == code
+        assert record.RequestId == request_id
+        assert record.HTTPStatusCode == 403
+        assert record.RetryAttempts == 2
+    if failure not in ("region", "sts", "tainted"):
+        assert record.region == "us-west-2"
+    if failure == "provider":
+        assert record.credential_provider == "custom-process"
+    if failure == "metadata":
+        assert record.credential_endpoint_http_status == 403
+    assert state.collector_job_end_requests[0]["body"] == {
+        "outcome": "failed",
+        "failure_message": summary,
+    }
+    assert state.collector_job_start_requests == []
+    assert aws_managed_service.executor.submitted == []
+    for forbidden in (AWS_ACCESS_KEY, AWS_SECRET_KEY, "private-runtime-session-token"):
+        assert forbidden not in caplog.text
+        assert all(forbidden not in repr(r.__dict__) for r in caplog.records)
+        assert forbidden not in repr(state.collector_job_end_requests)
+    assert all(r.exc_info is None for r in caplog.records)
 
 
 @pytest.mark.parametrize("launch_path", ["run_claimed_job", "_launch_job"])
