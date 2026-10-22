@@ -8,6 +8,9 @@ import os
 import re
 import sys
 import time
+import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from enum import Enum
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -15,9 +18,80 @@ from pathlib import Path
 import dlt
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markup import escape
 
 import openhound
 from openhound.config import get_mode_defaults
+
+
+class _ValueRedactor(logging.Filter):
+    def __init__(self, values: tuple[str, ...]):
+        super().__init__()
+        self.values = values
+        self.handlers: set[logging.Handler] = set()
+
+    def _redact(self, value):
+        if isinstance(value, str):
+            for secret in self.values:
+                value = value.replace(secret, "[REDACTED]")
+            return value
+        if isinstance(value, dict):
+            return {self._redact(k): self._redact(v) for k, v in value.items()}
+        if isinstance(value, (tuple, list)):
+            return type(value)(self._redact(item) for item in value)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return self._redact(str(value))
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Preserve argument types during interpolation, then redact the result.
+        record.msg = self._redact(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = self._redact(
+                "".join(traceback.format_exception(*record.exc_info))
+            )
+            # Rich handlers can format the exception again, including locals.
+            record.exc_info = None
+        record.__dict__.update(
+            self._redact(
+                {
+                    key: value
+                    for key, value in record.__dict__.items()
+                    if key not in ("msg", "args")
+                }
+            )
+        )
+        return True
+
+
+_active_redactors: list[_ValueRedactor] = []
+
+
+def _protect_handler[H: logging.Handler](handler: H) -> H:
+    for redactor in _active_redactors:
+        handler.addFilter(redactor)
+        redactor.handlers.add(handler)
+    return handler
+
+
+@contextmanager
+def redact_log_values(values: tuple[str, ...]) -> Iterator[None]:
+    """Protect current and newly configured OpenHound handlers for one worker."""
+    redactor = _ValueRedactor(values)
+    _active_redactors.append(redactor)
+    loggers = [logging.getLogger(), *logging.Logger.manager.loggerDict.values()]
+    for logger in loggers:
+        if isinstance(logger, logging.Logger):
+            for handler in logger.handlers:
+                _protect_handler(handler)
+    try:
+        yield
+    finally:
+        _active_redactors.remove(redactor)
+        for handler in redactor.handlers:
+            handler.removeFilter(redactor)
+
 
 VALID_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -147,7 +221,9 @@ class OpenHoundJSONFormatter(logging.Formatter):
             "openhound_version": openhound.__version__,
         }
 
-        if record.exc_info:
+        if record.exc_text:
+            log_data["exception"] = record.exc_text
+        elif record.exc_info:
             log_data["exception"] = self.formatException(record.exc_info)
 
         for key, value in record.__dict__.items():
@@ -195,7 +271,9 @@ class OpenHoundTextFormatter(logging.Formatter):
             extra_str = " ".join(f"{key}={value}" for key, value in extras.items())
             log_line = f"{log_line} | {extra_str}"
 
-        if record.exc_info:
+        if record.exc_text:
+            log_line = f"{log_line}\n{record.exc_text}"
+        elif record.exc_info:
             log_line = f"{log_line}\n{self.formatException(record.exc_info)}"
 
         return log_line
@@ -214,6 +292,10 @@ class OpenHoundRichFormatter(logging.Formatter):
             str: A formatted string for Rich logging
         """
         log_fmt = f"time={self.formatTime(record, '%Y-%m-%d %H:%M:%S')}, msg={record.getMessage()} (openhound_version={openhound.__version__})"
+        if record.exc_text and not record.exc_info:
+            # The redactor cleared exc_info, so Rich cannot render the original.
+            # Treat the sanitized traceback (including [REDACTED]) as literal text.
+            log_fmt = f"{log_fmt}\n{escape(record.exc_text)}"
         return log_fmt
 
 
@@ -411,7 +493,7 @@ class CustomLogger:
             # setup() may be called again after configuration changes. Keep a
             # cached handler's formatter aligned with the newly resolved mode.
             handler.setFormatter(self._file_formatter())
-        return handler
+        return _protect_handler(handler)
 
     def container_handlers(self, logger: logging.Logger, file_path: Path) -> None:
         """Set the logging handler/format when running in a container"""
@@ -422,7 +504,7 @@ class CustomLogger:
         # Output is human-readable text by default; set runtime.log_format = "JSON" for structured JSON.
         stdout_handler = logging.StreamHandler(sys.stdout)
         stdout_handler.setFormatter(formatter)
-        logger.addHandler(stdout_handler)
+        logger.addHandler(_protect_handler(stdout_handler))
 
         # But also log the same format to a file for persistence and debugging when needed
         logger.addHandler(self._get_file_handler(file_path))
@@ -442,7 +524,7 @@ class CustomLogger:
             rich_tracebacks=True,
         )
         console_handler.setFormatter(rich_formatter)
-        logger.addHandler(console_handler)
+        logger.addHandler(_protect_handler(console_handler))
 
         # But also save the logs to a file using the configured format (text by default)
         logger.addHandler(self._get_file_handler(file_path))

@@ -65,6 +65,7 @@ class CollectorJob(BaseModel):
     version: str
     params: dict[str, Any]
     scope_client_id: UUID | None
+    external_secret_key_id: str | None
     secret_key_id: str | None
     priority: int
     status: str

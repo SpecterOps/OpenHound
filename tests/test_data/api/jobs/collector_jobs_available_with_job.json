@@ -23,6 +23,7 @@
           }
         },
         "scope_client_id": null,
+        "external_secret_key_id": null,
         "secret_key_id": null,
         "priority": 10,
         "status": "ready",
