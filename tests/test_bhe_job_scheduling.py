@@ -405,6 +405,36 @@ def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeyp
     }
 
 
+@pytest.mark.parametrize("managed", [False, True])
+def test_scheduler_start_routes_requests_by_mode(
+    mock_service, mock_bloodhound_api, monkeypatch, managed
+):
+    mock_service.managed = managed
+    state = mock_bloodhound_api.app.state
+    monkeypatch.setattr(scheduler_service.signal, "signal", lambda *args: None)
+
+    def next_poll(seconds):
+        assert seconds == mock_service.interval
+        mock_service.exit = True
+        if mock_service.future is not None:
+            mock_service.future.set_result(Result({}, mock_service.job_running))
+
+    monkeypatch.setattr(scheduler_service.time, "sleep", next_poll)
+
+    mock_service.start()
+
+    if managed:
+        assert state.client_update_payload is None
+        assert state.management_available_requests == 0
+        assert len(state.collector_job_queue_requests) == 1
+        assert state.jobs_available_requests == state.jobs_current_requests == 0
+    else:
+        assert state.client_update_payload is not None
+        assert state.management_available_requests == 1
+        assert state.collector_job_queue_requests == []
+        assert state.jobs_available_requests == 1
+
+
 def test_request_forwards_connect_and_read_timeouts(monkeypatch):
     captured = {}
 
@@ -1202,11 +1232,9 @@ def test_check_management_ignores_non_queued_operations(
     assert mock_service.check_management() is None
 
 
-@pytest.mark.parametrize("managed", [False, True])
 def test_poll_prioritizes_management_over_a_new_job(
-    mock_service, mock_bloodhound_api, monkeypatch, managed
+    mock_service, mock_bloodhound_api, monkeypatch
 ):
-    mock_service.managed = managed
     mock_bloodhound_api.app.state.management_operations = [_support_bundle_operation()]
     sent = []
     monkeypatch.setattr(mock_service, "_send_support_bundle", sent.append)
@@ -1247,15 +1275,15 @@ def test_poll_still_checks_jobs_when_management_endpoint_fails(
         assert state.managed_events == ["claim", "retrieve", "start_handoff"]
     else:
         assert state.job_started is True
-    assert "management unavailable" in caplog.text
-    assert any(record.exc_info is not None for record in caplog.records)
+    assert ("management unavailable" in caplog.text) is (not managed)
+    assert any(record.exc_info is not None for record in caplog.records) is (
+        not managed
+    )
 
 
-@pytest.mark.parametrize("managed", [False, True])
 def test_poll_does_not_start_a_job_when_management_work_fails(
-    mock_service, mock_bloodhound_api, monkeypatch, managed
+    mock_service, mock_bloodhound_api, monkeypatch
 ):
-    mock_service.managed = managed
     mock_bloodhound_api.app.state.management_operations = [_support_bundle_operation()]
 
     def fail(operation):
@@ -1566,9 +1594,9 @@ def managed_service(mock_service, mock_bloodhound_api):
         "collector_jobs_available_with_job.json"
     )
     # Discovery is intentionally stale. Only the claimed snapshot is authoritative.
-    state.collector_job_queue_response["data"]["jobs"][0][
-        "secret_key_id"
-    ] = "stale-reference"
+    state.collector_job_queue_response["data"]["jobs"][0]["secret_key_id"] = (
+        "stale-reference"
+    )
     claimed_at = datetime.now(UTC)
     state.collector_job_claim_response.update(
         secret_key_id="private-secret-reference",
@@ -1806,7 +1834,7 @@ def test_managed_start_failure_retries_prepared_job_before_discovery(
     assert starts == [f"/api/v2/collie-job-queue/{job_id}/start"] * 4
     assert state.collector_job_claim_requests == [{"job_id": job_id, "body": b""}]
     assert len(state.collector_job_queue_requests) == 1
-    assert state.management_available_requests == 1
+    assert state.management_available_requests == 0
     assert service.secret_requests == ["private-secret-reference"]
     assert service._pending_managed_claim is service._pending_managed_start is None
     assert service.job_running == service.managed_job_id == job_id
@@ -2320,7 +2348,7 @@ def test_managed_scheduler_logs_failure_once_and_retries_reporting_next_poll(
     "stage,failure,expected",
     [
         ("poll", "region", "AWS_DEFAULT_REGION"),
-        ("metadata", "provider", "custom-process"),
+        ("poll", "provider", "custom-process"),
         ("end", "document", "non-empty token_id"),
     ],
 )
@@ -2359,12 +2387,6 @@ def test_managed_401_refresh_failure_is_visible_without_debug_logging(
     monkeypatch.setattr(managed_service, "_poll_management", lambda: False)
     monkeypatch.setattr(scheduler_service.signal, "signal", lambda *args: None)
     monkeypatch.setattr(scheduler_service.time, "sleep", next_poll)
-    if stage == "metadata":
-        managed_service.exit = True
-    else:
-        monkeypatch.setattr(
-            managed_service.client, "update_client_metadata", lambda: None
-        )
     if stage == "end":
         managed_service._pending_managed_failure = (
             "11111111-1111-1111-1111-111111111111"
@@ -2385,12 +2407,7 @@ def test_managed_401_refresh_failure_is_visible_without_debug_logging(
     assert "private-refresh-token" not in repr([r.__dict__ for r in caplog.records])
     assert managed_service.handoffs == []
     assert mock_bloodhound_api.app.state.collector_job_end_requests == []
-    if stage == "metadata":
-        assert "Unable to update client metadata" in caplog.text
-    else:
-        assert (
-            f"retrying next poll in {managed_service.interval} seconds" in caplog.text
-        )
+    assert f"retrying next poll in {managed_service.interval} seconds" in caplog.text
     if stage == "end":
         assert managed_service._pending_managed_failure is not None
 
@@ -2561,23 +2578,19 @@ def test_malformed_committed_claim_response_keeps_id_until_reconciled(
     assert str(service.handoffs[0].job.id) == job_id
 
 
-def test_managed_scheduler_keeps_serving_support_bundles_without_collection_runtime(
-    managed_service, mock_bloodhound_api, monkeypatch, tmp_path, caplog
+def test_managed_scheduler_skips_legacy_calls_without_collection_runtime(
+    managed_service, mock_bloodhound_api, monkeypatch, caplog
 ):
     service = managed_service
     state = mock_bloodhound_api.app.state
     service.managed_job_runner = None
-    service.log_base_path = tmp_path
-    (tmp_path / "openhound.log").write_text("support log")
+    state.management_operations = [_support_bundle_operation()]
     polls = []
 
     def next_poll(seconds):
         assert seconds == service.interval
         polls.append(seconds)
-        if len(polls) == 1:
-            # Support work arrives after a poll found no collection runtime.
-            state.management_operations = [_support_bundle_operation()]
-        else:
+        if len(polls) == 2:
             service.exit = True
 
     monkeypatch.setattr(scheduler_service.time, "sleep", next_poll)
@@ -2585,10 +2598,12 @@ def test_managed_scheduler_keeps_serving_support_bundles_without_collection_runt
     with caplog.at_level(logging.DEBUG):
         service.start()
 
-    assert len(polls) == state.management_available_requests == 2
-    assert state.operation_started is True
-    assert state.artifact_completed is True
-    assert state.operation_end_payload["status"] == "succeeded"
+    assert len(polls) == 2
+    assert state.management_available_requests == 0
+    assert state.client_update_payload is None
+    assert state.operation_started is False
+    assert state.artifact_completed is False
+    assert state.operation_end_payload is None
     assert (
         state.collector_job_queue_requests == state.collector_job_claim_requests == []
     )
@@ -2596,13 +2611,12 @@ def test_managed_scheduler_keeps_serving_support_bundles_without_collection_runt
     assert state.job_started is False
     assert service.handoffs == []
     assert (
-        "Managed collection runtime is unavailable; continuing support-bundle polling."
-        in caplog.text
+        "Managed collection runtime is unavailable; retrying next poll." in caplog.text
     )
 
 
 @pytest.mark.parametrize("pending", ["claim", "failure"])
-def test_managed_recovery_precedes_management_then_allows_support_work(
+def test_managed_recovery_continues_without_legacy_management(
     managed_service, mock_bloodhound_api, monkeypatch, pending
 ):
     service = managed_service
@@ -2627,8 +2641,9 @@ def test_managed_recovery_precedes_management_then_allows_support_work(
     )
 
     service._poll()
-    assert state.management_available_requests == 1
-    assert len(sent) == 1
+    assert state.management_available_requests == 0
+    assert sent == []
+    assert len(state.collector_job_queue_requests) == 1
 
 
 def test_support_bundle_tracebacks_preserve_aws_auth_context(
@@ -3198,9 +3213,9 @@ def test_managed_completion_fails_job_when_remaining_staged_file_disappears(
     mock_service._poll()
 
     assert uploads == [b"file-0"]
-    assert (
-        len(ends) == 1
-    ), "Missing staged data must fail the job instead of retrying forever"
+    assert len(ends) == 1, (
+        "Missing staged data must fail the job instead of retrying forever"
+    )
     assert ends[0][:2] == (job_id, ManagedJobOutcome.FAILED)
     assert ends[0][2]["failure_message"]
     assert mock_service.future is None
@@ -3264,9 +3279,9 @@ def test_managed_poll_cleans_partial_upload_output_after_heartbeat_claim_loss(
     assert mock_service.job_running is None
     assert mock_service.managed_job_id is None
     assert mock_service.next_heartbeat_at is None
-    assert (
-        not output.exists()
-    ), "Claim loss must also remove partially uploaded staged data"
+    assert not output.exists(), (
+        "Claim loss must also remove partially uploaded staged data"
+    )
 
 
 @pytest.mark.usefixtures("enabled_managed_heartbeats")
@@ -3680,39 +3695,6 @@ def test_managed_collection_stages_then_uploads_before_job_end(
     ]
     assert state.job_ended is False
     assert not result.output_path.exists()
-
-
-def test_start_claimed_managed_job_passes_uuid_and_staging_mode_to_worker(mock_service):
-    job = CollectorJob.model_validate(
-        load_json("collector_jobs_available_with_job.json")["data"]["jobs"][0]
-    )
-    job.status = "running"
-    job.claimed_by = UUID("c894ea20-8c11-49bd-83f8-5550c8255148")
-    mock_service.managed = True
-    mock_service.start_claimed_managed_job(job)
-    args, _kwargs, future = mock_service.executor.submitted[0]
-    assert args == (
-        _subprocess_collect,
-        "openhound-faker",
-        str(job.id),
-        None,
-        None,
-        True,
-    )
-    assert mock_service.future is future
-    assert mock_service.job_running == str(job.id)
-
-
-@pytest.mark.parametrize("managed", [False, True])
-def test_start_claimed_managed_job_rejects_unclaimed_jobs(mock_service, managed):
-    job = CollectorJob.model_validate(
-        load_json("collector_jobs_available_with_job.json")["data"]["jobs"][0]
-    )
-    mock_service.managed = managed
-    with pytest.raises(ValueError):
-        mock_service.start_claimed_managed_job(job)
-    assert mock_service.executor.submitted == []
-    assert mock_service.job_running is None
 
 
 def test_failed_managed_conversion_cleans_up_staged_files(monkeypatch, tmp_path):
