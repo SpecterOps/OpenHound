@@ -528,6 +528,10 @@ def test_scheduler_ingest_opengraph(mock_service, mock_bloodhound_api, monkeypat
     assert result.job_id == 123
     assert mock_bloodhound_api.app.state.ingested_nodes == 1000
     assert mock_bloodhound_api.app.state.ingested_edges == 10000
+    assert all(
+        "traversable" not in properties
+        for properties in mock_bloodhound_api.app.state.ingested_edge_properties
+    )
 
 
 def _support_bundle_operation() -> dict:
@@ -788,8 +792,3 @@ def test_collection_logs_include_extension_and_openhound_versions(monkeypatch, c
         assert record.collector_extension_version == "2.3.4"
         assert record.openhound_version == "4.5.6"
         assert record.job_id == 42
-
-    assert all(
-        "traversable" not in properties
-        for properties in mock_bloodhound_api.app.state.ingested_edge_properties
-    )
