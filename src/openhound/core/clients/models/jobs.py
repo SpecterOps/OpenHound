@@ -62,7 +62,7 @@ class CollectorJob(BaseModel):
     job_profile_id: UUID | None
     job_type_id: int
     job_key: str
-    params_version: str
+    version: str
     params: dict[str, Any]
     scope_client_id: UUID | None
     secret_key_id: str | None
