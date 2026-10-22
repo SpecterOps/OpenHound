@@ -762,10 +762,11 @@ class Service:
         else:
             if self.managed_job_id is not None and result.output_path is not None:
                 if result.job_id != self.job_running:
-                    raise ValueError("Managed collection result does not match the running job")
-                while (
-                    result.upload_failure is None
-                    and result.uploaded_files < len(result.data_files)
+                    raise ValueError(
+                        "Managed collection result does not match the running job"
+                    )
+                while result.upload_failure is None and result.uploaded_files < len(
+                    result.data_files
                 ):
                     data_file = result.data_files[result.uploaded_files]
                     try:
@@ -777,7 +778,9 @@ class Service:
                         break
                     try:
                         with data:
-                            self.client.upload_collector_job_data(self.managed_job_id, data)
+                            self.client.upload_collector_job_data(
+                                self.managed_job_id, data
+                            )
                     except BloodHoundHTTPError as error:
                         if error.code in (404, 409):
                             self._abort_managed_job(self.managed_job_id)
@@ -824,28 +827,6 @@ class Service:
             except Exception:
                 logger.exception("Error checking in-progress job.")
 
-    def start_claimed_managed_job(self, job: CollectorJob) -> None:
-        """Run a managed job after the queue caller has claimed it.
-
-        Claiming and renewing the job belongs to the queue scheduling flow.
-        """
-        if not self.managed:
-            raise ValueError("Managed collections are not enabled")
-        if self.job_running is not None or self.future is not None:
-            raise ValueError("A collector job is already running")
-        if job.status != "running" or job.claimed_by is None:
-            raise ValueError("The managed collector job must be claimed and running")
-        self.job_running = str(job.id)
-        self.managed_job_id = str(job.id)
-        self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
-        try:
-            self.future = self.executor.submit(
-                _subprocess_collect, self.collector_name, str(job.id), None, None, True
-            )
-        except BrokenProcessPool as error:
-            self.future = Future()
-            self.future.set_exception(error)
-
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
         try:
@@ -861,15 +842,14 @@ class Service:
                     "Error reporting completed job; retaining result for retry."
                 )
 
-        # Support bundles precede new collections in either mode. An unresolved
-        # managed job must be reconciled before accepting management work.
+        # Legacy support-bundle management is only available to unmanaged clients.
         idle = (
             self.job_running is None
             and self._pending_managed_claim is None
             and self._pending_managed_start is None
             and self._pending_managed_failure is None
         )
-        if idle and self._poll_management():
+        if not self.managed and idle and self._poll_management():
             return
 
         if self.managed:
@@ -896,13 +876,11 @@ class Service:
         logger.info(
             f"Service started, monitoring {self.bhe_uri} every {self.interval} seconds."
         )
-        try:
-            self.client.update_client_metadata()
-
-        except Exception:
-            if self.managed:
-                logger.error("Unable to update client metadata.")
-            else:
+        # Managed identities have no client metadata endpoint.
+        if not self.managed:
+            try:
+                self.client.update_client_metadata()
+            except Exception:
                 logger.exception("Unable to update client metadata.")
 
         try:
@@ -912,7 +890,7 @@ class Service:
                         self._poll()
                     except ManagedRuntimeUnavailableError:
                         logger.error(
-                            "Managed collection runtime is unavailable; continuing support-bundle polling."
+                            "Managed collection runtime is unavailable; retrying next poll."
                         )
                     except ManagedJobProcessingError:
                         logger.error(
