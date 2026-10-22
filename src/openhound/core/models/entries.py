@@ -78,7 +78,7 @@ class EdgeProperties(BaseModel):
 
     model_config = ConfigDict(extra="allow")
     composed: bool = False
-    traversable: bool = False
+    traversable: bool | None = None
 
 
 class Edge(BaseModel):
