@@ -1,0 +1,170 @@
+name: Push Bundled OpenHound + AWS Beta Image to ECR
+run-name: AWS beta bundle — ${{ inputs.tag }} — ${{ inputs.source_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Development version only, e.g. 0.4.1.dev9346005 (without ecr-enterprise)"
+        required: true
+        type: string
+      source_ref:
+        description: "OpenHound source branch: main or the configured approved beta branch"
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: managed-aws-beta-ecr-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate source and publishing protections
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.prepare.outputs.source_sha }}
+      aws_sha: ${{ steps.prepare.outputs.aws_sha }}
+      image_tag: ${{ steps.prepare.outputs.image_tag }}
+      ecr_registry: ${{ steps.prepare.outputs.ecr_registry }}
+      ecr_repository: ${{ steps.prepare.outputs.ecr_repository }}
+    steps:
+      - name: Checkout reviewed build tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # ratchet:actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate inputs, environment, and immutable source revisions
+        id: prepare
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # ratchet:actions/github-script@v8
+        env:
+          VERSION: ${{ inputs.tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          APPROVED_BETA_BRANCH: ${{ vars.MANAGED_AWS_BETA_SOURCE_BRANCH }}
+          ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        with:
+          script: |
+            const { prepareBuild } = require('./.github/scripts/aws-beta.cjs');
+            await prepareBuild({ github, context, core, env: process.env });
+
+  publish:
+    name: Approve, build, and publish managed AWS beta
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: managed-aws-beta
+    timeout-minutes: 90
+    env:
+      ECR_REGISTRY: ${{ needs.prepare.outputs.ecr_registry }}
+      ECR_REPOSITORY: ${{ needs.prepare.outputs.ecr_repository }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+    steps:
+      - name: Checkout reviewed build tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # ratchet:actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: bundle
+          persist-credentials: false
+
+      - name: Require maintainer membership for the initiator and rerun actor
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # ratchet:actions/github-script@v8
+        env:
+          AUTHORIZATION_TOKEN: ${{ secrets.OPENHOUND_BETA_AUTHORIZATION_TOKEN }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        with:
+          github-token: ${{ secrets.OPENHOUND_BETA_AUTHORIZATION_TOKEN }}
+          script: |
+            const { authorizeActors } = require('./bundle/.github/scripts/aws-beta.cjs');
+            await authorizeActors({ github, context, env: process.env });
+
+      - name: Check required build credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.BHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.BHE_AWS_SECRET_ACCESS_KEY }}
+          AWS_SOURCE_TOKEN: ${{ secrets.OPENHOUND_AWS_GITHUB_TOKEN }}
+        run: |
+          if [[ -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" || -z "$AWS_SOURCE_TOKEN" ]]; then
+            echo "::error::Configure the managed-aws-beta environment's ECR and AWS source credentials."
+            exit 1
+          fi
+
+      - name: Checkout the approved OpenHound source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # ratchet:actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # ratchet:docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # ratchet:docker/setup-buildx-action@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # ratchet:aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.BHE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.BHE_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Reject an existing image tag
+        run: |
+          if result=$(aws ecr describe-images \
+            --registry-id "${ECR_REGISTRY%%.*}" \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$IMAGE_TAG" 2>&1); then
+            echo "::error::Image tag $IMAGE_TAG already exists. Choose a new development version."
+            exit 1
+          elif [[ "$result" != *"(ImageNotFoundException)"* ]]; then
+            echo "$result"
+            exit 1
+          fi
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@f2e9fc6c2b355c1890b65e6f6f0e2ac3e6e22f78 # ratchet:aws-actions/amazon-ecr-login@v2
+
+      - name: Build, smoke check, and push the bundled enterprise image
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # ratchet:docker/build-push-action@v7
+        with:
+          context: ./source
+          file: ./bundle/Dockerfile.aws-bundle
+          build-contexts: |
+            bundle=./bundle
+          target: enterprise
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          labels: |
+            org.opencontainers.image.version=${{ inputs.tag }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.source_sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            com.specterops.openhound.bundle=managed-aws-beta
+            com.specterops.openhound.aws-revision=${{ needs.prepare.outputs.aws_sha }}
+            com.specterops.openhound.build-tooling-revision=${{ github.sha }}
+          build-args: |
+            OPENHOUND_VERSION=${{ inputs.tag }}
+            OPENHOUND_AWS_COMMIT=${{ needs.prepare.outputs.aws_sha }}
+          secrets: |
+            OPENHOUND_AWS_GITHUB_TOKEN=${{ secrets.OPENHOUND_AWS_GITHUB_TOKEN }}
+
+      - name: Record the published image
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          AWS_SHA: ${{ needs.prepare.outputs.aws_sha }}
+        run: |
+          {
+            echo '## Published managed OpenHound + AWS beta bundle'
+            echo "- Image: \`$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG\`"
+            echo "- Immutable image: \`$ECR_REGISTRY/$ECR_REPOSITORY@$IMAGE_DIGEST\`"
+            echo "- OpenHound commit: \`$SOURCE_SHA\`"
+            echo "- AWS extension commit: \`$AWS_SHA\`"
+            echo "- Build tooling commit: \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"

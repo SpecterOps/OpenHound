@@ -77,3 +77,9 @@ jobs:
       - name: Run DLT Pydantic exception handling (override) test
         run: |
           .venv/bin/pytest tests/test_dlt_pydantic_override.py -v
+
+      - name: Run managed AWS beta publishing guard tests
+        run: node --test tests/workflows/aws-beta.test.cjs
+
+      - name: Run AWS bundle packaging tests
+        run: .venv/bin/pytest tests/test_aws_bundle_preparation.py -v

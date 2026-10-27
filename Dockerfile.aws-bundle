@@ -1,0 +1,56 @@
+# Managed AWS beta bundle only; see deployments/aws-extension-bundle.md.
+# The named "bundle" context supplies reviewed build tooling independently of
+# the selected OpenHound source context.
+FROM rust:1.96.0-slim-bookworm@sha256:4732ca96fd086cb9be682050c3f0176288eebaac2b80aa2bcefccfaf198e1950 AS rust
+
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:531f855bda2c73cd6ef67d56b733b357cea384185b3022bd09f05e002cd144ca AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=rust /usr/local/cargo /usr/local/cargo
+COPY --from=rust /usr/local/rustup /usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup
+ENV PATH="/usr/local/cargo/bin:${PATH}"
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_NO_DEV=1 UV_PYTHON_DOWNLOADS=0
+
+ARG OPENHOUND_VERSION
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${OPENHOUND_VERSION}
+
+WORKDIR /app
+COPY . /app
+COPY --from=bundle scripts/prepare_aws_bundle.py scripts/smoke_aws_bundle.py /app/scripts/
+COPY --from=bundle deployments/aws-extension-constraints.txt /app/deployments/aws-extension-constraints.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --extra all --frozen --no-install-project \
+ && export SETUPTOOLS_SCM_PRETEND_VERSION="$(.venv/bin/python -c 'import os; from packaging.version import Version; print(Version(os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"]))')" \
+ && uv sync --extra all --frozen
+
+# Update this reviewed, immutable pin to publish newer AWS extension changes.
+# Read access to the internal repository is supplied only as a BuildKit secret.
+ARG OPENHOUND_AWS_COMMIT=a8500e4a4667dab7c6dff82e3646d8f1b1ba470b
+RUN --mount=type=secret,id=OPENHOUND_AWS_GITHUB_TOKEN,required=true \
+    .venv/bin/python scripts/prepare_aws_bundle.py "${OPENHOUND_AWS_COMMIT}"
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    export SETUPTOOLS_SCM_PRETEND_VERSION="$(.venv/bin/python -c 'from importlib.metadata import version; print(version("openhound"))')" \
+ && uv pip freeze --exclude-editable > /tmp/openhound-constraints.txt \
+ && uv pip install --python .venv --prerelease allow \
+      --constraint /tmp/openhound-constraints.txt \
+      --constraint deployments/aws-extension-constraints.txt "/app[all]" /tmp/openhound-aws \
+ && uv pip check --python .venv
+
+FROM gcr.io/distroless/python3:nonroot@sha256:727eccc5d83f11273c954652667b5b5a1c66120bd4cfb884e879ab77dcdf966a AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app/src:/app/.venv/lib/python3.13/site-packages"
+COPY --from=builder --chown=nonroot:nonroot /app /app
+WORKDIR /app
+
+# Verify extension discovery and native imports on each actual target runtime.
+RUN ["python", "scripts/smoke_aws_bundle.py"]
+
+FROM base AS enterprise
+ENTRYPOINT ["python", "src/scheduler.py"]
