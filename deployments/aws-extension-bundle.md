@@ -28,39 +28,45 @@ passed as a build argument or saved in an image layer.
 3. Set `tag` to a development version such as `0.4.1.dev9346005`, without `v` or
    `ecr-enterprise`. Use the existing numbering convention and coordinate versions
    with other publishers to the shared repository.
-4. Run the workflow. It builds the `enterprise` image for AMD64 and ARM64 and
+4. Set **`aws_commit`** to the full 40-character source commit SHA from
+   `SpecterOps/openhound-aws` that you want to bundle. This input is required and
+   has no default; branches, tags, and abbreviated SHAs are rejected by the build.
+5. Run the workflow. It builds the `enterprise` image for AMD64 and ARM64 and
    publishes only this version tag:
 
    ```text
    ${ECR_REGISTRY}/${ECR_REPOSITORY}:ecr-enterprise0.4.1.dev9346005
    ```
 
-5. Update the managed beta collector deployment through the infrastructure team's
+6. Update the managed beta collector deployment through the infrastructure team's
    existing process. Publishing an image does not update a running deployment.
 
-The Dockerfile, AWS source pin, constraints, and preparation/smoke scripts come
-from the selected **workflow revision**, independently of `source_ref`. This lets
+The Dockerfile, constraints, and preparation/smoke scripts come from the selected
+**workflow revision**, independently of `source_ref`. This lets
 the workflow on `main` build a feature branch that predates these bundle files.
-The selected source still needs to contain the desired managed runtime features.
+The AWS source revision is selected separately through `aws_commit`. The selected
+OpenHound source still needs to contain the desired managed runtime features.
 
-After the workflow merges to `main`, it can also be started with:
+After the workflow merges to `main`, it can also be started with the GitHub CLI.
+Set `AWS_COMMIT_SHA` to the desired full AWS source commit SHA first:
 
 ```sh
 gh workflow run build-ecr-aws-beta-manual.yaml --ref main \
-  -f tag=0.4.1.dev9346005 -f source_ref=main
+  -f tag=0.4.1.dev9346005 -f source_ref=main -f aws_commit="$AWS_COMMIT_SHA"
 ```
 
 ## Include newer AWS extension changes
 
-Update **`ARG OPENHOUND_AWS_COMMIT` in `Dockerfile.aws-bundle`** to the desired full
-40-character commit SHA from `SpecterOps/openhound-aws`, verify the bundle, and
-merge that update to `main`. Then run the workflow with a new development version.
-The build uses this checked-in pin; it does not automatically follow the AWS
-repository's latest commit.
+Run the workflow with the desired **`aws_commit`** and a new development version.
+Selecting a newer extension revision does not require editing files or merging a
+SHA update to `main`. Each build fetches exactly the supplied commit instead of
+automatically following the AWS repository's latest commit. Local Docker builds
+must likewise pass `--build-arg OPENHOUND_AWS_COMMIT=<full-commit-sha>`.
 
-When updating the pin, review `scripts/prepare_aws_bundle.py` and
-`deployments/aws-extension-constraints.txt`. The preparation script patches the
-temporary extension's OpenHound requirement to the installed local version,
+When selecting a newer commit, consider compatibility with
+`scripts/prepare_aws_bundle.py` and `deployments/aws-extension-constraints.txt`.
+The preparation script patches the temporary extension's OpenHound requirement
+to the installed local version,
 raises its boto3 requirement to `>=1.43.90`, and places `extension.yaml` inside the
 Python package. Changed upstream packaging may require updating those patches.
 

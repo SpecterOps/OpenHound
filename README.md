@@ -41,7 +41,6 @@ while CLI commands and graph documentation are automatically generated for every
 Follow the docs for setup, CLI usage, and collector development:
 
 - Overview: [OpenHound Documentation](https://bloodhound.specterops.io/openhound/overview)
-- Maintainers: [Publish managed OpenHound + AWS beta images](deployments/aws-extension-bundle.md)
 
 ## How it works
 

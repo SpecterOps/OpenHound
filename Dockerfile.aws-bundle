@@ -26,9 +26,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
  && export SETUPTOOLS_SCM_PRETEND_VERSION="$(.venv/bin/python -c 'import os; from packaging.version import Version; print(Version(os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"]))')" \
  && uv sync --extra all --frozen
 
-# Update this reviewed, immutable pin to publish newer AWS extension changes.
+# The workflow's required aws_commit input selects this immutable source revision.
 # Read access to the internal repository is supplied only as a BuildKit secret.
-ARG OPENHOUND_AWS_COMMIT=a8500e4a4667dab7c6dff82e3646d8f1b1ba470b
+ARG OPENHOUND_AWS_COMMIT
 RUN --mount=type=secret,id=OPENHOUND_AWS_GITHUB_TOKEN,required=true \
     .venv/bin/python scripts/prepare_aws_bundle.py "${OPENHOUND_AWS_COMMIT}"
 RUN --mount=type=cache,target=/root/.cache/uv \

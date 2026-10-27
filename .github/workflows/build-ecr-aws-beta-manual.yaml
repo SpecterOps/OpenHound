@@ -13,6 +13,10 @@ on:
         required: true
         default: main
         type: string
+      aws_commit:
+        description: "Full 40-character openhound-aws source commit SHA to bundle"
+        required: true
+        type: string
 
 # Match the existing manual ECR workflow's token permissions and access model.
 permissions:
@@ -77,5 +81,6 @@ jobs:
           tags: ${{ steps.metadata.outputs.tags }}
           build-args: |
             OPENHOUND_VERSION=${{ inputs.tag }}
+            OPENHOUND_AWS_COMMIT=${{ inputs.aws_commit }}
           secrets: |
             OPENHOUND_AWS_GITHUB_TOKEN=${{ secrets.OPENHOUND_AWS_GITHUB_TOKEN }}
