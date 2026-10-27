@@ -22,6 +22,14 @@ passed as a build argument or saved in an image layer.
 
 ## Publish a beta image
 
+Commit references for the workflow inputs:
+
+- **`aws_commit`:** [Recent openhound-aws commits](https://github.com/SpecterOps/openhound-aws/commits/main/).
+  Open the desired commit and copy its **full 40-character SHA**, not the
+  abbreviated value shown in the history. Repository access is required.
+- **`source_ref`:** [Recent OpenHound commits](https://github.com/SpecterOps/OpenHound/commits/main/).
+  Use the branch selector to view feature-branch history when needed.
+
 1. In GitHub Actions, select **Push Bundled OpenHound + AWS Beta Image to ECR**.
 2. Use the workflow from **`main`**. Set `source_ref` to `main`, or to the beta
    branch/commit containing the managed functionality you want to build.
