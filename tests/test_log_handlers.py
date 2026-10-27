@@ -1,5 +1,8 @@
 import json
 import logging
+import os
+import threading
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from decimal import Decimal
 from io import StringIO
@@ -17,6 +20,7 @@ from openhound.core.logging import (
     OpenHoundRichFormatter,
     OpenHoundTextFormatter,
     RotatingFileHandler,
+    _ParentWorkerHandler,
     _ValueRedactor,
     redact_log_values,
 )
@@ -337,7 +341,13 @@ def test_redaction_formats_original_arguments(message, args, secret, expected):
         assert record.msg == record.getMessage() == expected
         assert record.args == ()
         assert record.response == {"credential": "[REDACTED]", "count": 7}
-        assert secret not in repr(record.__dict__)
+        # Numeric metadata (timestamps/PIDs) is preserved and may coincidentally
+        # contain a short numeric test secret. Check rendered/string fields.
+        assert all(
+            secret not in value
+            for value in record.__dict__.values()
+            if isinstance(value, str)
+        )
         assert secret not in formatter.format(record)
 
 
@@ -431,6 +441,32 @@ def test_get_file_handler_caches_handler_per_path(tmp_path):
             handler.close()
 
 
+@pytest.mark.parametrize("rich", [False, True], ids=["stdout", "rich-console"])
+def test_parent_worker_routing_deduplicates_shared_console_destinations(
+    configured_logger, rich
+):
+    output = StringIO()
+    handlers = [
+        RichHandler(console=Console(file=output), show_time=False, show_path=False)
+        if rich
+        else logging.StreamHandler(output)
+        for _ in range(2)
+    ]
+    configured_logger.root_logger.addHandler(handlers[0])
+    configured_logger.dlt_logger.addHandler(handlers[1])
+    try:
+        record = logging.LogRecord(
+            "dlt", logging.ERROR, __file__, 1, "one-delivery", (), None
+        )
+        _ParentWorkerHandler(configured_logger).handle(record)
+        assert output.getvalue().count("one-delivery") == 1
+    finally:
+        configured_logger.root_logger.removeHandler(handlers[0])
+        configured_logger.dlt_logger.removeHandler(handlers[1])
+        for handler in handlers:
+            handler.close()
+
+
 def test_root_and_dlt_loggers_share_single_file_handler(configured_logger):
     """The root and dlt loggers writing to openhound.log must share one handler
     instance so the file is only opened once, which is required for rotation on
@@ -490,3 +526,274 @@ def test_build_file_handler_applies_rotation_settings(tmp_path):
         )
     finally:
         handler.close()
+
+
+WORKER_ACCESS = "worker-example-access-key"
+WORKER_SECRET = "worker-example-secret-key"
+
+
+def _spawned_log_collection(collector, job_id, params, credentials, managed, directory):
+    """Run the real job/configuration bridge; replace only collection/network IO."""
+    from dlt.common import logger as dlt_logger
+
+    from openhound.core.logging import logger_override
+    from openhound.scheduler import service
+
+    def collect(*args):
+        # DLT runtime initialization can configure its logger, as can each of
+        # OpenHound's collect/preprocess/convert stages. All must keep forwarding.
+        dlt.pipeline(
+            pipeline_name="worker_logs", pipelines_dir=str(directory / "pipelines")
+        )
+        logger_override.setup()
+        CustomLogger("unused.log", base_path="/must/not/be/created").setup()
+        logger_override.set_handler("aws")
+        logger_override.set_handler("aws")
+        loggers = [logging.getLogger(), *logging.Logger.manager.loggerDict.values()]
+        assert not any(
+            isinstance(handler, logging.FileHandler)
+            for logger in loggers
+            if isinstance(logger, logging.Logger)
+            for handler in logger.handlers
+        ), "scheduler workers must not own file handlers"
+        logging.getLogger("openhound.core.collect").info(
+            "forwarded-core %s",
+            WORKER_ACCESS,
+            extra={
+                "details": {"secret": WORKER_SECRET, "values": [False, 0, None]},
+                "path": Path("structured-path"),
+            },
+        )
+        logging.getLogger("openhound_aws.auth").warning(
+            "forwarded-extension %s",
+            WORKER_SECRET,
+            extra={
+                "job_id": "explicit-job",
+                "collector_extension": "explicit-collector",
+            },
+        )
+        dlt_logger.info(
+            "forwarded-dlt %s", WORKER_SECRET, extra={"metrics": {"rows": 7}}
+        )
+        try:
+            raise RuntimeError(f"diagnostic {WORKER_SECRET}")
+        except RuntimeError:
+            logging.getLogger("openhound.core.collect").exception("forwarded-exception")
+        logging.getLogger("botocore.worker_test").debug("forbidden-sdk-response")
+        if params.get("test", {}).get("fail"):
+            raise RuntimeError(f"worker failure {WORKER_SECRET}")
+        return service.Result({}, job_id)
+
+    service._collect_in_worker = collect
+    return service._subprocess_collect(
+        collector, job_id, params, credentials, managed, directory
+    )
+
+
+def _spawned_log_then_die():
+    logging.getLogger("openhound.core.collect").warning("before-abrupt-death")
+    os._exit(17)
+
+
+def _spawned_busy_logger():
+    logger = logging.getLogger("openhound.core.collect")
+    logger.warning("before-abrupt-death")
+    while True:
+        logger.info("worker-writing", extra={"payload": "x" * 65536})
+
+
+@pytest.fixture
+def logging_scheduler(configured_logger, monkeypatch):
+    from openhound.core import logging as openhound_logging
+    from openhound.scheduler.service import Service
+
+    monkeypatch.setattr(openhound_logging, "logger_override", configured_logger)
+    scheduler = Service("https://bhe.example.test", "token", "id", "aws", managed=False)
+    monkeypatch.setattr(scheduler.client, "start_collector_job", lambda job_id: None)
+    monkeypatch.setattr(
+        scheduler.client, "end_managed_job", lambda *args, **kwargs: None
+    )
+    try:
+        yield scheduler
+    finally:
+        scheduler.executor.shutdown(wait=True, cancel_futures=True)
+        scheduler._cleanup_aws_profile_workspace()
+        scheduler._worker_logging.close()
+
+
+def test_real_spawned_worker_routes_redacted_records_and_survives_replacement(
+    logging_scheduler, configured_logger, tmp_path, monkeypatch
+):
+    from openhound.scheduler.aws_profile import AWSAccessKeyCredentials
+    from openhound.scheduler.configuration import ManagedConfigurationError
+
+    scheduler = logging_scheduler
+    records = []
+
+    class ParentOnlyHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = ParentOnlyHandler()
+    logging.getLogger().addHandler(handler)
+    listener_thread = scheduler._worker_logging.listener._thread
+    manager_process = scheduler._worker_logging.manager._process
+    try:
+        for index in range(3):
+            if index == 2:
+                scheduler._reset_executor()
+            executor = scheduler.executor
+            submit = executor.submit
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    executor,
+                    "submit",
+                    lambda function, *args, submit=submit: submit(
+                        _spawned_log_collection, *args
+                    ),
+                )
+                scheduler.run_claimed_job(
+                    f"job-{index}",
+                    {"test": {"fail": index == 1}},
+                    AWSAccessKeyCredentials(WORKER_ACCESS, WORKER_SECRET),
+                )
+            if index == 1:
+                with pytest.raises(ManagedConfigurationError) as error:
+                    scheduler.future.result(timeout=30)
+                assert WORKER_SECRET not in str(error.value)
+            else:
+                assert scheduler.future.result(timeout=30).job_id == f"job-{index}"
+            scheduler._handle_completed_job(scheduler.future)
+        scheduler._shutdown()
+        assert not listener_thread.is_alive()
+        assert not manager_process.is_alive()
+        assert scheduler._worker_logging.listener is None
+        assert scheduler._worker_logging.manager is None
+        # Closing twice is safe, including after Service shutdown.
+        scheduler._worker_logging.close()
+
+        core = [
+            record
+            for record in records
+            if record.getMessage().startswith("forwarded-core")
+        ]
+        extension = [
+            record
+            for record in records
+            if record.getMessage().startswith("forwarded-extension")
+        ]
+        dlt_records = [
+            record
+            for record in records
+            if record.getMessage().startswith("forwarded-dlt")
+        ]
+        exceptions = [
+            record for record in records if record.getMessage() == "forwarded-exception"
+        ]
+        assert len(core) == len(extension) == len(dlt_records) == len(exceptions) == 3
+        assert {record.job_id for record in core} == {"job-0", "job-1", "job-2"}
+        assert all(
+            record.collector_extension == "aws"
+            for record in core + dlt_records + exceptions
+        )
+        assert all(
+            record.job_id == "explicit-job"
+            and record.collector_extension == "explicit-collector"
+            for record in extension
+        )
+        assert all(
+            record.name == "openhound_aws.auth" and record.levelno == logging.WARNING
+            for record in extension
+        )
+        assert all(
+            record.details == {"secret": "[REDACTED]", "values": [False, 0, None]}
+            and record.path == "structured-path"
+            for record in core
+        )
+        assert all(record.metrics == {"rows": 7} for record in dlt_records)
+        assert all(
+            "RuntimeError: diagnostic [REDACTED]" in record.exc_text
+            and "collect" in record.exc_text
+            for record in exceptions
+        )
+        assert any(
+            "worker failure [REDACTED]" in (record.exc_text or "") for record in records
+        )
+        assert "forbidden-sdk-response" not in repr(
+            [record.__dict__ for record in records]
+        )
+        for secret in (WORKER_ACCESS, WORKER_SECRET):
+            assert secret not in repr([record.__dict__ for record in records])
+            assert secret not in (tmp_path / "openhound.log").read_text()
+            assert secret not in (tmp_path / "ext_aws.log").read_text()
+        main = [
+            json.loads(line)
+            for line in (tmp_path / "openhound.log").read_text().splitlines()
+        ]
+        assert sum(row["message"].startswith("forwarded-dlt") for row in main) == 3
+        extension_file = [
+            json.loads(line)
+            for line in (tmp_path / "ext_aws.log").read_text().splitlines()
+        ]
+        assert (
+            sum(row["message"].startswith("forwarded-dlt") for row in extension_file)
+            == 3
+        )
+    finally:
+        logging.getLogger().removeHandler(handler)
+
+
+@pytest.mark.parametrize("claim_lost", [False, True], ids=["broken-pool", "claim-loss"])
+def test_worker_logging_abrupt_termination_and_shutdown_do_not_hang(
+    logging_scheduler, claim_lost, tmp_path
+):
+    scheduler = logging_scheduler
+    listener_thread = scheduler._worker_logging.listener._thread
+    if claim_lost:
+        ready = threading.Event()
+
+        class ReadyHandler(logging.Handler):
+            def emit(self, record):
+                if record.getMessage() == "worker-writing":
+                    ready.set()
+
+        handler = ReadyHandler()
+        logging.getLogger().addHandler(handler)
+        try:
+            future = scheduler.executor.submit(_spawned_busy_logger)
+            scheduler.future = future
+            assert ready.wait(30), "worker did not begin forwarding records"
+            # Kill a live producer while it is continuously forwarding records,
+            # rather than only exercising orderly queue submissions before exit.
+            scheduler._abort_managed_job("job")
+            with pytest.raises(BrokenProcessPool):
+                future.result(timeout=30)
+        finally:
+            logging.getLogger().removeHandler(handler)
+    else:
+        scheduler.future = scheduler.executor.submit(_spawned_log_then_die)
+        with pytest.raises(BrokenProcessPool):
+            scheduler.future.result(timeout=30)
+        scheduler._reset_executor()
+        scheduler.future = None
+    # A replacement initialized through either reset path still forwards.
+    future = scheduler.executor.submit(_spawned_log_then_die)
+    with pytest.raises(BrokenProcessPool):
+        future.result(timeout=30)
+    scheduler.future = None
+    finished = threading.Event()
+
+    def shutdown():
+        scheduler._shutdown()
+        finished.set()
+
+    thread = threading.Thread(target=shutdown, daemon=True)
+    thread.start()
+    assert finished.wait(10), "shutdown hung after abrupt worker termination"
+    thread.join(timeout=1)
+    assert not listener_thread.is_alive()
+    main = [
+        json.loads(line)
+        for line in (tmp_path / "openhound.log").read_text().splitlines()
+    ]
+    assert sum(row["message"] == "before-abrupt-death" for row in main) == 2

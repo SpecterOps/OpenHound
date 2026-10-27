@@ -1,0 +1,14 @@
+{
+  "sources": {
+    "source": {
+      "aws": {
+        "credentials": {
+          "region_name": "us-east-1"
+        },
+        "bucket_policy": {
+          "include": false
+        }
+      }
+    }
+  }
+}

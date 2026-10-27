@@ -10,6 +10,7 @@ import time
 import traceback
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -388,6 +389,11 @@ def mock_service(mock_bloodhound_api, monkeypatch):
 
     monkeypatch.setattr("requests.request", mock_request)
     monkeypatch.setattr(scheduler_service, "ProcessPoolExecutor", DummyExecutor)
+    monkeypatch.setattr(
+        scheduler_service.openhound_logging,
+        "WorkerLogRouter",
+        lambda context: SimpleNamespace(queue=None, close=lambda: None),
+    )
 
     return Service(
         bhe_uri="http://localhost:8000",
@@ -1958,15 +1964,9 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
     "field,value",
     [
         ("external_secret_key_id", None),
-        ("external_secret_key_id", ""),
-        ("external_secret_key_id", "ASIAIOSFODNN7EXAMPLE"),
-        ("external_secret_key_id", AWS_ACCESS_KEY + "\n"),
-        ("external_secret_key_id", "not-an-access-key"),
         ("secret_key_id", None),
         ("secret_key_id", ""),
         ("secret_key_id", "  "),
-        ("secret_key_id", " private-secret-reference"),
-        ("secret_key_id", "reference\nother"),
     ],
 )
 def test_invalid_aws_metadata_fails_before_start_without_runtime_fallback(
@@ -2005,14 +2005,6 @@ def test_invalid_aws_metadata_fails_before_start_without_runtime_fallback(
     "response",
     [
         {},
-        {"SecretString": ""},
-        {"SecretString": " " + AWS_SECRET_KEY},
-        {"SecretString": AWS_SECRET_KEY + "\n"},
-        {"SecretString": AWS_SECRET_KEY[:-1]},
-        {"SecretString": "x" * 41},
-        {"SecretString": "%" * 40},
-        {"SecretString": json.dumps(AWS_SECRET_KEY)},
-        {"SecretString": '["key"]'},
         {"SecretString": json.dumps({"aws_secret_access_key": AWS_SECRET_KEY})},
         {"SecretString": json.dumps(COLLECTOR_SECRETS)},
         {"SecretBinary": b"\xff\xfe"},
@@ -2047,9 +2039,48 @@ def test_invalid_raw_aws_payloads_are_not_trimmed_wrapped_or_treated_as_document
         {"source_account": "999999999999"},
         {"org_role_name": ""},
         {"org_role_name": 123},
+        {"role_arn": None},
+        {"role_arn": ""},
+        {"role_arn": "arn:aws:iam::123456789012:user/Collector"},
+        {"role_arn": "arn:aws:iam::123456789:role/Collector"},
+        {"role_arn": "arn:aws:iam::123456789012:role/Collector\n"},
+        {"role_session_name": "collection-session"},
+        {"external_id": "customer-123"},
+        {
+            "role_arn": "arn:aws:iam::123456789012:role/Collector",
+            "role_session_name": "x",
+        },
+        {
+            "role_arn": "arn:aws:iam::123456789012:role/Collector",
+            "role_session_name": "x" * 65,
+        },
+        {
+            "role_arn": "arn:aws:iam::123456789012:role/Collector",
+            "role_session_name": "session\n[profile other]",
+        },
+        {
+            "role_arn": "arn:aws:iam::123456789012:role/Collector",
+            "role_session_name": None,
+        },
+        {
+            "role_arn": "arn:aws:iam::123456789012:role/Collector",
+            "external_id": "contains spaces",
+        },
+        {
+            "role_arn": "arn:aws:iam::123456789012:role/Collector",
+            "external_id": "x" * 1225,
+        },
+        {
+            "role_arn": "arn:aws:iam::123456789012:role/Collector",
+            "external_id": 123,
+        },
+        {
+            "role_arn": "arn:aws:iam::123456789012:role/Collector",
+            "source_account": "123456789012",
+        },
     ],
 )
-def test_raw_aws_authentication_conflicts_fail_before_start(
+def test_raw_aws_settings_reach_worker_handoff_without_aws_validation(
     aws_managed_service, mock_bloodhound_api, options, monkeypatch
 ):
     state = mock_bloodhound_api.app.state
@@ -2059,12 +2090,16 @@ def test_raw_aws_authentication_conflicts_fail_before_start(
     monkeypatch.setattr(
         aws_managed_service.secrets_manager,
         "get_secret",
-        lambda _: pytest.fail("invalid authentication must fail before retrieval"),
+        lambda _: AWS_SECRET_KEY,
     )
     aws_managed_service._poll()
-    assert state.collector_job_start_requests == []
-    assert aws_managed_service.executor.submitted == []
-    assert state.collector_job_end_requests[0]["body"]["outcome"] == "failed"
+    assert len(state.collector_job_start_requests) == 1
+    submitted = aws_managed_service.executor.submitted[0][0]
+    assert submitted[3] == state.collector_job_claim_response["params"]
+    assert submitted[3]["sources"]["source"]["aws"]["credentials"] == options
+    assert submitted[4].secret_access_key == AWS_SECRET_KEY
+    assert state.collector_job_end_requests == []
+    aws_managed_service._cleanup_aws_profile_workspace()
 
 
 def test_missing_new_bhe_job_field_rejects_claim_before_start(
@@ -2323,9 +2358,7 @@ def test_aws_launch_paths_validate_before_start(
     params = (
         {}
         if wrong_collector
-        else {
-            "sources": {"source": {"aws": {"credentials": {"profile_name": "local"}}}}
-        }
+        else {"sources": {"source": {"aws": {"credentials": "not-an-object"}}}}
     )
     kwargs = {"managed": True} if launch_path == "_launch_job" else {}
     with pytest.raises(AWSAccessKeyError):
@@ -2348,7 +2381,6 @@ def test_aws_launch_paths_validate_before_start(
         {"sources": {"credentials": {"org_role_name": "OtherRole"}}},
         {"sources": {"source": {"credentials": {"profile_name": "other"}}}},
         {"sources": {"aws": {"credentials": {"profile_names": ["other"]}}}},
-        {"profile_name": "flat-profile"},
         {"aws_collector": {"credentials": {"profile_names": ["other"]}}},
         {
             "aws_collector": {
@@ -2359,15 +2391,75 @@ def test_aws_launch_paths_validate_before_start(
         },
     ],
 )
-def test_raw_aws_rejects_ambiguous_authentication_layouts_before_start(
+def test_raw_aws_preserves_alternative_nested_authentication_layouts(
     aws_managed_service, mock_bloodhound_api, params
 ):
     state = mock_bloodhound_api.app.state
     state.collector_job_claim_response["params"] = params
     aws_managed_service._poll()
-    assert state.collector_job_start_requests == []
-    assert aws_managed_service.executor.submitted == []
-    assert state.collector_job_end_requests[0]["body"]["outcome"] == "failed"
+    assert len(state.collector_job_start_requests) == 1
+    submitted = aws_managed_service.executor.submitted[0][0]
+    expected = deepcopy(params)
+    expected.setdefault("sources", {}).setdefault("source", {}).setdefault(
+        "aws", {}
+    ).setdefault("credentials", {})
+    assert submitted[3] == expected
+    assert state.collector_job_end_requests == []
+    aws_managed_service._cleanup_aws_profile_workspace()
+
+
+@pytest.mark.parametrize(
+    "key", ["", "nonstandard-key", "ASIAIOSFODNN7EXAMPLE", "key\n"]
+)
+@pytest.mark.parametrize(
+    "secret", ["", "short", "%" * 41, '"quoted-key"', '["key"]', " key\n"]
+)
+def test_nonstandard_raw_keys_reach_handoff_unchanged(
+    aws_managed_service, mock_bloodhound_api, key, secret
+):
+    state = mock_bloodhound_api.app.state
+    state.collector_job_claim_response["external_secret_key_id"] = key
+    aws_managed_service.secrets_manager = AWSSecretsManager(
+        SimpleNamespace(get_secret_value=lambda **kwargs: {"SecretString": secret})
+    )
+    aws_managed_service._poll()
+    submitted = aws_managed_service.executor.submitted[0][0]
+    assert submitted[4].access_key_id == key
+    assert submitted[4].secret_access_key == secret
+    assert len(state.collector_job_start_requests) == 1
+    aws_managed_service._cleanup_aws_profile_workspace()
+
+
+@pytest.mark.parametrize("reference", [" reference with spaces", "reference\nother"])
+def test_aws_secret_reference_is_passed_to_reader_unchanged(
+    aws_managed_service, mock_bloodhound_api, monkeypatch, reference
+):
+    state = mock_bloodhound_api.app.state
+    state.collector_job_claim_response["secret_key_id"] = reference
+    seen = []
+
+    def retrieve(value):
+        seen.append(value)
+        return AWS_SECRET_KEY
+
+    monkeypatch.setattr(aws_managed_service.secrets_manager, "get_secret", retrieve)
+    aws_managed_service._poll()
+    assert seen == [reference]
+    assert len(state.collector_job_start_requests) == 1
+    aws_managed_service._cleanup_aws_profile_workspace()
+
+
+@pytest.mark.parametrize(
+    "document", [{}, {"custom": {"nested": [None, {}, [], False, 0, ""]}}]
+)
+def test_nested_credential_values_reach_runner_unchanged(managed_service, document):
+    managed_service.secrets_manager = AWSSecretsManager(
+        SimpleNamespace(
+            get_secret_value=lambda **kwargs: {"SecretString": json.dumps(document)}
+        )
+    )
+    managed_service._poll()
+    assert managed_service.handoffs[0].credentials == document
 
 
 @pytest.mark.parametrize(
@@ -2612,12 +2704,9 @@ def test_managed_expired_claim_start_rejection_clears_preparation(
     [
         "plain-secret",
         '{"malformed":',
-        "{}",
         '{"value":"  "}',
         '{"value":null}',
-        '{"value":{}}',
         '{"value":[]}',
-        '{"value":{"nested":""}}',
         '{"value":NaN}',
         '{" ":"private-credential-value"}',
     ],
@@ -3487,6 +3576,9 @@ def test_managed_configuration_failure_is_logged_and_reported_with_the_same_reas
         for record in caplog.records
         if record.name == "openhound.scheduler.service"
         and record.levelno == logging.ERROR
+        and record.getMessage().startswith(
+            "Managed job collector-job-123 configuration"
+        )
     ]
     assert record.getMessage() == (
         f"Managed job collector-job-123 configuration is invalid: {message}"
@@ -4502,7 +4594,7 @@ def test_failed_managed_conversion_cleans_up_staged_files(monkeypatch, tmp_path)
         raise RuntimeError("conversion failed")
 
     monkeypatch.setattr(scheduler_service.dataflow, "pipeline", fail)
-    with pytest.raises(RuntimeError, match="conversion failed"):
+    with pytest.raises(ManagedConfigurationError, match="check worker logs"):
         _subprocess_collect(
             "example", "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d", managed=True
         )
