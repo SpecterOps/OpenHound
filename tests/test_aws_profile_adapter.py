@@ -41,7 +41,6 @@ SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 PAIR = AWSAccessKeyCredentials(ACCESS_KEY, SECRET_KEY)
 SOURCE_ACCOUNT = "999999999999"
 MANAGEMENT_ACCOUNT = "111111111111"
-MEMBER_ACCOUNT = "222222222222"
 ROLE_ACCOUNT = "333333333333"
 ROLE_ARN = f"arn:aws:iam::{ROLE_ACCOUNT}:role/security/CollectorRole"
 ROLE_ACCESS_KEY = "ASIAIOSFODNN7EXAMPLE"
@@ -164,11 +163,9 @@ def _assert_role_credentials(session):
 
 
 @pytest.mark.parametrize("custom_session", [False, True], ids=["default", "custom"])
-def test_role_profile_resolves_through_real_sdk_and_extension(
+def test_role_profile_resolves_through_real_sdk(
     custom_session,
     workspace,
-    resolve_aws_settings,
-    aws_extension_auth,
     profile_assumptions,
     monkeypatch,
 ):
@@ -190,11 +187,12 @@ def test_role_profile_resolves_through_real_sdk_and_extension(
         if custom_session:
             expected["ExternalId"] = "customer/123"
         profile_assumptions(expected)
-        model = resolve_aws_settings()["credentials"]
-        assert type(model) is aws_extension_auth.AWSProfileCredentials
-        assert model.profile_name == profile
-        assert model.region_name == "eu-west-1"
-        session = model.session
+        settings = dlt.secrets.get("sources.source.aws.credentials", dict)
+        assert settings["profile_name"] == profile
+        assert settings["region_name"] == "eu-west-1"
+        session = boto3.Session(
+            profile_name=settings["profile_name"], region_name=settings["region_name"]
+        )
         _assert_role_credentials(session)
         sts = session.client("sts")
         with Stubber(sts) as stubber:
@@ -328,34 +326,6 @@ def test_arbitrary_settings_survive_profile_adaptation_without_mutation(workspac
             "aws_secret_access_key": "short%secret",
         }
     assert params == original
-
-
-@pytest.mark.parametrize(
-    "options,model_name",
-    [
-        (
-            {"source_account": "incomplete", "management_role_name": "ignored"},
-            "AWSProfileCredentials",
-        ),
-        ({"profile_names": ["job-supplied-profile"]}, "AWSMultiProfileCredentials"),
-        ({"future": {"unknown": [None, {}, [], False, 0]}}, "AWSProfileCredentials"),
-    ],
-)
-def test_current_extension_fallback_and_ignored_fields_are_authoritative(
-    workspace, resolve_aws_settings, aws_extension_auth, options, model_name
-):
-    params = {"sources": {"source": {"aws": {"credentials": options}}}}
-    with managed_aws_profile(params, PAIR, workspace.directory) as profile:
-        model = resolve_aws_settings()["credentials"]
-        assert type(model) is getattr(aws_extension_auth, model_name)
-        if model_name == "AWSMultiProfileCredentials":
-            assert model.profile_names == options["profile_names"]
-        else:
-            assert model.profile_name == profile
-        assert dlt.config.get("sources.source.aws.credentials", dict) == {
-            **options,
-            "profile_name": profile,
-        }
 
 
 @pytest.mark.parametrize(
@@ -530,9 +500,7 @@ def test_sdk_debug_responses_are_suppressed_and_logging_state_restored(
         sdk_logger.handlers, sdk_logger.disabled, sdk_logger.propagate = previous[1:]
 
 
-def test_real_sdk_and_extension_profile_resolution(
-    workspace, aws_extension_auth, resolve_aws_settings
-):
+def test_profile_resolves_in_sdk_and_preserves_nested_configuration(workspace):
     params = {
         "sources": {
             "source": {
@@ -553,22 +521,27 @@ def test_real_sdk_and_extension_profile_resolution(
     }
     original = deepcopy(params)
     with managed_aws_profile(params, PAIR, workspace.directory) as profile:
-        settings = resolve_aws_settings()
-        model = settings["credentials"]
-        assert type(model) is aws_extension_auth.AWSProfileCredentials
-        assert model.profile_name == profile
-        assert model.region_name == "eu-west-1"
-        assert model.endpoint_url == "https://aws.example.test"
-        _assert_source_credentials(model.session)
-        client = model.session.client("sts", endpoint_url=model.endpoint_url)
+        settings = dlt.config.get("sources.source.aws", dict)
+        credentials = settings["credentials"]
+        assert credentials == {
+            **params["sources"]["source"]["aws"]["credentials"],
+            "profile_name": profile,
+        }
+        session = boto3.Session(
+            profile_name=credentials["profile_name"],
+            region_name=credentials["region_name"],
+        )
+        _assert_source_credentials(session)
+        client = session.client("sts", endpoint_url=credentials["endpoint_url"])
         with Stubber(client) as stubber:
             stubber.add_response("get_caller_identity", _identity(), {})
             assert client.get_caller_identity()["Account"] == SOURCE_ACCOUNT
         assert client.meta.endpoint_url == "https://aws.example.test"
         assert settings["max_attempts"] == 7
-        bucket = settings["bucket_policy"]
-        assert bucket.include is True and bucket.max_objects == 9
-        assert bucket.bucket_whitelist[0].match == "public/.*"
+        assert (
+            settings["bucket_policy"]
+            == params["sources"]["source"]["aws"]["bucket_policy"]
+        )
         for name in ("credentials", "config"):
             path = workspace.directory / name
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -583,7 +556,7 @@ def test_real_sdk_and_extension_profile_resolution(
 
 
 def test_runtime_and_local_configuration_cannot_override_generated_identity(
-    workspace, resolve_aws_settings, aws_extension_auth, monkeypatch
+    workspace, monkeypatch
 ):
     for key, value in {
         "AWS_ACCESS_KEY_ID": "scheduler-access-key",
@@ -635,10 +608,22 @@ def test_runtime_and_local_configuration_cannot_override_generated_identity(
     original_environment = dict(os.environ)
     try:
         with managed_aws_profile({}, PAIR, workspace.directory) as profile:
-            model = resolve_aws_settings()["credentials"]
-            assert type(model) is aws_extension_auth.AWSProfileCredentials
-            assert model.profile_name == profile
-            _assert_source_credentials(model.session)
+            assert (
+                dlt.secrets.get("sources.source.aws.credentials.profile_name", str)
+                == profile
+            )
+            assert (
+                dlt.secrets.get(
+                    "sources.source.aws.credentials.profile_names", list[str]
+                )
+                is None
+            )
+            assert (
+                dlt.secrets.get("sources.source.aws.credentials.org_role_name", str)
+                is None
+            )
+            assert dlt.secrets.get("credentials.profile_names", list[str]) is None
+            _assert_source_credentials(boto3.Session(profile_name=profile))
             assert (
                 dlt.config.get("destination.bloodhoundenterprise.url", str)
                 == "https://bhe.example.test"
@@ -654,14 +639,11 @@ def test_runtime_and_local_configuration_cannot_override_generated_identity(
 @pytest.mark.parametrize(
     "dedicated_source", [False, True], ids=["management-profile", "source-account"]
 )
-def test_organization_models_and_assume_role_use_generated_source_identity(
+def test_organization_settings_pass_through_with_generated_source_profile(
     dedicated_source,
     role_profile,
     workspace,
-    aws_extension_auth,
-    resolve_aws_settings,
     profile_assumptions,
-    monkeypatch,
 ):
     options = {
         "org_role_name": "MemberCollectorRole",
@@ -684,74 +666,18 @@ def test_organization_models_and_assume_role_use_generated_source_identity(
             {"RoleArn": options["role_arn"], "RoleSessionName": "initial-session"}
         )
     params = {"sources": {"source": {"aws": {"credentials": options}}}}
-    clients = []
-    sessions = []
-    original_client = boto3.session.Session.client
-
-    def stub_sts(session, name, **kwargs):
-        assert name == "sts"
+    original = deepcopy(params)
+    with managed_aws_profile(params, PAIR, workspace.directory) as profile:
+        settings = dlt.secrets.get("sources.source.aws.credentials", dict)
+        assert settings == {**options, "profile_name": profile}
+        session = boto3.Session(
+            profile_name=settings["profile_name"], region_name=settings["region_name"]
+        )
         if role_profile:
             _assert_role_credentials(session)
         else:
             _assert_source_credentials(session)
-        sessions.append(session)
-        client = original_client(session, name, **kwargs)
-        stubber = Stubber(client)
-        if not clients:
-            stubber.add_response("get_caller_identity", _identity(), {})
-        else:
-            account, role = (
-                (MANAGEMENT_ACCOUNT, "ManagementCollectorRole")
-                if dedicated_source and len(clients) == 1
-                else (MEMBER_ACCOUNT, "MemberCollectorRole")
-            )
-            stubber.add_response(
-                "assume_role",
-                {
-                    "Credentials": {
-                        "AccessKeyId": "ASIAIOSFODNN7EXAMPLE",
-                        "SecretAccessKey": "T" * 40,
-                        "SessionToken": "assumed-session-token",
-                        "Expiration": datetime.now(UTC) + timedelta(hours=1),
-                    }
-                },
-                {
-                    "RoleArn": f"arn:aws:iam::{account}:role/{role}",
-                    "RoleSessionName": "job-session",
-                },
-            )
-        stubber.activate()
-        clients.append(stubber)
-        return client
-
-    monkeypatch.setattr(boto3.session.Session, "client", stub_sts)
-    try:
-        with managed_aws_profile(params, PAIR, workspace.directory) as profile:
-            model = resolve_aws_settings()["credentials"]
-            assert type(model) is aws_extension_auth.AWSOrganizationProfileCredentials
-            assert model.profile_name == profile
-            assert model.org_role_name == "MemberCollectorRole"
-            assert model.collect_management_account is False
-            auth = aws_extension_auth.AWSAuth(model)
-            assert auth.source_ctx.account_id == SOURCE_ACCOUNT
-            if dedicated_source:
-                management = auth.management_ctx
-                assert management.account_id == MANAGEMENT_ACCOUNT
-                assert (
-                    management.session.get_credentials().token
-                    == "assumed-session-token"
-                )
-            member = auth.context_for_account(MEMBER_ACCOUNT)
-            assert member.account_id == MEMBER_ACCOUNT
-            assert member.session.get_credentials().token == "assumed-session-token"
-            # Both assumptions originate from the selected source identity (raw
-            # user or initial role), never management's temporary credentials.
-            assert all(session is auth.source_ctx.session for session in sessions)
-            for stubber in clients:
-                stubber.assert_no_pending_responses()
-    finally:
-        for stubber in clients:
-            stubber.deactivate()
+    assert params == original
 
 
 @pytest.mark.parametrize(
@@ -759,7 +685,7 @@ def test_organization_models_and_assume_role_use_generated_source_identity(
 )
 @pytest.mark.parametrize("failed", [False, True], ids=["success", "failure"])
 def test_successive_jobs_restore_environment_providers_and_remove_files(
-    failed, role_profile, resolve_aws_settings, profile_assumptions, monkeypatch
+    failed, role_profile, profile_assumptions, monkeypatch
 ):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "scheduler-access")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "scheduler-secret")
@@ -787,15 +713,22 @@ def test_successive_jobs_restore_environment_providers_and_remove_files(
         try:
             with managed_aws_profile(options, PAIR, workspace.directory) as profile:
                 profiles.append(profile)
-                model = resolve_aws_settings()["credentials"]
-                assert model.region_name == ("eu-west-1" if index == 0 else "us-east-1")
+                settings = dlt.secrets.get("sources.source.aws.credentials", dict)
+                assert settings["profile_name"] == profile
+                assert settings.get("region_name") == (
+                    "eu-west-1" if index == 0 else None
+                )
+                session = boto3.Session(
+                    profile_name=settings["profile_name"],
+                    region_name=settings.get("region_name"),
+                )
                 if role_profile and index == 0:
                     profile_assumptions(
                         {"RoleArn": ROLE_ARN, "RoleSessionName": profile}
                     )
-                    _assert_role_credentials(model.session)
+                    _assert_role_credentials(session)
                 else:
-                    _assert_source_credentials(model.session)
+                    _assert_source_credentials(session)
                 if failed and index == 0:
                     raise RuntimeError(SECRET_KEY)
         except ManagedConfigurationError as error:

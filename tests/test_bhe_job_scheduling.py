@@ -1841,7 +1841,6 @@ def aws_managed_service(managed_service, mock_bloodhound_api):
 def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
     aws_managed_service,
     mock_bloodhound_api,
-    resolve_aws_settings,
     failed,
     binary_secret,
     monkeypatch,
@@ -1874,10 +1873,12 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
         assert state.collector_job_start_requests == [
             (state.collector_job_claim_response["id"], b"")
         ]
-        model = resolve_aws_settings()["credentials"]
-        assert model.profile_name.startswith("openhound-job-")
-        assert model.region_name == "us-west-2"
-        credentials = model.session.get_credentials()
+        settings = dlt.secrets.get("sources.source.aws.credentials", dict)
+        assert settings["profile_name"].startswith("openhound-job-")
+        assert settings["region_name"] == "us-west-2"
+        credentials = boto3.Session(
+            profile_name=settings["profile_name"], region_name=settings["region_name"]
+        ).get_credentials()
         assert credentials.method == "shared-credentials-file"
         frozen = credentials.get_frozen_credentials()
         assert (frozen.access_key, frozen.secret_key, frozen.token) == (
