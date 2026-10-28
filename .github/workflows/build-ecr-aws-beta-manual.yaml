@@ -18,7 +18,6 @@ on:
         required: true
         type: string
 
-# Match the existing manual ECR workflow's token permissions and access model.
 permissions:
   contents: read
   id-token: write
