@@ -1,4 +1,4 @@
-"""Adapt BHE's raw IAM access-key pair to the AWS extension's named profile.
+"""Adapt BHE's IAM source keys to a direct-key or assume-role AWS profile.
 
 Only the worker installs AWS/DLT configuration or writes credential material.
 The scheduler owns the workspace and its lifetime, including killed workers.
@@ -6,7 +6,6 @@ The scheduler owns the workspace and its lifetime, including killed workers.
 
 import logging
 import os
-import re
 import shutil
 import stat
 import tempfile
@@ -16,6 +15,7 @@ from configparser import ConfigParser
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -41,16 +41,7 @@ from openhound.scheduler.configuration import (
 
 logger = logging.getLogger(__name__)
 
-_CREDENTIAL_SETTINGS = {
-    "region_name",
-    "endpoint_url",
-    "org_role_name",
-    "org_role_session_name",
-    "include_management_account",
-    "source_account",
-    "management_account_id",
-    "management_role_name",
-}
+_ROLE_PROFILE_SETTINGS = {"role_arn", "role_session_name", "external_id"}
 
 
 class AWSAccessKeyError(ManagedConfigurationError):
@@ -59,7 +50,7 @@ class AWSAccessKeyError(ManagedConfigurationError):
     def __init__(
         self,
         message: str,
-        summary: str = "Managed AWS credentials or authentication settings are invalid",
+        summary: str = "Managed AWS credentials could not be prepared",
         **context: Any,
     ) -> None:
         super().__init__(message)
@@ -67,20 +58,8 @@ class AWSAccessKeyError(ManagedConfigurationError):
         self.context = context
 
 
-def validate_access_key_id(value: Any) -> None:
-    # ASIA keys are temporary and require a session token, absent in BHE's beta
-    # contract. Do not strip input: INI/SDK whitespace normalization would change it.
-    if not isinstance(value, str) or re.fullmatch(r"AKIA[A-Z0-9]{16}", value) is None:
-        raise AWSAccessKeyError(
-            "Managed AWS job requires a long-lived IAM Access Key ID in external_secret_key_id"
-        )
-
-
 def validate_secret_reference(value: Any) -> str:
-    if (
-        not isinstance(value, str)
-        or re.fullmatch(r"[A-Za-z0-9/_+=.@:-]{1,2048}", value) is None
-    ):
+    if not isinstance(value, str) or not value.strip():
         raise AWSAccessKeyError(
             "Managed AWS job requires a valid secret_key_id reference"
         )
@@ -93,13 +72,12 @@ class AWSAccessKeyCredentials:
     secret_access_key: str = field(repr=False)
 
     def __post_init__(self) -> None:
-        validate_access_key_id(self.access_key_id)
-        if (
-            not isinstance(self.secret_access_key, str)
-            or re.fullmatch(r"[A-Za-z0-9/+=]{40}", self.secret_access_key) is None
+        # BHE's raw-key handoff needs strings for the INI writer, not AWS syntax.
+        if not isinstance(self.access_key_id, str) or not isinstance(
+            self.secret_access_key, str
         ):
             raise AWSAccessKeyError(
-                "Managed AWS credential secret must be the raw 40-character Secret Access Key"
+                "Managed AWS raw credentials require a key identifier and text secret payload"
             )
 
 
@@ -110,12 +88,11 @@ def prepare_aws_credentials(
 
     An explicit key ID selects the beta raw-key contract. Without it, retain
     compatibility with nested credential documents; a raw payload still needs
-    a valid key ID and must never fall back to the scheduler's AWS identity.
+    a key ID and must never fall back to the scheduler's AWS identity.
     """
     reference = validate_secret_reference(job.secret_key_id)
     raw_key = job.external_secret_key_id is not None
     if raw_key:
-        validate_access_key_id(job.external_secret_key_id)
         aws_profile_params(job.params)
     try:
         credentials = load_secret(reference)
@@ -143,7 +120,7 @@ def prepare_aws_credentials(
 def aws_profile_params(
     params: dict[str, Any], *, collector_name: str = "aws"
 ) -> dict[str, Any]:
-    """Validate the raw-key mode and copy its full nested settings before /start."""
+    """Validate the profile bridge and copy its nested DLT document."""
     if collector_name != "aws":
         raise AWSAccessKeyError("Managed AWS credentials require the AWS collector")
     if not isinstance(params, dict) or any(
@@ -153,7 +130,6 @@ def aws_profile_params(
             "Managed AWS params must use nested configuration sections"
         )
     document = deepcopy(params)
-    _validate_credential_sections(document)
     node = document
     for section in ("sources", "source", "aws"):
         node = node.setdefault(section, {})
@@ -162,47 +138,18 @@ def aws_profile_params(
                 "Managed AWS source configuration must be a nested object"
             )
     credentials = node.setdefault("credentials", {})
-    if not isinstance(credentials, dict) or credentials.keys() - _CREDENTIAL_SETTINGS:
+    if not isinstance(credentials, dict):
         raise AWSAccessKeyError(
-            "Managed AWS access-key jobs cannot select another profile or authentication mode"
+            "Managed AWS credentials configuration must be a nested object"
         )
-    if any(
-        key in node
-        for key in ("profile_name", "profile_names", "auth_mode", "authentication_mode")
-    ):
-        raise AWSAccessKeyError(
-            "Managed AWS access-key jobs contain conflicting authentication settings"
-        )
-    # An incomplete organization configuration must not fall through to the single
-    # profile model and silently ignore account/role settings.
-    organization = _CREDENTIAL_SETTINGS - {"region_name", "endpoint_url"}
-    if credentials.keys() & organization and (
-        not isinstance(credentials.get("org_role_name"), str)
-        or not credentials["org_role_name"].strip()
-    ):
-        raise AWSAccessKeyError(
-            "Managed AWS organization settings require org_role_name"
-        )
-    return document
-
-
-def _validate_credential_sections(
-    document: dict[str, Any], path: tuple[str, ...] = ()
-) -> None:
-    # DLT accepts compact, less-specific and pipeline-prefixed layouts too.
-    # Keep every source-credential setting in the canonical raw-key section so
-    # another union alternative cannot win during pipeline-scoped resolution.
-    for key, value in document.items():
-        if (
-            key == "credentials"
-            and path != ("sources", "source", "aws")
-            and "destination" not in path
-        ):
+    if credentials.keys() & _ROLE_PROFILE_SETTINGS:
+        role_arn = credentials.get("role_arn")
+        # A linked profile without a role can fall back to the worker's identity.
+        if not isinstance(role_arn, str) or not role_arn.strip():
             raise AWSAccessKeyError(
-                "Managed AWS credential settings must use sources.source.aws.credentials"
+                "Managed AWS role settings require a non-empty role_arn"
             )
-        if isinstance(value, dict):
-            _validate_credential_sections(value, (*path, key))
+    return document
 
 
 def _workspace_root() -> Path:
@@ -274,11 +221,10 @@ class _SourceCredentialFallback(ConfigProvider):
     def get_value(
         self, key: str, hint: type[Any], pipeline_name: str, *sections: str
     ) -> tuple[Any, str]:
-        if not self.provider.supports_sections and key in _CREDENTIAL_SETTINGS | {
-            "profile_name",
-            "profile_names",
-            "credentials",
-        }:
+        # Unsectioned providers cannot distinguish source credentials from other
+        # defaults. Exclude them entirely rather than enumerating AWS fields.
+        # The job provider itself is never wrapped.
+        if not self.provider.supports_sections:
             return None, key
         if (not sections or sections[0] in ("sources", "credentials")) and (
             key == "credentials" or "credentials" in sections
@@ -299,9 +245,32 @@ class _SourceCredentialFallback(ConfigProvider):
         return self.provider.supports_sections
 
 
-def _write_ini(path: Path, sections: dict[str, dict[str, str]]) -> None:
+def _write_ini(path: Path, sections: dict[str, dict[str, Any]]) -> None:
     config = ConfigParser(interpolation=None)
-    config.read_dict(sections)
+    try:
+        # Only the authentication bridge calls this writer. Arbitrary extension
+        # JSON remains in DLT, never in AWS INI files.
+        if any(
+            not isinstance(value, (str, int, float, bool))
+            for settings in sections.values()
+            for value in settings.values()
+        ):
+            raise TypeError
+        config.read_dict(sections)
+        stream = StringIO()
+        config.write(stream)
+        serialized = stream.getvalue()
+        serialized.encode("utf-8")
+        # Require a lossless INI round trip (e.g. multiline section injection is
+        # not representable). This is serialization, not AWS field validation.
+        restored = ConfigParser(interpolation=None)
+        restored.read_string(serialized)
+        if {s: dict(restored[s]) for s in restored.sections()} != {
+            s: dict(config[s]) for s in config.sections()
+        }:
+            raise ValueError
+    except Exception:  # noqa: BLE001 - serialization failures must omit supplied values
+        raise AWSAccessKeyError("Managed AWS profile could not be serialized") from None
     # O_EXCL prevents following/reusing an existing file; permissions apply from
     # creation, independent of the process umask.
     with os.fdopen(
@@ -309,7 +278,7 @@ def _write_ini(path: Path, sections: dict[str, dict[str, str]]) -> None:
         "w",
         encoding="utf-8",
     ) as stream:
-        config.write(stream)
+        stream.write(serialized)
 
 
 @contextmanager
@@ -369,10 +338,25 @@ def _log_collection_failure(error: Exception) -> None:
 def managed_aws_profile(
     params: dict[str, Any], credentials: AWSAccessKeyCredentials, directory: Path
 ) -> Iterator[str]:
-    """Install one profile before loading collectors; restore all worker state."""
+    """Install a direct-key or role profile; restore all worker state afterward."""
     document = aws_profile_params(params)
     profile = f"openhound-job-{uuid4().hex}"
-    document["sources"]["source"]["aws"]["credentials"]["profile_name"] = profile
+    settings = document["sources"]["source"]["aws"]["credentials"]
+    # These fields belong to boto3's file provider, not the extension's DLT model.
+    role_settings = {
+        key: settings[key] for key in _ROLE_PROFILE_SETTINGS if key in settings
+    }
+    settings["profile_name"] = profile
+    source_profile = f"{profile}-source" if role_settings else profile
+    profile_config = (
+        {
+            **role_settings,
+            "source_profile": source_profile,
+            "role_session_name": role_settings.get("role_session_name", profile),
+        }
+        if role_settings
+        else {}
+    )
     files = {
         "AWS_SHARED_CREDENTIALS_FILE": directory / "credentials",
         "AWS_CONFIG_FILE": directory / "config",
@@ -396,13 +380,15 @@ def managed_aws_profile(
                 _write_ini(
                     files["AWS_SHARED_CREDENTIALS_FILE"],
                     {
-                        profile: {
+                        source_profile: {
                             "aws_access_key_id": credentials.access_key_id,
                             "aws_secret_access_key": credentials.secret_access_key,
                         }
                     },
                 )
-                _write_ini(files["AWS_CONFIG_FILE"], {f"profile {profile}": {}})
+                _write_ini(
+                    files["AWS_CONFIG_FILE"], {f"profile {profile}": profile_config}
+                )
                 os.environ.update({key: str(path) for key, path in files.items()})
                 providers.providers = [
                     _SourceCredentialFallback(p) for p in previous_providers

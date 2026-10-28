@@ -1,5 +1,5 @@
 import logging
-import math
+import multiprocessing
 import shutil
 import signal
 import tempfile
@@ -50,6 +50,7 @@ from openhound.scheduler.aws_profile import (
 )
 from openhound.scheduler.configuration import (
     ManagedConfigurationError,
+    _validate_document,
     managed_job_configuration,
 )
 
@@ -107,26 +108,6 @@ class PreparedManagedJob:
     credentials: dict[str, Any] | AWSAccessKeyCredentials = field(repr=False)
 
 
-def _usable_credential_value(value: Any) -> bool:
-    """Validate generic JSON values without inventing a collector field schema."""
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, dict):
-        return bool(value) and all(
-            isinstance(key, str)
-            and bool(key.strip())
-            and _usable_credential_value(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, list):
-        return bool(value) and all(_usable_credential_value(item) for item in value)
-    if isinstance(value, (bool, int)):
-        return True
-    if isinstance(value, float):
-        return math.isfinite(value)
-    return False
-
-
 @dataclass
 class Result:
     results: dict
@@ -161,6 +142,57 @@ def _subprocess_collect(
         ExtensionNotFoundError: If the collector cannot be found via entrypoints.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Context and redaction surround imports, configuration, pipeline setup, and
+    # failure diagnostics. The queue handler applies them before serialization.
+    values = (
+        (secrets.access_key_id, secrets.secret_access_key)
+        if isinstance(secrets, AWSAccessKeyCredentials)
+        else tuple(_credential_log_values(secrets))
+    )
+    with (
+        openhound_logging.worker_log_context(job_id, collector_name),
+        openhound_logging.redact_log_values(values),
+    ):
+        try:
+            return _configured_worker_collect(
+                collector_name, job_id, params, secrets, managed, aws_profile_directory
+            )
+        except ManagedConfigurationError:
+            # AWS failures were diagnosed inside the SDK logging controls;
+            # configuration-resolution failures deliberately omit their values.
+            logger.exception("Worker configuration or collection failed")
+            raise
+        except ExtensionNotFoundError:
+            logger.exception("Collection worker could not load extension")
+            raise
+        except Exception:
+            logger.exception("Collection worker failed")
+            if managed:
+                raise ManagedConfigurationError(
+                    "Managed collection failed; check worker logs"
+                ) from None
+            raise
+
+
+def _credential_log_values(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _credential_log_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _credential_log_values(item)
+
+
+def _configured_worker_collect(
+    collector_name: str,
+    job_id: int | str,
+    params: dict[str, Any] | None,
+    secrets: dict[str, Any] | AWSAccessKeyCredentials | None,
+    managed: bool,
+    aws_profile_directory: Path | None,
+) -> Result:
     if isinstance(secrets, AWSAccessKeyCredentials):
         if collector_name != "aws" or aws_profile_directory is None:
             raise ManagedConfigurationError(
@@ -300,7 +332,13 @@ class Service:
 
         # Futures/results from the subprocess executor
         self.future: Future[Result] | None = None
-        self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
+        self._worker_context = multiprocessing.get_context("spawn")
+        self._worker_logging = openhound_logging.WorkerLogRouter(self._worker_context)
+        try:
+            self.executor = self._create_executor()
+        except BaseException:
+            self._worker_logging.close()
+            raise
 
         # Exit condition, changed to True when the process needs to stop
         self.exit = False
@@ -327,7 +365,10 @@ class Service:
                     "Unexpected error handling completed job during shutdown."
                 )
                 self._clear_running_job()
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        try:
+            self.executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            self._worker_logging.close()
         logger.info("Collection service stopped.")
 
     def _finish_managed_job_on_shutdown(self) -> None:
@@ -362,10 +403,19 @@ class Service:
     def _reset_executor(self) -> None:
         """Tear down and recreate the process pool after it has entered a broken state."""
         try:
-            self.executor.shutdown(wait=False, cancel_futures=True)
+            self.executor.shutdown(wait=True, cancel_futures=True)
         except Exception:
             logger.exception("Error shutting down broken executor.")
-        self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
+        self.executor = self._create_executor()
+
+    def _create_executor(self) -> ProcessPoolExecutor:
+        return ProcessPoolExecutor(
+            max_workers=1,
+            max_tasks_per_child=1,
+            mp_context=self._worker_context,
+            initializer=openhound_logging.configure_worker_logging,
+            initargs=(self._worker_logging.queue, logging.getLogger().level),
+        )
 
     def check_jobs(self) -> Job | None:
         """Checks BloodHound enterprise for available jobs. These can either be new jobs or jobs currently started and not finished/stopped.
@@ -439,7 +489,8 @@ class Service:
                 credentials = self.secrets_manager.get_secret(job.secret_key_id)
             if isinstance(credentials, AWSAccessKeyCredentials):
                 return credentials
-            if isinstance(credentials, dict) and _usable_credential_value(credentials):
+            if isinstance(credentials, dict):
+                _validate_document(credentials, allow_empty=True)
                 return credentials
         except AWSAccessKeyError as error:
             raise CredentialValidationError(
@@ -447,6 +498,8 @@ class Service:
             ) from None
         except CredentialValidationError:
             raise
+        except ManagedConfigurationError as error:
+            raise CredentialValidationError(str(error)) from None
         except SecretRetrievalError as error:
             raise CredentialValidationError(str(error), error.failure_summary) from None
         except Exception as error:  # noqa: BLE001
@@ -455,9 +508,7 @@ class Service:
                 f"Credential secret reader failed ({type(error).__name__})",
                 "Credential secret retrieval failed",
             ) from None
-        raise CredentialValidationError(
-            "Credential document must be a non-empty JSON object with usable values"
-        )
+        raise CredentialValidationError("Credential document must be a JSON object")
 
     def _validate_managed_claim(self, job: CollectorJob, job_id: str) -> None:
         """Check the job identity and lease confirmed by BHE's claim response."""
@@ -799,7 +850,7 @@ class Service:
             ):
                 self._remove_job_output(future.result())
             self._clear_running_job()
-            self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
+            self.executor = self._create_executor()
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
         """Report the completed worker's outcome through the active job API."""
