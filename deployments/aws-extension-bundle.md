@@ -49,8 +49,8 @@ Commit references for the workflow inputs:
 6. Update the managed beta collector deployment through the infrastructure team's
    existing process. Publishing an image does not update a running deployment.
 
-The Dockerfile, constraints, and preparation/smoke scripts come from the selected
-**workflow revision**, independently of `source_ref`. This lets
+The Dockerfile and preparation/smoke scripts come from the selected **workflow
+revision**, independently of `source_ref`. This lets
 the workflow on `main` build a feature branch that predates these bundle files.
 The AWS source revision is selected separately through `aws_commit`. The selected
 OpenHound source still needs to contain the desired managed runtime features.
@@ -72,16 +72,17 @@ automatically following the AWS repository's latest commit. Local Docker builds
 must likewise pass `--build-arg OPENHOUND_AWS_COMMIT=<full-commit-sha>`.
 
 When selecting a newer commit, consider compatibility with
-`scripts/prepare_aws_bundle.py` and `deployments/aws-extension-constraints.txt`.
+`scripts/prepare_aws_bundle.py`.
 The preparation script patches the temporary extension's OpenHound requirement
-to the installed local version,
-raises its boto3 requirement to `>=1.43.90`, and places `extension.yaml` inside the
-Python package. Changed upstream packaging may require updating those patches.
+to the installed local version, raises its boto3 requirement to `>=1.43.90`, and
+places `extension.yaml` inside the Python package. Changed upstream packaging may
+require updating those patches.
 
-The build runs `uv pip check` and an offline smoke check inside the final nonroot
-image on each architecture. These checks verify extension discovery, metadata,
-and native imports only when the bundle is manually built. No extra automatic
-workflow test suite is added.
+The build preserves OpenHound's installed, locked dependencies while resolving
+the extension's declared requirements. It runs `uv pip check` and an offline smoke
+check inside the final nonroot image on each architecture. These checks verify
+extension discovery, metadata, and native imports only when the bundle is
+manually built. No extra automatic workflow test suite is added.
 
 When bringing `main` into older beta branches, retain its standard
 `build-ecr-manual.yaml` and `Dockerfile`, plus the separate bundle files. Replace
