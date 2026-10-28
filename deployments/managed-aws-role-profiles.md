@@ -294,8 +294,19 @@ harness stubs both assumptions and reports the final target account's identity.
 ### Live role authentication
 
 Edit the example parameters file to use the intended role and optional
-organization settings. Use the source-key JSON described in
-[the bundle's local check instructions](aws-extension-bundle.md#local-managed-profile-and-collection-check).
+organization settings. Create a source-key JSON file outside the checkout at
+`$HOME/.config/openhound-aws-local/credentials.json`:
+
+```json
+{
+  "access_key_id": "AKIA...",
+  "secret_access_key": "<raw Secret Access Key>"
+}
+```
+
+The command supplies this file over stdin rather than Docker arguments or
+environment variables. For image publishing, see
+[the beta image instructions](aws-extension-bundle.md).
 
 ```sh
 docker run --rm -i --platform linux/arm64 --entrypoint python \
@@ -308,6 +319,7 @@ docker run --rm -i --platform linux/arm64 --entrypoint python \
 ```
 
 Confirm the caller ARN identifies the requested assumed role. For full collection,
-use the bundle's existing collection command with these updated adapter, script,
-and parameter mounts, and omit `--auth-only`. For AMD64, change `linux/arm64` and
-`:arm64` to the AMD64 equivalents.
+omit `--auth-only`, mount a writable host output directory at `/output`, and add
+`--output-dir /output`. Keep the adapter, script, and parameter mounts above.
+Collected JSON is saved under `/output/<job UUID>/`. For AMD64, change
+`linux/arm64` and `:arm64` to the AMD64 equivalents.
