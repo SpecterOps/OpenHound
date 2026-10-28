@@ -31,10 +31,12 @@ from openhound.scheduler import aws_profile, service
 from openhound.scheduler.aws_profile import (
     AWSAccessKeyCredentials,
     AWSProfileWorkspace,
+    aws_profile_params,
     cleanup_orphaned_aws_profiles,
     managed_aws_profile,
 )
 from openhound.scheduler.configuration import ManagedConfigurationError
+from scripts import check_managed_aws
 
 ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"
 SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
@@ -47,6 +49,12 @@ ROLE_ARN = f"arn:aws:iam::{ROLE_ACCOUNT}:role/security/CollectorRole"
 ROLE_ACCESS_KEY = "ASIAIOSFODNN7EXAMPLE"
 ROLE_SECRET_KEY = "T" * 40
 ROLE_TOKEN = "assumed-session-token"
+INTERMEDIATE_ROLE_ARN = f"arn:aws:iam::{SOURCE_ACCOUNT}:role/CentralCollectorRole"
+INTERMEDIATE_CREDENTIALS = (
+    "ASIAINTERMEDIATE12345",
+    "I" * 40,
+    "intermediate-session-token",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -83,20 +91,34 @@ def profile_assumptions(monkeypatch):
     create_client = BotocoreSession.create_client
     pending, stubbers = [], []
 
-    def expect(params, *, denied=False, secret=ROLE_SECRET_KEY):
-        pending.append((params, denied, secret))
+    def expect(
+        params,
+        *,
+        denied=False,
+        secret=ROLE_SECRET_KEY,
+        source_credentials=(ACCESS_KEY, SECRET_KEY, None),
+        response_credentials=None,
+    ):
+        pending.append(
+            (
+                params,
+                denied,
+                source_credentials,
+                response_credentials or (ROLE_ACCESS_KEY, secret, ROLE_TOKEN),
+            )
+        )
 
     def stub_sts(session, name, *args, **kwargs):
         client = create_client(session, name, *args, **kwargs)
-        if name == "sts" and kwargs.get("aws_access_key_id") == ACCESS_KEY:
+        if name == "sts" and kwargs.get("aws_access_key_id") is not None:
+            assert pending, "Unexpected role assumption"
+            params, denied, source_credentials, response_credentials = pending.pop(0)
             frozen = client._request_signer._credentials.get_frozen_credentials()
-            assert (frozen.access_key, frozen.secret_key, frozen.token) == (
-                ACCESS_KEY,
-                SECRET_KEY,
-                None,
-            )
-            assert pending, "Unexpected initial role assumption"
-            params, denied, secret = pending.pop(0)
+            assert (
+                frozen.access_key,
+                frozen.secret_key,
+                frozen.token,
+            ) == source_credentials
             stubber = Stubber(client)
             if denied:
                 stubber.add_client_error(
@@ -110,9 +132,9 @@ def profile_assumptions(monkeypatch):
                     "assume_role",
                     {
                         "Credentials": {
-                            "AccessKeyId": ROLE_ACCESS_KEY,
-                            "SecretAccessKey": secret,
-                            "SessionToken": ROLE_TOKEN,
+                            "AccessKeyId": response_credentials[0],
+                            "SecretAccessKey": response_credentials[1],
+                            "SessionToken": response_credentials[2],
                             "Expiration": datetime.now(UTC) + timedelta(hours=1),
                         }
                     },
@@ -125,7 +147,7 @@ def profile_assumptions(monkeypatch):
     monkeypatch.setattr(BotocoreSession, "create_client", stub_sts)
     try:
         yield expect
-        assert not pending, "Expected initial role assumption did not occur"
+        assert not pending, "Expected role assumption did not occur"
         for stubber in stubbers:
             stubber.assert_no_pending_responses()
     finally:
@@ -164,8 +186,10 @@ def _assert_role_credentials(session):
 
 
 @pytest.mark.parametrize("custom_session", [False, True], ids=["default", "custom"])
+@pytest.mark.parametrize("chained", [False, True], ids=["single-role", "chained-role"])
 def test_role_profile_resolves_through_real_sdk_and_extension(
     custom_session,
+    chained,
     workspace,
     resolve_aws_settings,
     aws_extension_auth,
@@ -182,6 +206,13 @@ def test_role_profile_resolves_through_real_sdk_and_extension(
         options.update(
             role_session_name="collection-session", external_id="customer/123"
         )
+    if chained:
+        options["source_role_arn"] = INTERMEDIATE_ROLE_ARN
+        if custom_session:
+            options.update(
+                source_role_session_name="central-session",
+                source_role_external_id="central/123",
+            )
     params = {"sources": {"source": {"aws": {"credentials": options}}}}
     original_params, original_environment = deepcopy(params), dict(os.environ)
     with managed_aws_profile(params, PAIR, workspace.directory) as profile:
@@ -189,7 +220,24 @@ def test_role_profile_resolves_through_real_sdk_and_extension(
         expected = {"RoleArn": ROLE_ARN, "RoleSessionName": session_name}
         if custom_session:
             expected["ExternalId"] = "customer/123"
-        profile_assumptions(expected)
+        if chained:
+            source_expected = {
+                "RoleArn": INTERMEDIATE_ROLE_ARN,
+                "RoleSessionName": (
+                    "central-session" if custom_session else f"{profile}-intermediate"
+                ),
+            }
+            if custom_session:
+                source_expected["ExternalId"] = "central/123"
+            profile_assumptions(
+                source_expected, response_credentials=INTERMEDIATE_CREDENTIALS
+            )
+        profile_assumptions(
+            expected,
+            source_credentials=(
+                INTERMEDIATE_CREDENTIALS if chained else (ACCESS_KEY, SECRET_KEY, None)
+            ),
+        )
         model = resolve_aws_settings()["credentials"]
         assert type(model) is aws_extension_auth.AWSProfileCredentials
         assert model.profile_name == profile
@@ -207,7 +255,14 @@ def test_role_profile_resolves_through_real_sdk_and_extension(
             assert sts.get_caller_identity() == identity
         iam = session.client("iam")
         assert iam._request_signer._credentials is session.get_credentials()
-        for key in ("role_arn", "role_session_name", "external_id"):
+        for key in (
+            "role_arn",
+            "role_session_name",
+            "external_id",
+            "source_role_arn",
+            "source_role_session_name",
+            "source_role_external_id",
+        ):
             assert dlt.secrets.get(
                 f"sources.source.aws.credentials.{key}", str
             ) == options.get(key)
@@ -217,8 +272,21 @@ def test_role_profile_resolves_through_real_sdk_and_extension(
         role = config[f"profile {profile}"]
         assert role["role_arn"] == ROLE_ARN
         assert role["role_session_name"] == session_name
-        assert credentials.sections() == [role["source_profile"]]
-        assert credentials[role["source_profile"]]["aws_access_key_id"] == ACCESS_KEY
+        if chained:
+            assert role["source_profile"] == f"{profile}-intermediate"
+            intermediate = config[f"profile {role['source_profile']}"]
+            assert dict(intermediate) == {
+                "role_arn": INTERMEDIATE_ROLE_ARN,
+                "role_session_name": source_expected["RoleSessionName"],
+                "source_profile": f"{profile}-source",
+                **({"external_id": "central/123"} if custom_session else {}),
+            }
+        assert len(config.sections()) == (2 if chained else 1)
+        assert credentials.sections() == [f"{profile}-source"]
+        assert credentials[f"{profile}-source"]["aws_access_key_id"] == ACCESS_KEY
+        assert all(
+            "source_role_arn" not in config[section] for section in config.sections()
+        )
         assert profile not in credentials
         for name in ("config", "credentials"):
             assert stat.S_IMODE((workspace.directory / name).stat().st_mode) == 0o600
@@ -227,6 +295,178 @@ def test_role_profile_resolves_through_real_sdk_and_extension(
     assert dict(os.environ) == original_environment
     assert not (workspace.directory / "config").exists()
     assert not (workspace.directory / "credentials").exists()
+
+
+def test_chained_role_profile_refreshes_both_roles(workspace, profile_assumptions):
+    options = {"source_role_arn": INTERMEDIATE_ROLE_ARN, "role_arn": ROLE_ARN}
+    params = {"sources": {"source": {"aws": {"credentials": options}}}}
+    with managed_aws_profile(params, PAIR, workspace.directory) as profile:
+        source_expected = {
+            "RoleArn": INTERMEDIATE_ROLE_ARN,
+            "RoleSessionName": f"{profile}-intermediate",
+        }
+        target_expected = {"RoleArn": ROLE_ARN, "RoleSessionName": profile}
+        profile_assumptions(
+            source_expected, response_credentials=INTERMEDIATE_CREDENTIALS
+        )
+        profile_assumptions(
+            target_expected, source_credentials=INTERMEDIATE_CREDENTIALS
+        )
+        session = boto3.Session(profile_name=profile, region_name="us-east-1")
+        _assert_role_credentials(session)
+
+        provider = session._session.get_component("credential_provider").get_provider(
+            "assume-role"
+        )
+        provider.cache.clear()
+        final_credentials = session.get_credentials()
+        intermediate = final_credentials._refresh_using.__self__._source_credentials
+        for credentials in (final_credentials, intermediate):
+            credentials._expiry_time = datetime.now(UTC) - timedelta(seconds=1)
+        refreshed_intermediate = ("ASIAREFRESHED12345678", "J" * 40, "refreshed-token")
+        profile_assumptions(
+            source_expected, response_credentials=refreshed_intermediate
+        )
+        profile_assumptions(
+            target_expected,
+            source_credentials=refreshed_intermediate,
+            secret="R" * 40,
+        )
+        assert final_credentials.get_frozen_credentials().secret_key == "R" * 40
+
+
+@pytest.mark.parametrize("denied_step", ["intermediate", "target"])
+def test_denied_chained_role_does_not_collect_as_source(
+    workspace, profile_assumptions, caplog, denied_step
+):
+    params = {
+        "sources": {
+            "source": {
+                "aws": {
+                    "credentials": {
+                        "source_role_arn": INTERMEDIATE_ROLE_ARN,
+                        "role_arn": ROLE_ARN,
+                    }
+                }
+            }
+        }
+    }
+    original_environment = dict(os.environ)
+    providers = Container()[PluggableRunContext].providers
+    original_providers = providers.providers
+    with (
+        pytest.raises(ManagedConfigurationError, match="Managed AWS collection failed"),
+        managed_aws_profile(params, PAIR, workspace.directory) as profile,
+    ):
+        profile_assumptions(
+            {
+                "RoleArn": INTERMEDIATE_ROLE_ARN,
+                "RoleSessionName": f"{profile}-intermediate",
+            },
+            response_credentials=INTERMEDIATE_CREDENTIALS,
+            denied=denied_step == "intermediate",
+        )
+        if denied_step == "target":
+            profile_assumptions(
+                {"RoleArn": ROLE_ARN, "RoleSessionName": profile},
+                source_credentials=INTERMEDIATE_CREDENTIALS,
+                denied=True,
+            )
+        session = boto3.Session(profile_name=profile, region_name="us-east-1")
+        session.get_credentials().get_frozen_credentials()
+        pytest.fail("Denied role must not fall back to an earlier identity")
+    assert "AssumeRole returned AccessDenied" in caplog.text
+    for value in (ACCESS_KEY, SECRET_KEY, *INTERMEDIATE_CREDENTIALS):
+        assert value not in caplog.text
+    assert dict(os.environ) == original_environment
+    assert providers.providers is original_providers
+    assert not (workspace.directory / "config").exists()
+    assert not (workspace.directory / "credentials").exists()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"source_role_arn": INTERMEDIATE_ROLE_ARN},
+        {"source_role_arn": INTERMEDIATE_ROLE_ARN, "role_arn": None},
+        {"source_role_arn": INTERMEDIATE_ROLE_ARN, "role_arn": " "},
+        {"source_role_arn": INTERMEDIATE_ROLE_ARN, "role_arn": 123},
+        {"source_role_arn": None, "role_arn": ROLE_ARN},
+        {"source_role_arn": " ", "role_arn": ROLE_ARN},
+        {"source_role_arn": {}, "role_arn": ROLE_ARN},
+        {"source_role_session_name": "central-session", "role_arn": ROLE_ARN},
+        {"source_role_external_id": "central/123", "role_arn": ROLE_ARN},
+    ],
+)
+def test_incomplete_source_role_chain_is_rejected_before_installation(
+    workspace, options
+):
+    params = {"sources": {"source": {"aws": {"credentials": options}}}}
+    original = deepcopy(params)
+    original_environment = dict(os.environ)
+    with pytest.raises(ManagedConfigurationError, match="source-role chaining"):
+        aws_profile_params(params)
+    with (
+        pytest.raises(ManagedConfigurationError, match="source-role chaining"),
+        managed_aws_profile(params, PAIR, workspace.directory),
+    ):
+        pytest.fail("Incomplete role chain cannot run collection")
+    assert params == original
+    assert dict(os.environ) == original_environment
+    assert not (workspace.directory / "config").exists()
+    assert not (workspace.directory / "credentials").exists()
+
+
+@pytest.mark.parametrize("mode", ["direct", "single-role", "chained-role"])
+def test_offline_managed_aws_check_exercises_profile_chain(
+    mode, resolve_aws_settings, aws_extension_auth, monkeypatch, tmp_path, capsys
+):
+    # Use the real extension auth and DLT models without its native collection
+    # engine. The harness still runs the real worker and SDK profile resolver.
+    module = SimpleNamespace(AWSAuth=aws_extension_auth.AWSAuth)
+
+    def source():
+        module.AWSAuth(resolve_aws_settings()["credentials"])
+
+    module.source = source
+    collector = SimpleNamespace(
+        name="aws", dlt_source=None, package_version="test", metadata=None
+    )
+    monkeypatch.setattr(service, "import_module", lambda name: module)
+    monkeypatch.setattr(
+        service.CollectorManager,
+        "from_entrypoint",
+        lambda: SimpleNamespace(collectors=[collector]),
+    )
+    options = {"region_name": "us-east-1"}
+    if mode != "direct":
+        options.update(
+            role_arn=ROLE_ARN,
+            role_session_name="target-session",
+            external_id="target/123",
+        )
+    if mode == "chained-role":
+        options.update(
+            source_role_arn=INTERMEDIATE_ROLE_ARN,
+            source_role_session_name="central-session",
+            source_role_external_id="central/123",
+        )
+    params = {"sources": {"source": {"aws": {"credentials": options}}}}
+    check_managed_aws.run(
+        check_managed_aws.local_job(ACCESS_KEY, params),
+        SECRET_KEY,
+        probe=True,
+        offline=True,
+        output=tmp_path,
+    )
+    output = capsys.readouterr().out
+    expected_account = "123456789012" if mode == "direct" else ROLE_ACCOUNT
+    assert f"extension STS identity is account {expected_account}" in output
+    expected_pair_message = (
+        "supplied pair matches" if mode == "direct" else "supplied source pair matches"
+    )
+    assert expected_pair_message in output
+    assert "PASS: temporary AWS profile workspace removed" in output
 
 
 def test_role_profile_refreshes_temporary_credentials(workspace, profile_assumptions):

@@ -85,6 +85,7 @@ def check_profile(
     directory: Path,
     *,
     role_arn: str | None = None,
+    source_role_arn: str | None = None,
 ) -> None:
     """Inspect the model DLT actually passed to the extension's AWSAuth."""
     profile = getattr(model, "profile_name", None)
@@ -106,10 +107,18 @@ def check_profile(
             raise RuntimeError(
                 "The generated profile does not select the requested role"
             )
-        # Inspect the source pair without forcing an extra initial AssumeRole call.
-        credentials = boto3.Session(
-            profile_name=config["source_profile"]
-        ).get_credentials()
+        source_profile = config["source_profile"]
+        if source_role_arn:
+            intermediate = session._session.full_config["profiles"][source_profile]
+            if intermediate.get("role_arn") != source_role_arn or not intermediate.get(
+                "source_profile"
+            ):
+                raise RuntimeError(
+                    "The generated chain does not select the requested source role"
+                )
+            source_profile = intermediate["source_profile"]
+        # Inspect the raw source pair without forcing extra AssumeRole calls.
+        credentials = boto3.Session(profile_name=source_profile).get_credentials()
         if credentials is None or credentials.method != "shared-credentials-file":
             raise RuntimeError(
                 "The role did not reference the generated source profile"
@@ -145,13 +154,14 @@ def run(job: CollectorJob, secret: str, *, probe: bool, offline: bool, output: P
     )
 
     workspace = AWSProfileWorkspace()
-    role_arn = (
+    auth_settings = (
         job.params.get("sources", {})
         .get("source", {})
         .get("aws", {})
         .get("credentials", {})
-        .get("role_arn")
     )
+    role_arn = auth_settings.get("role_arn")
+    source_role_arn = auth_settings.get("source_role_arn")
     result = None
     previous_sigint = signal.getsignal(signal.SIGINT)
     try:
@@ -167,7 +177,11 @@ def run(job: CollectorJob, secret: str, *, probe: bool, offline: bool, output: P
 
                     def checked_auth(model, **kwargs):
                         check_profile(
-                            model, credentials, workspace.directory, role_arn=role_arn
+                            model,
+                            credentials,
+                            workspace.directory,
+                            role_arn=role_arn,
+                            source_role_arn=source_role_arn,
                         )
                         auth = real_auth(model, **kwargs)
                         observed_auth.append(auth)
@@ -218,21 +232,31 @@ def run(job: CollectorJob, secret: str, *, probe: bool, offline: bool, output: P
                     stubber = stack.enter_context(Stubber(client))
                     offline_stubbers.append(stubber)
                     config = session.get_scoped_config()
-                    if (
-                        role_arn
-                        and kwargs.get("aws_access_key_id") == credentials.access_key_id
-                    ):
+                    if role_arn and kwargs.get("aws_access_key_id") is not None:
+                        intermediate_step = (
+                            source_role_arn
+                            and kwargs["aws_access_key_id"] == credentials.access_key_id
+                        )
+                        role_config = (
+                            session.full_config["profiles"][config["source_profile"]]
+                            if intermediate_step
+                            else config
+                        )
                         expected = {
-                            "RoleArn": role_arn,
-                            "RoleSessionName": config["role_session_name"],
+                            "RoleArn": role_config["role_arn"],
+                            "RoleSessionName": role_config["role_session_name"],
                         }
-                        if "external_id" in config:
-                            expected["ExternalId"] = config["external_id"]
+                        if "external_id" in role_config:
+                            expected["ExternalId"] = role_config["external_id"]
                         stubber.add_response(
                             "assume_role",
                             {
                                 "Credentials": {
-                                    "AccessKeyId": "ASIAIOSFODNN7EXAMPLE",
+                                    "AccessKeyId": (
+                                        "ASIAINTERMEDIATE12345"
+                                        if intermediate_step
+                                        else "ASIAIOSFODNN7EXAMPLE"
+                                    ),
                                     "SecretAccessKey": "T" * 40,
                                     "SessionToken": "offline-role-token",
                                     "Expiration": datetime.now(UTC)

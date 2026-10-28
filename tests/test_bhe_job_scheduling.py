@@ -2078,6 +2078,13 @@ def test_invalid_raw_aws_payloads_are_not_trimmed_wrapped_or_treated_as_document
             "role_arn": "arn:aws:iam::123456789012:role/Collector",
             "source_account": "123456789012",
         },
+        {
+            "source_role_arn": "arn:aws:iam::123456789012:role/CentralCollector",
+            "source_role_session_name": "central-session",
+            "source_role_external_id": "central/123",
+            "role_arn": "arn:aws:iam::222222222222:role/TargetCollector",
+            "role_session_name": "target-session",
+        },
     ],
 )
 def test_raw_aws_settings_reach_worker_handoff_without_aws_validation(
@@ -2100,6 +2107,42 @@ def test_raw_aws_settings_reach_worker_handoff_without_aws_validation(
     assert submitted[4].secret_access_key == AWS_SECRET_KEY
     assert state.collector_job_end_requests == []
     aws_managed_service._cleanup_aws_profile_workspace()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"source_role_arn": "arn:aws:iam::123456789012:role/CentralCollector"},
+        {
+            "source_role_arn": None,
+            "role_arn": "arn:aws:iam::222222222222:role/TargetCollector",
+        },
+        {"source_role_session_name": "central-session"},
+        {"source_role_external_id": "central/123"},
+    ],
+)
+def test_incomplete_aws_role_chain_fails_before_secret_retrieval_or_start(
+    aws_managed_service, mock_bloodhound_api, options, monkeypatch
+):
+    state = mock_bloodhound_api.app.state
+    state.collector_job_claim_response["params"] = {
+        "sources": {"source": {"aws": {"credentials": options}}}
+    }
+    monkeypatch.setattr(
+        aws_managed_service.secrets_manager,
+        "get_secret",
+        lambda _: pytest.fail(
+            "Incomplete role chains must fail before secret retrieval"
+        ),
+    )
+    aws_managed_service._poll()
+    assert state.collector_job_start_requests == []
+    assert aws_managed_service.executor.submitted == []
+    assert aws_managed_service._aws_profile_workspace is None
+    assert state.collector_job_end_requests[0]["body"] == {
+        "outcome": "failed",
+        "failure_message": "Managed AWS credentials could not be prepared",
+    }
 
 
 def test_missing_new_bhe_job_field_rejects_claim_before_start(

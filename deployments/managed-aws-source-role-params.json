@@ -1,0 +1,18 @@
+{
+  "sources": {
+    "source": {
+      "aws": {
+        "credentials": {
+          "region_name": "us-east-1",
+          "source_role_arn": "arn:aws:iam::123456789012:role/CentralCollectorRole",
+          "source_role_session_name": "product-openhound-source",
+          "role_arn": "arn:aws:iam::222222222222:role/TargetCollectorRole",
+          "role_session_name": "product-openhound-collection"
+        },
+        "bucket_policy": {
+          "include": false
+        }
+      }
+    }
+  }
+}

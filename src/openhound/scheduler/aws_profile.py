@@ -42,6 +42,11 @@ from openhound.scheduler.configuration import (
 logger = logging.getLogger(__name__)
 
 _ROLE_PROFILE_SETTINGS = {"role_arn", "role_session_name", "external_id"}
+_SOURCE_ROLE_PROFILE_SETTINGS = {
+    "source_role_arn": "role_arn",
+    "source_role_session_name": "role_session_name",
+    "source_role_external_id": "external_id",
+}
 
 
 class AWSAccessKeyError(ManagedConfigurationError):
@@ -141,6 +146,16 @@ def aws_profile_params(
     if not isinstance(credentials, dict):
         raise AWSAccessKeyError(
             "Managed AWS credentials configuration must be a nested object"
+        )
+    # A partial chain must not silently collect as the intermediate role or
+    # the raw-key identity. Leave AWS syntax and permissions to boto3/AWS.
+    if _SOURCE_ROLE_PROFILE_SETTINGS.keys() & credentials.keys() and any(
+        not isinstance(credentials.get(key), str) or not credentials[key].strip()
+        for key in ("source_role_arn", "role_arn")
+    ):
+        raise AWSAccessKeyError(
+            "Managed AWS source-role chaining requires non-empty "
+            "source_role_arn and role_arn settings"
         )
     return document
 
@@ -331,7 +346,7 @@ def _log_collection_failure(error: Exception) -> None:
 def managed_aws_profile(
     params: dict[str, Any], credentials: AWSAccessKeyCredentials, directory: Path
 ) -> Iterator[str]:
-    """Install a direct-key or role profile; restore all worker state afterward."""
+    """Install direct-key, single-role, or chained-role profiles for one job."""
     document = aws_profile_params(params)
     profile = f"openhound-job-{uuid4().hex}"
     settings = document["sources"]["source"]["aws"]["credentials"]
@@ -339,17 +354,34 @@ def managed_aws_profile(
     role_settings = {
         key: settings[key] for key in _ROLE_PROFILE_SETTINGS if key in settings
     }
+    source_role_settings = {
+        ini_key: settings[key]
+        for key, ini_key in _SOURCE_ROLE_PROFILE_SETTINGS.items()
+        if key in settings
+    }
     settings["profile_name"] = profile
     source_profile = f"{profile}-source" if role_settings else profile
+    role_source_profile = source_profile
+    config_sections = {}
+    if source_role_settings:
+        role_source_profile = f"{profile}-intermediate"
+        config_sections[f"profile {role_source_profile}"] = {
+            **source_role_settings,
+            "source_profile": source_profile,
+            "role_session_name": source_role_settings.get(
+                "role_session_name", role_source_profile
+            ),
+        }
     profile_config = (
         {
             **role_settings,
-            "source_profile": source_profile,
+            "source_profile": role_source_profile,
             "role_session_name": role_settings.get("role_session_name", profile),
         }
         if role_settings
         else {}
     )
+    config_sections[f"profile {profile}"] = profile_config
     files = {
         "AWS_SHARED_CREDENTIALS_FILE": directory / "credentials",
         "AWS_CONFIG_FILE": directory / "config",
@@ -379,9 +411,7 @@ def managed_aws_profile(
                         }
                     },
                 )
-                _write_ini(
-                    files["AWS_CONFIG_FILE"], {f"profile {profile}": profile_config}
-                )
+                _write_ini(files["AWS_CONFIG_FILE"], config_sections)
                 os.environ.update({key: str(path) for key, path in files.items()})
                 providers.providers = [
                     _SourceCredentialFallback(p) for p in previous_providers

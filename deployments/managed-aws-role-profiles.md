@@ -1,20 +1,21 @@
 # Managed AWS role profiles
 
 Managed AWS jobs can use a supplied IAM user's Access Key ID and Secret Access
-Key to assume an initial collection role. Configure that role through the
-existing BHE collection plan's Configuration JSON (`params`); supply the source
-user's keys through the existing credential inputs.
+Key to assume a collection role, optionally through an intermediate source role.
+Configure these roles through the existing BHE collection plan's Configuration
+JSON (`params`); supply the source user's keys through the existing credential inputs.
 
-The OpenHound worker creates a private source credentials profile and a linked
-role profile, then injects the role profile's generated name into the AWS
+The OpenHound worker creates a private source credentials profile and linked
+role profiles, then injects the final role profile's generated name into the AWS
 extension's configuration. Boto3 performs STS `AssumeRole` and refreshes the
-initial role credentials as needed. No AWS extension or BHE changes are required.
+role credentials as needed. No AWS extension or BHE changes are required.
 
 OpenHound transports configuration and mechanically adapts the raw-key credential
 handoff. The installed extension, DLT, boto3, and AWS determine field meanings,
-model selection, required combinations, and validity. OpenHound does not enforce
-AWS key formats, role/session/external-ID syntax, organization combinations, or
-an allowlist of credential settings.
+model selection, and AWS validity. OpenHound checks that intermediate-role
+configuration includes both role ARNs, but does not enforce AWS key formats,
+role/session/external-ID syntax, organization combinations, or an allowlist of
+credential settings.
 
 ## Configuration layout and resolution
 
@@ -93,7 +94,7 @@ replacing the example role ARN with the actual collection role:
 | --- | --- | --- |
 | `role_arn` | Copied when present | boto3/AWS interpret the role identifier. |
 | `role_session_name` | Copied when present | Defaults to the generated job profile name when a linked profile is created. |
-| `external_id` | Copied when present | boto3 passes it to the initial STS `AssumeRole` request. |
+| `external_id` | Copied when present | boto3 passes it to the collection role's STS `AssumeRole` request. |
 
 The bridge translates these three fields from
 `sources.source.aws.credentials`, retaining them in the DLT document as well.
@@ -112,6 +113,86 @@ file locations. Files are mode 0600, the workspace is mode 0700, and environment
 and DLT providers are restored after collection. Cleanup also covers submission
 failure and forced worker termination. An `AWS_ROLE_ARN` environment variable is
 not a substitute for the bridge's job setting.
+
+## Cross-account collection through an intermediate source role
+
+When the starting IAM user cannot assume the target account's collection role
+directly, add `source_role_arn`. The worker generates this chain:
+
+```text
+Starting access key + secret
+    -> intermediate source role (source_role_arn)
+    -> target account's collection role (role_arn)
+    -> collection using the target role
+```
+
+Use [managed-aws-source-role-params.json](managed-aws-source-role-params.json) as a
+complete plan example. Its credential section is:
+
+```json
+{
+  "region_name": "us-east-1",
+  "source_role_arn": "arn:aws:iam::123456789012:role/CentralCollectorRole",
+  "source_role_session_name": "product-openhound-source",
+  "role_arn": "arn:aws:iam::222222222222:role/TargetCollectorRole",
+  "role_session_name": "product-openhound-collection"
+}
+```
+
+All settings go under `sources.source.aws.credentials`:
+
+| Setting | Translation and behavior |
+| --- | --- |
+| `source_role_arn` | Intermediate profile's `role_arn`; assumed using the starting keys. |
+| `source_role_session_name` | Intermediate profile's `role_session_name`; defaults to its generated profile name. |
+| `source_role_external_id` | Optional intermediate profile `external_id`; applies only to the first assumption. |
+| `role_arn` | Final profile's `role_arn`; assumed using the intermediate role credentials. |
+| `role_session_name` | Final profile's session name; defaults to the final generated profile name. |
+| `external_id` | Optional final profile `external_id`; applies only to the second assumption. |
+
+Supplying any `source_role_*` setting requires non-empty string values for both
+`source_role_arn` and `role_arn`. Incomplete chains fail preparation before secret
+retrieval or job start. Other supplied values retain the existing mechanical INI
+serialization behavior; boto3/AWS validate their meaning and permissions.
+
+The generated credentials file still contains only the starting key pair:
+
+```ini
+[openhound-job-<id>-source]
+aws_access_key_id = <supplied key ID>
+aws_secret_access_key = <retrieved secret>
+```
+
+The generated AWS config contains two linked role profiles:
+
+```ini
+[profile openhound-job-<id>-intermediate]
+role_arn = arn:aws:iam::123456789012:role/CentralCollectorRole
+source_profile = openhound-job-<id>-source
+role_session_name = product-openhound-source
+
+[profile openhound-job-<id>]
+role_arn = arn:aws:iam::222222222222:role/TargetCollectorRole
+source_profile = openhound-job-<id>-intermediate
+role_session_name = product-openhound-collection
+```
+
+The DLT document retains all supplied settings and gets the final generated
+`profile_name`. Boto3 follows the profile chain and refreshes both roles' temporary
+credentials in memory. Failure at either assumption fails collection without
+falling back to the starting user or intermediate role.
+
+Create one plan per target account, using the same intermediate role and each
+account's own collection role ARN. No common role name is required across accounts.
+The starting user must be allowed to assume the intermediate role, and that role
+must be allowed to assume the target role, with matching role trust policies.
+
+Existing behavior is preserved when all `source_role_*` settings are omitted:
+`role_arn` alone still performs one assumption (including central-account-only
+collection), and omitting all role settings still collects with the starting keys.
+Do not supply profile names or a manual `source_profile` to wire this chain; the
+worker owns those names and links. `source_role_arn` is unrelated to the extension's
+organization setting `source_account`.
 
 ## Organization collection after the initial role assumption
 
@@ -133,11 +214,10 @@ looks like:
 }
 ```
 
-`source_account` must match the **initial assumed role's account**, not necessarily
-the raw-key user's account. The source user must be allowed to assume the initial
-role, and the management/member roles must permit assumption from that initial
-role. The extension assumes management and member roles directly from the initial
-role; member assumptions do not chain through the management role.
+`source_account` must match the **final generated profile's account** (`role_arn`
+when supplied), not necessarily the raw-key user's or intermediate role's account.
+The extension assumes management and member roles directly from that final
+profile's identity; member assumptions do not chain through the management role.
 
 For management-account organization collection, set `role_arn` to the management
 collection role, retain `org_role_name` and any other applicable organization
@@ -180,9 +260,10 @@ death. Standalone CLI and direct calls retain their local logging handlers.
 
 ## Local verification with the bundle image
 
-The local harness in `scripts/check_managed_aws.py` now recognizes `assume-role`
-credentials and prints the STS caller ARN. `--auth-only` verifies the selected
-initial role, not downstream organization-role permissions or service access.
+The local harness in `scripts/check_managed_aws.py` recognizes single-role and
+chained-role credentials and prints the STS caller ARN. `--auth-only` verifies
+the final role (including both assumptions when chained), not downstream
+organization-role permissions or service access.
 
 An existing bundle image contains the old adapter. The commands below mount the
 updated adapter and harness from this checkout, so an image rebuild is not
@@ -205,7 +286,12 @@ Expected output includes `using assume-role` and an
 `arn:aws:sts::...:assumed-role/...` caller ARN. This verifies profile wiring, not
 live role permissions.
 
-### Live initial-role authentication
+To check a two-role chain offline, use
+`deployments/managed-aws-source-role-params.json` instead of
+`deployments/managed-aws-role-params.json` as the mounted parameter file. The
+harness stubs both assumptions and reports the final target account's identity.
+
+### Live role authentication
 
 Edit the example parameters file to use the intended role and optional
 organization settings. Use the source-key JSON described in
