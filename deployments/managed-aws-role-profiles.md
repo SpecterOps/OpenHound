@@ -12,7 +12,8 @@ initial role credentials as needed. No AWS extension or BHE changes are required
 
 OpenHound transports configuration and mechanically adapts the raw-key credential
 handoff. The installed extension, DLT, boto3, and AWS determine field meanings,
-model selection, required combinations, and validity. OpenHound does not enforce
+model selection, required combinations, and validity. OpenHound requires a
+non-empty `role_arn` when any initial role setting is supplied, but does not enforce
 AWS key formats, role/session/external-ID syntax, organization combinations, or
 an allowlist of credential settings.
 
@@ -98,12 +99,14 @@ replacing the example role ARN with the actual collection role:
 The bridge translates these three fields from
 `sources.source.aws.credentials`, retaining them in the DLT document as well.
 The current extension does not consume them directly in its credential models.
-When any is present, the worker writes the raw keys to a generated source profile
-and adds `source_profile` wiring to the generated collection profile. Values are
-copied mechanically, without checking syntax or requiring combinations. Scalar
-values must be losslessly representable in INI; serialization failures produce a
-sanitized operational error. Omitting all three preserves direct-key collection.
-Failed role assumption does not retry with the source user's permissions.
+When any is present, `role_arn` must be a non-empty string; incomplete settings
+are rejected during job preparation to prevent fallback to the worker's identity.
+The worker writes the raw keys to a generated source profile and adds
+`source_profile` wiring to the generated collection profile. Values are otherwise
+copied mechanically, without checking AWS syntax. Scalar values must be losslessly
+representable in INI; serialization failures produce a sanitized operational error.
+Omitting all three preserves direct-key collection. Failed role assumption does
+not retry with the source user's permissions.
 
 Supplied profile/authentication settings are preserved, except the injected
 canonical `profile_name`. For the generated-profile examples, omit `profile_names`

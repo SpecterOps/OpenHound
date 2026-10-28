@@ -361,8 +361,8 @@ def test_current_extension_fallback_and_ignored_fields_are_authoritative(
 @pytest.mark.parametrize(
     "settings",
     [
-        {"role_session_name": "no-role-required"},
-        {"external_id": 123},
+        {"role_arn": ROLE_ARN, "role_session_name": "collection-session"},
+        {"role_arn": ROLE_ARN, "external_id": 123},
         {"role_arn": "user/not-a-role", "role_session_name": "x" * 65},
     ],
 )
@@ -378,7 +378,13 @@ def test_role_fields_are_mechanically_serialized(workspace, settings):
 
 @pytest.mark.parametrize("value", [None, {}, [], "unencodable-\ud800"])
 def test_unserializable_ini_values_fail_operationally_and_cleanup(workspace, value):
-    params = {"sources": {"source": {"aws": {"credentials": {"role_arn": value}}}}}
+    params = {
+        "sources": {
+            "source": {
+                "aws": {"credentials": {"role_arn": ROLE_ARN, "external_id": value}}
+            }
+        }
+    }
     original = dict(os.environ)
     with (
         pytest.raises(

@@ -2039,13 +2039,9 @@ def test_invalid_raw_aws_payloads_are_not_trimmed_wrapped_or_treated_as_document
         {"source_account": "999999999999"},
         {"org_role_name": ""},
         {"org_role_name": 123},
-        {"role_arn": None},
-        {"role_arn": ""},
         {"role_arn": "arn:aws:iam::123456789012:user/Collector"},
         {"role_arn": "arn:aws:iam::123456789:role/Collector"},
         {"role_arn": "arn:aws:iam::123456789012:role/Collector\n"},
-        {"role_session_name": "collection-session"},
-        {"external_id": "customer-123"},
         {
             "role_arn": "arn:aws:iam::123456789012:role/Collector",
             "role_session_name": "x",
@@ -2100,6 +2096,43 @@ def test_raw_aws_settings_reach_worker_handoff_without_aws_validation(
     assert submitted[4].secret_access_key == AWS_SECRET_KEY
     assert state.collector_job_end_requests == []
     aws_managed_service._cleanup_aws_profile_workspace()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"role_session_name": "collection-session"},
+        {"external_id": "customer-123"},
+        {"role_session_name": "collection-session", "external_id": "customer-123"},
+        {"role_arn": None},
+        {"role_arn": ""},
+        {"role_arn": " \t"},
+        {"role_arn": False},
+        {"role_arn": 123},
+        {"role_arn": []},
+        {"role_arn": {}},
+        {"role_arn": "", "role_session_name": "collection-session"},
+        {"role_arn": None, "external_id": "customer-123"},
+    ],
+)
+def test_incomplete_aws_role_settings_fail_before_secret_retrieval_and_start(
+    aws_managed_service, mock_bloodhound_api, options, monkeypatch, caplog
+):
+    state = mock_bloodhound_api.app.state
+    state.collector_job_claim_response["params"] = {
+        "sources": {"source": {"aws": {"credentials": options}}}
+    }
+    monkeypatch.setattr(
+        aws_managed_service.secrets_manager,
+        "get_secret",
+        lambda _: pytest.fail("Incomplete role settings must not retrieve credentials"),
+    )
+    aws_managed_service._poll()
+    assert "Managed AWS role settings require a non-empty role_arn" in caplog.text
+    assert state.collector_job_start_requests == []
+    assert aws_managed_service.executor.submitted == []
+    assert aws_managed_service._aws_profile_workspace is None
+    assert state.collector_job_end_requests[0]["body"]["outcome"] == "failed"
 
 
 def test_missing_new_bhe_job_field_rejects_claim_before_start(

@@ -120,7 +120,7 @@ def prepare_aws_credentials(
 def aws_profile_params(
     params: dict[str, Any], *, collector_name: str = "aws"
 ) -> dict[str, Any]:
-    """Copy the DLT document and ensure the runtime injection path is an object."""
+    """Validate the profile bridge and copy its nested DLT document."""
     if collector_name != "aws":
         raise AWSAccessKeyError("Managed AWS credentials require the AWS collector")
     if not isinstance(params, dict) or any(
@@ -142,6 +142,13 @@ def aws_profile_params(
         raise AWSAccessKeyError(
             "Managed AWS credentials configuration must be a nested object"
         )
+    if credentials.keys() & _ROLE_PROFILE_SETTINGS:
+        role_arn = credentials.get("role_arn")
+        # A linked profile without a role can fall back to the worker's identity.
+        if not isinstance(role_arn, str) or not role_arn.strip():
+            raise AWSAccessKeyError(
+                "Managed AWS role settings require a non-empty role_arn"
+            )
     return document
 
 
