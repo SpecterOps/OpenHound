@@ -17,14 +17,49 @@ on:
         description: "Full 40-character openhound-aws source commit SHA to bundle"
         required: true
         type: string
+      verify_access_only:
+        description: "Only verify read access to SpecterOps/openhound-aws; skip ECR publishing"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
+  verify-openhound-aws-access:
+    name: Verify read access to openhound-aws
+    if: ${{ inputs.verify_access_only == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create read token for openhound-aws
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: SpecterOps
+          repositories: openhound-aws
+          permission-contents: read
+
+      - name: Check out openhound-aws
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # ratchet:actions/checkout@v6
+        with:
+          repository: SpecterOps/openhound-aws
+          ref: ${{ inputs.aws_commit }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: repo-b
+          persist-credentials: false
+
+      - name: Confirm checked out revision
+        run: git -C repo-b rev-parse --verify HEAD
+
   push-to-ECR-registry:
     name: Push bundled enterprise image to ECR
+    if: ${{ inputs.verify_access_only != true }}
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout bundle build tooling
@@ -66,6 +101,16 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@f2e9fc6c2b355c1890b65e6f6f0e2ac3e6e22f78 # ratchet:aws-actions/amazon-ecr-login@v2
 
+      - name: Create read token for openhound-aws
+        id: openhound-aws-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: SpecterOps
+          repositories: openhound-aws
+          permission-contents: read
+
       - name: Build and push bundled multi-arch image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # ratchet:docker/build-push-action@v7
         with:
@@ -82,4 +127,4 @@ jobs:
             OPENHOUND_VERSION=${{ inputs.tag }}
             OPENHOUND_AWS_COMMIT=${{ inputs.aws_commit }}
           secrets: |
-            OPENHOUND_AWS_GITHUB_TOKEN=${{ secrets.OPENHOUND_AWS_GITHUB_TOKEN }}
+            OPENHOUND_AWS_GITHUB_TOKEN=${{ steps.openhound-aws-token.outputs.token }}
