@@ -36,9 +36,9 @@ def patch_packaging(destination: Path, local_version: str) -> None:
 def main(commit: str) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("OPENHOUND_AWS_COMMIT must be a full, pinned commit SHA")
-    token = Path("/run/secrets/OPENHOUND_AWS_GITHUB_TOKEN").read_text().strip()
+    token = Path("/run/secrets/OPENHOUND_AWS_APP_TOKEN").read_text().strip()
     if not token:
-        raise ValueError("OPENHOUND_AWS_GITHUB_TOKEN must not be empty")
+        raise ValueError("OPENHOUND_AWS_APP_TOKEN must not be empty")
     request = Request(
         f"https://api.github.com/repos/SpecterOps/openhound-aws/tarball/{commit}",
         headers={
