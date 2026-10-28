@@ -1,0 +1,27 @@
+{
+  "schema": {
+    "name": "Faker",
+    "display_name": "Faker Example Extension",
+    "version": "v1.0.0",
+    "namespace": "Rand"
+  },
+  "node_kinds": [
+    {
+      "name": "RAND_Computer",
+      "display_name": "Random Computer",
+      "description": "A randomly generated computer used for testing OpenHound collection and conversion.",
+      "is_display_kind": true,
+      "icon": "computer",
+      "color": "#FFFFFF"
+    }
+  ],
+  "relationship_kinds": [
+    {
+      "name": "RAND_ExampleReference",
+      "description": "An example reference from one randomly generated computer to another.",
+      "is_traversable": false
+    }
+  ],
+  "environments": [],
+  "relationship_findings": []
+}
