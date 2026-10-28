@@ -1,7 +1,7 @@
 import re
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
 import typer
 
@@ -10,17 +10,32 @@ create_app = typer.Typer(
 )
 
 
-def generate_docs(base_path: Path, group: str = "openhound.sources") -> None:
+def generate_docs(
+    base_path: Path,
+    group: str = "openhound.sources",
+    schema_path: Path | None = None,
+) -> None:
     """Loads the collector extensions via entrypoints and uses griffe to generate OpenHound collector docs.
 
     Args:
         base_path (Path): Base path where to create the collector docs (default: ./docs).
         group (str, optional): The entrypoint that collectors use  (default: "openhound.sources").
+        schema_path (Path, optional): Explicit path to the graph schema extension JSON.
 
     """
     import griffe
 
     from openhound.docs.pipeline import CustomCollectorDocs, GraphResourceDecorator
+    from openhound.docs.schema import GraphSchema
+
+    schema = None
+    if schema_path is not None:
+        try:
+            schema = GraphSchema.model_validate_json(schema_path.read_text())
+        except Exception as exc:
+            raise typer.BadParameter(
+                f"Cannot load graph schema {schema_path}: {exc}", param_hint="--schema"
+            ) from exc
 
     discover_extension = entry_points(group=group)
     griffe_ext = GraphResourceDecorator()
@@ -48,45 +63,67 @@ def generate_docs(base_path: Path, group: str = "openhound.sources") -> None:
             sources=collector.sources,
             resources=collector.resources,
             transformers=collector.transformers,
+            schema=schema,
         )
         docs.to_markdown(output_path=output_path)
 
 
 @create_app.command()
 def docs(
-    output_dir: Path = typer.Argument(
-        Path("./docs"),
-        help="Where to create the docs for extensions",
-        file_okay=False,
-        dir_okay=True,
-        exists=True,
-    ),
+    output_dir: Annotated[
+        Path,
+        typer.Argument(
+            Path("./docs"),
+            help="Where to create the docs for extensions",
+            file_okay=False,
+            dir_okay=True,
+            exists=True,
+        ),
+    ],
+    schema: Annotated[
+        Path | None,
+        typer.Option(
+            "--schema",
+            help="Path to the graph schema extension JSON used for report metadata",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
 ):
     """Generate OpenHound collector docs based on @app.asset decorators and docstrings in each collector.
 
     Args:
         output_dir (Path): Base path where to create the collector docs (default: ./docs).
+        schema (Path, optional): Explicit path to the graph schema extension JSON.
 
     """
-    generate_docs(output_dir)
+    generate_docs(output_dir, schema_path=schema)
 
 
 @create_app.command()
 def collector(
-    output_dir: Path = typer.Argument(
-        help="Where to create the collector",
-        file_okay=False,
-        dir_okay=True,
-    ),
-    config: Optional[Path] = typer.Option(
-        None,
-        "--config",
-        "-c",
-        help="Path to config file (YAML/JSON)",
-        exists=True,
-        file_okay=True,
-        dir_okay=False,
-    ),
+    output_dir: Annotated[
+        Path,
+        typer.Argument(
+            help="Where to create the collector",
+            file_okay=False,
+            dir_okay=True,
+        ),
+    ],
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            None,
+            "--config",
+            "-c",
+            help="Path to config file (YAML/JSON)",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+        ),
+    ],
     template: str = typer.Option(
         "gh:SpecterOps/OpenHound-template", "--template", "-t", help="Template to use"
     ),
