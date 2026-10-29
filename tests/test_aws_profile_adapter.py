@@ -6,7 +6,7 @@ import tempfile
 import time
 import traceback
 import zipfile
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from configparser import ConfigParser
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -24,8 +24,11 @@ from dlt.common.configuration.providers.doc import CustomLoaderDocProvider
 from dlt.common.configuration.providers.provider import ConfigProvider
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
 from dlt.common.configuration.utils import TraceLogContext
+from dlt.destinations import filesystem
 
 from openhound.core import logging as openhound_logging
+from openhound.core.clients.bloodhound_enterprise import ManagedJobOutcome
+from openhound.core.resources import safe_defer_wrapper, safe_resource_wrapper
 from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import aws_profile, service
 from openhound.scheduler.aws_profile import (
@@ -266,6 +269,223 @@ def test_denied_profile_role_fails_without_source_fallback(
     assert dict(os.environ) == original_environment
     assert not (workspace.directory / "config").exists()
     assert not (workspace.directory / "credentials").exists()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "assume-role-denied",
+        "invalid-source-key",
+        "success",
+        "recoverable",
+        "empty",
+    ],
+)
+def test_initial_identity_controls_worker_and_managed_outcome(
+    outcome, profile_assumptions, monkeypatch, tmp_path, caplog
+):
+    """Real SDK profile resolution + DLT + worker; mock only AWS/BHE IO and executor."""
+    failed = outcome in {"assume-role-denied", "invalid-source-key"}
+    role = outcome != "invalid-source-key"
+    options = {
+        "region_name": "eu-west-1",
+        "endpoint_url": "https://sts.example.test",
+    }
+    if role:
+        options.update(role_arn=ROLE_ARN, role_session_name="initial-collection")
+        profile_assumptions(
+            {"RoleArn": ROLE_ARN, "RoleSessionName": "initial-collection"},
+            denied=outcome == "assume-role-denied",
+        )
+    params = {"sources": {"source": {"aws": {"credentials": options}}}}
+    # Defaults must not become an alternative identity after a role denial.
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "scheduler-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "scheduler-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "scheduler-token")
+    original_environment = dict(os.environ)
+    providers = Container()[PluggableRunContext].providers
+    original_providers = providers.providers
+    create_client = BotocoreSession.create_client
+    identity_requests, stubbers, stages, ends, uploads = [], [], [], [], []
+
+    def stub_identity(session, name, *args, **kwargs):
+        client = create_client(session, name, *args, **kwargs)
+        if name == "sts" and kwargs.get("aws_access_key_id") is None:
+            # Stubber bypasses request signing. Resolve the real SDK credential
+            # chain first so the initial AssumeRole still runs (and can fail).
+            credentials = client._request_signer._credentials
+            frozen = credentials.get_frozen_credentials()
+            assert credentials.method == (
+                "assume-role" if role else "shared-credentials-file"
+            )
+            assert frozen.access_key == (ROLE_ACCESS_KEY if role else ACCESS_KEY)
+            assert client.meta.region_name == "eu-west-1"
+            assert client.meta.endpoint_url == "https://sts.example.test"
+            identity_requests.append(frozen.access_key)
+            stubber = Stubber(client)
+            if outcome == "invalid-source-key":
+                stubber.add_client_error(
+                    "get_caller_identity",
+                    service_error_code="InvalidClientTokenId",
+                    expected_params={},
+                )
+            else:
+                stubber.add_response("get_caller_identity", _identity(ROLE_ACCOUNT), {})
+            stubber.activate()
+            stubbers.append(stubber)
+        return client
+
+    monkeypatch.setattr(BotocoreSession, "create_client", stub_identity)
+
+    def denied_resource():
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "Optional bucket denied"}},
+            "GetBucketPolicy",
+        )
+        yield  # Resource errors occur on iteration, as in the AWS extension.
+
+    def denied_defer():
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "Optional object denied"}},
+            "GetObject",
+        )
+
+    def collect(**kwargs):
+        stages.append("collect")
+        settings = dlt.secrets.get("sources.source.aws.credentials", dict)
+        assert settings["profile_name"].startswith("openhound-job-")
+        assert (directory / "credentials").exists()
+        resources = [dlt.resource([], name="accounts")]
+        if outcome != "empty":
+            resources = [dlt.resource([{"AccountId": ROLE_ACCOUNT}], name="accounts")]
+        if outcome == "recoverable":
+            resources.append(
+                dlt.resource(safe_resource_wrapper(denied_resource, "bucket_policy"))()
+            )
+
+            @dlt.resource
+            def objects():
+                yield dlt.defer(safe_defer_wrapper(denied_defer))()
+
+            resources.append(objects())
+        pipeline = dlt.pipeline(
+            pipeline_name="initial_auth_regression",
+            pipelines_dir=str(tmp_path / "pipelines"),
+            destination=filesystem(bucket_url=str(tmp_path / "collected")),
+            dataset_name="aws",
+        )
+        return pipeline.run(resources)
+
+    def preprocess(extension):
+        stages.append("preprocess")
+        return []
+
+    def convert(extension, output_path):
+        stages.append("convert")
+        (output_path / "graph.json").write_text('{"graph": {}}')
+        return []
+
+    collector = SimpleNamespace(
+        name="aws",
+        dlt_source=object(),
+        package_version="test",
+        metadata=None,
+        collector=collect,
+        preprocessor=object(),
+    )
+    monkeypatch.setattr(
+        service.CollectorManager,
+        "from_entrypoint",
+        lambda: SimpleNamespace(collectors=[collector]),
+    )
+    monkeypatch.setattr(service.dataflow, "preprocess", preprocess)
+    monkeypatch.setattr(service.dataflow, "convert", convert)
+    output_directory = tmp_path / "staged-graph"
+
+    def create_output(**kwargs):
+        output_directory.mkdir()
+        return str(output_directory)
+
+    monkeypatch.setattr(service, "tempfile", SimpleNamespace(mkdtemp=create_output))
+    scheduler = service.Service(
+        "https://bhe.example.test", "token", "id", "aws", managed=True
+    )
+    monkeypatch.setattr(scheduler.client, "start_collector_job", lambda job_id: None)
+    monkeypatch.setattr(
+        scheduler.client,
+        "end_managed_job",
+        lambda *args, **kwargs: ends.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        scheduler.client,
+        "upload_collector_job_data",
+        lambda *args: uploads.append(args),
+    )
+
+    def submit(function, *args):
+        nonlocal directory
+        directory = scheduler._aws_profile_workspace.directory
+        future = Future()
+        try:
+            future.set_result(function(*args))
+        except Exception as error:  # noqa: BLE001 - emulate ProcessPoolExecutor
+            future.set_exception(error)
+        return future
+
+    directory = None
+    monkeypatch.setattr(scheduler.executor, "submit", submit)
+    try:
+        scheduler.run_claimed_job("job-initial-auth", params, PAIR)
+        assert not (directory / "credentials").exists()
+        assert not (directory / "config").exists()
+        assert dict(os.environ) == original_environment
+        assert providers.providers is original_providers
+        if failed:
+            with pytest.raises(
+                ManagedConfigurationError, match="Managed AWS collection failed"
+            ):
+                scheduler.future.result()
+            assert stages == []
+            assert "completed successfully" not in caplog.text
+            assert (
+                "AssumeRole returned AccessDenied"
+                if role
+                else "GetCallerIdentity returned InvalidClientTokenId"
+            ) in caplog.text
+        else:
+            result = scheduler.future.result()
+            assert result.job_id == "job-initial-auth"
+            assert stages == ["collect", "preprocess", "convert"]
+            if outcome == "recoverable":
+                assert (
+                    "Error in resource 'bucket_policy' during iteration" in caplog.text
+                )
+                assert "Error executing DLT defer" in caplog.text
+        scheduler._handle_completed_job(scheduler.future)
+        assert ends[0][0] == (
+            "job-initial-auth",
+            ManagedJobOutcome.FAILED if failed else ManagedJobOutcome.SUCCEEDED,
+        )
+        assert len(ends) == 1
+        assert len(uploads) == (0 if failed else 1)
+        assert identity_requests == (
+            []
+            if outcome == "assume-role-denied"
+            else [ROLE_ACCESS_KEY if role else ACCESS_KEY]
+        )
+        assert not directory.exists()
+        assert not output_directory.exists()
+        assert scheduler._aws_profile_workspace is None
+        assert scheduler.future is scheduler.job_running is None
+        assert ACCESS_KEY not in caplog.text and SECRET_KEY not in caplog.text
+        for stubber in stubbers:
+            stubber.assert_no_pending_responses()
+    finally:
+        for stubber in stubbers:
+            stubber.deactivate()
+        scheduler.executor.shutdown(wait=True, cancel_futures=True)
+        scheduler._worker_logging.close()
+        scheduler._cleanup_aws_profile_workspace()
 
 
 def test_boto3_file_provider_uses_exact_pair_without_a_session_token(

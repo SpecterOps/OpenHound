@@ -22,6 +22,8 @@ import dlt
 import pytest
 import requests
 from botocore.exceptions import ClientError
+from botocore.httpsession import URLLib3Session
+from botocore.session import Session as BotocoreSession
 from botocore.stub import Stubber
 from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
@@ -1780,6 +1782,10 @@ def test_managed_job_retrieves_full_hierarchy_secret_before_dlt_resolution(
         return {"collect": []}
 
     monkeypatch.setattr(scheduler_service.dataflow, "pipeline", collect)
+    # This test verifies configuration handoff, not existing AWS profiles.
+    monkeypatch.setattr(
+        scheduler_service, "validate_configured_aws_profiles", lambda: None
+    )
 
     def submit(function, *args):
         future = Future()
@@ -1805,6 +1811,162 @@ def test_managed_job_retrieves_full_hierarchy_secret_before_dlt_resolution(
 
 AWS_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"
 AWS_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+
+@pytest.mark.parametrize(
+    "case", ["single-denied", "single-success", "mixed", "all-denied"]
+)
+def test_existing_aws_profiles_report_authentication_outcome_through_queue(
+    managed_service, mock_bloodhound_api, case, monkeypatch, tmp_path, caplog
+):
+    """Exercise discovery/claim/start/end against the local API and real SDK files."""
+    scheduler = managed_service
+    scheduler.collector_name = "aws"
+    scheduler.managed_job_runner = scheduler._run_prepared_managed_job
+    state = mock_bloodhound_api.app.state
+    state.collector_job_queue_response["data"]["jobs"][0]["job_key"] = "aws"
+    config, credentials = tmp_path / "config", tmp_path / "credentials"
+    config.write_text(
+        "[profile good]\nregion=eu-west-1\n[profile denied]\nregion=eu-west-1\n"
+    )
+    contents = "".join(
+        f"[{profile}]\naws_access_key_id={AWS_ACCESS_KEY}\naws_secret_access_key={AWS_SECRET_KEY}\n"
+        for profile in ("good", "denied")
+    )
+    credentials.write_text(contents)
+    options = {"config_file": str(config), "credentials_file": str(credentials)}
+    if case in ("mixed", "all-denied"):
+        options["profile_names"] = ["denied", "good"] if case == "mixed" else ["denied"]
+    else:
+        options["profile_name"] = "good" if case == "single-success" else "denied"
+    document = {"sources": {"source": {"aws": {"credentials": options}}}}
+    scheduler.secrets_manager = AWSSecretsManager(
+        SimpleNamespace(
+            get_secret_value=lambda **kwargs: {"SecretString": json.dumps(document)}
+        )
+    )
+    state.collector_job_claim_response.update(
+        job_key="aws",
+        external_secret_key_id=None,
+        params={
+            "sources": {
+                "source": {"aws": {"credentials": {"region_name": "eu-west-1"}}}
+            }
+        },
+    )
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "scheduler-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "scheduler-secret")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setattr(
+        URLLib3Session, "send", lambda *a, **kw: pytest.fail("Live AWS request")
+    )
+    environment = dict(os.environ)
+    create_client = BotocoreSession.create_client
+    identities, stubbers, stages = [], [], []
+
+    def stub_identity(session, name, *args, **kwargs):
+        client = create_client(session, name, *args, **kwargs)
+        assert name == "sts"
+        profile = session.get_config_variable("profile")
+        assert profile in ("good", "denied")
+        assert client._request_signer._credentials.method == "shared-credentials-file"
+        assert client._request_signer._credentials.access_key == AWS_ACCESS_KEY
+        identities.append(profile)
+        stubber = Stubber(client)
+        if profile == "denied":
+            stubber.add_client_error(
+                "get_caller_identity",
+                service_error_code="InvalidClientTokenId",
+                expected_params={},
+            )
+        else:
+            stubber.add_response(
+                "get_caller_identity",
+                {
+                    "Account": "123456789012",
+                    "Arn": "arn:aws:iam::123456789012:user/collector",
+                    "UserId": "collector",
+                },
+                {},
+            )
+        stubber.activate()
+        stubbers.append(stubber)
+        return client
+
+    monkeypatch.setattr(BotocoreSession, "create_client", stub_identity)
+
+    def collect(**kwargs):
+        stages.append("collect")
+        return SimpleNamespace(load_packages=[])
+
+    collector = SimpleNamespace(
+        name="aws",
+        dlt_source=object(),
+        package_version="test",
+        metadata=None,
+        collector=collect,
+        preprocessor=object(),
+    )
+    monkeypatch.setattr(
+        scheduler_service.CollectorManager,
+        "from_entrypoint",
+        lambda: SimpleNamespace(collectors=[collector]),
+    )
+    monkeypatch.setattr(
+        scheduler_service.dataflow,
+        "preprocess",
+        lambda extension: stages.append("preprocess") or [],
+    )
+
+    def convert(extension, output_path):
+        stages.append("convert")
+        (output_path / "graph.json").write_text(Graph(graph={}).model_dump_json())
+        return []
+
+    monkeypatch.setattr(scheduler_service.dataflow, "convert", convert)
+
+    def submit(function, *args):
+        future = Future()
+        try:
+            future.set_result(function(*args))
+        except Exception as error:  # noqa: BLE001 - emulate ProcessPoolExecutor
+            future.set_exception(error)
+        return future
+
+    monkeypatch.setattr(scheduler.executor, "submit", submit)
+    failed = case in ("single-denied", "all-denied")
+    try:
+        scheduler._poll()
+        if failed:
+            with pytest.raises(ManagedConfigurationError):
+                scheduler.future.result()
+            assert stages == []
+        else:
+            assert scheduler.future.result().job_id == scheduler.job_running
+            assert stages == ["collect", "preprocess", "convert"]
+        state.collector_job_queue_response = load_json(
+            "collector_jobs_available_empty.json"
+        )
+        scheduler._poll()
+        assert len(state.collector_job_start_requests) == 1
+        assert len(state.collector_job_end_requests) == 1
+        assert state.collector_job_end_requests[0]["body"]["outcome"] == (
+            "failed" if failed else "succeeded"
+        )
+        assert len(state.managed_ingest_requests) == (0 if failed else 1)
+        assert identities == (
+            ["denied", "good"] if case == "mixed" else ["denied" if failed else "good"]
+        )
+        assert credentials.read_text() == contents
+        assert scheduler._aws_profile_workspace is None
+        assert scheduler.future is scheduler.job_running is None
+        assert dict(os.environ) == environment
+        assert AWS_ACCESS_KEY not in caplog.text and AWS_SECRET_KEY not in caplog.text
+        for stubber in stubbers:
+            stubber.assert_no_pending_responses()
+    finally:
+        for stubber in stubbers:
+            stubber.deactivate()
 
 
 @pytest.fixture
@@ -1868,6 +2030,29 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
         runner(prepared)
 
     scheduler.managed_job_runner = handoff
+
+    create_client = BotocoreSession.create_client
+    identity_stubbers = []
+
+    def stub_identity(session, name, *args, **kwargs):
+        sts = create_client(session, name, *args, **kwargs)
+        if name == "sts":
+            assert sts._request_signer._credentials.access_key == AWS_ACCESS_KEY
+            stubber = Stubber(sts)
+            stubber.add_response(
+                "get_caller_identity",
+                {
+                    "Account": "123456789012",
+                    "Arn": "arn:aws:iam::123456789012:user/collector",
+                    "UserId": "collector",
+                },
+                {},
+            )
+            stubber.activate()
+            identity_stubbers.append(stubber)
+        return sts
+
+    monkeypatch.setattr(BotocoreSession, "create_client", stub_identity)
 
     def load_collectors():
         assert state.collector_job_start_requests == [
@@ -1959,6 +2144,10 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
     assert AWS_SECRET_KEY not in caplog.text
     assert AWS_SECRET_KEY not in repr(handoffs)
     assert all(AWS_SECRET_KEY not in repr(record.__dict__) for record in caplog.records)
+    assert len(identity_stubbers) == 1
+    for stubber in identity_stubbers:
+        stubber.assert_no_pending_responses()
+        stubber.deactivate()
 
 
 @pytest.mark.parametrize(

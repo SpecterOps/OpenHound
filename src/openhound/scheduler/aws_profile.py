@@ -2,6 +2,10 @@
 
 Only the worker installs AWS/DLT configuration or writes credential material.
 The scheduler owns the workspace and its lifetime, including killed workers.
+
+Managed authentication preflights are a beta compatibility bridge (BED-10368).
+Move them with profile generation to the AWS extension once it reports fatal
+initial-authentication failures before best-effort resource iteration.
 """
 
 import logging
@@ -12,7 +16,7 @@ import tempfile
 import traceback
 from collections.abc import Callable, Iterator
 from configparser import ConfigParser
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from io import StringIO
@@ -20,7 +24,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import boto3
+import dlt
 from botocore.exceptions import BotoCoreError, ClientError
+from botocore.session import Session as BotocoreSession
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.providers.provider import ConfigProvider
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
@@ -332,6 +339,106 @@ def _log_collection_failure(error: Exception) -> None:
             getattr(cause, "exception", None) or cause.__cause__ or cause.__context__
         )
     logger.exception("Managed AWS collection failed")
+
+
+def validate_aws_profile(
+    profile: str,
+    *,
+    config_file: str | None = None,
+    credentials_file: str | None = None,
+) -> None:
+    """Authenticate the initial collection identity before best-effort resources.
+
+    Select the profile explicitly: a role profile must complete AssumeRole, never
+    retry with its source keys or the worker's default identity. Callers provide
+    safe SDK diagnostics and any generated-profile cleanup. This checks identity
+    only, not permissions for individual AWS services.
+    """
+    sdk_session = None
+    if config_file or credentials_file:
+        # Match the extension's per-session file selection for existing-profile
+        # credential documents; never change process-wide files for these jobs.
+        sdk_session = BotocoreSession()
+        for variable, value in (
+            ("config_file", config_file),
+            ("credentials_file", credentials_file),
+        ):
+            if value:
+                path = Path(value).expanduser().resolve()
+                if variable == "config_file" and not path.is_file():
+                    raise AWSAccessKeyError("Managed AWS config file is unavailable")
+                sdk_session.set_config_variable(variable, str(path))
+    session = boto3.Session(
+        profile_name=profile,
+        region_name=dlt.secrets.get("sources.source.aws.credentials.region_name", str),
+        botocore_session=sdk_session,
+    )
+    with closing(
+        session.client(
+            "sts",
+            endpoint_url=dlt.secrets.get(
+                "sources.source.aws.credentials.endpoint_url", str
+            ),
+        )
+    ) as sts:
+        sts.get_caller_identity()
+
+
+def validate_configured_aws_profiles() -> None:
+    """Temporary validation for managed jobs referencing existing named profiles.
+
+    Organization setup is already validated before resource iteration by the AWS
+    extension. For independent profiles, preserve its skip-and-continue behavior,
+    but require at least one authenticated profile, regardless of resource rows.
+    Move this policy to the extension along with managed profile generation.
+    """
+    prefix = "sources.source.aws.credentials"
+    if dlt.secrets.get(f"{prefix}.org_role_name", str) is not None:
+        return
+    profiles = dlt.secrets.get(f"{prefix}.profile_names", list)
+    multiple = profiles is not None
+    if profiles is None:
+        profile = dlt.secrets.get(f"{prefix}.profile_name", str)
+        if profile is None:
+            return  # Leave credential-model selection to the extension/DLT.
+        profiles = [profile]
+    with _safe_sdk_logging():
+        try:
+            authenticated = False
+            for profile in dict.fromkeys(profiles):
+                try:
+                    validate_aws_profile(
+                        profile,
+                        config_file=dlt.secrets.get(f"{prefix}.config_file", str),
+                        credentials_file=dlt.secrets.get(
+                            f"{prefix}.credentials_file", str
+                        ),
+                    )
+                except (BotoCoreError, ClientError) as error:
+                    if not multiple:
+                        raise
+                    diagnostics = _classify_aws_error(error).safe_diagnostics
+                    assert diagnostics is not None
+                    message, context = diagnostics
+                    logger.warning(
+                        "Skipping managed AWS profile %r during authentication: %s",
+                        profile,
+                        message,
+                        extra=context,
+                    )
+                    continue
+                authenticated = True
+            if not authenticated:
+                raise ManagedConfigurationError(
+                    "Managed AWS collection failed: no configured profile authenticated"
+                )
+        except ManagedConfigurationError:
+            raise
+        except Exception as error:  # noqa: BLE001 - sanitize SDK/config failures
+            _log_collection_failure(error)
+            raise ManagedConfigurationError(
+                "Managed AWS collection failed; check worker logs"
+            ) from None
 
 
 @contextmanager

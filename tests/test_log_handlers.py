@@ -585,6 +585,8 @@ def _spawned_log_collection(collector, job_id, params, credentials, managed, dir
         return service.Result({}, job_id)
 
     service._collect_in_worker = collect
+    # Network IO is out of scope for this logging-only worker.
+    service.validate_aws_profile = lambda profile: None
     return service._subprocess_collect(
         collector, job_id, params, credentials, managed, directory
     )
