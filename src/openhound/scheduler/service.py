@@ -47,6 +47,8 @@ from openhound.scheduler.aws_profile import (
     cleanup_orphaned_aws_profiles,
     managed_aws_profile,
     prepare_aws_credentials,
+    validate_aws_profile,
+    validate_configured_aws_profiles,
 )
 from openhound.scheduler.configuration import (
     ManagedConfigurationError,
@@ -198,7 +200,10 @@ def _configured_worker_collect(
             raise ManagedConfigurationError(
                 "Managed AWS profile worker context is required"
             )
-        with managed_aws_profile(params or {}, secrets, aws_profile_directory):
+        with managed_aws_profile(
+            params or {}, secrets, aws_profile_directory
+        ) as profile:
+            validate_aws_profile(profile)
             return _collect_in_worker(collector_name, job_id, managed, True)
     configured = params is not None or secrets is not None
     configuration = (
@@ -209,6 +214,8 @@ def _configured_worker_collect(
     # Install configuration before importing collectors or constructing pipelines:
     # both can resolve DLT settings. Always remove it, including on worker failure.
     with configuration:
+        if managed and collector_name == "aws":
+            validate_configured_aws_profiles()
         return _collect_in_worker(collector_name, job_id, managed, configured)
 
 
