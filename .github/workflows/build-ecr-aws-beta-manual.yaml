@@ -1,17 +1,12 @@
 name: Push Bundled OpenHound + AWS Beta Image to ECR
-run-name: AWS beta bundle — ${{ inputs.tag }} — ${{ inputs.source_ref }}
+run-name: AWS beta bundle — ${{ inputs.tag }} — ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Development version, e.g. 0.4.1.dev9346005 (without ecr-enterprise)"
+        description: "Development version, e.g. 0.5.0.dev9346005"
         required: true
-        type: string
-      source_ref:
-        description: "OpenHound source branch or commit to bundle"
-        required: true
-        default: main
         type: string
       aws_commit:
         description: "Full 40-character openhound-aws source commit SHA to bundle"
@@ -62,17 +57,10 @@ jobs:
       id-token: write
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout bundle build tooling
+      - name: Checkout OpenHound source and bundle build tooling
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # ratchet:actions/checkout@v6
         with:
           ref: ${{ github.sha }}
-          path: bundle
-          persist-credentials: false
-
-      - name: Checkout OpenHound source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # ratchet:actions/checkout@v6
-        with:
-          ref: ${{ inputs.source_ref }}
           path: source
           persist-credentials: false
 
@@ -84,6 +72,7 @@ jobs:
             ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}
           tags: |
             type=raw,prefix=ecr-enterprise,value=${{ inputs.tag }},enable=true
+            type=raw,value=candidate
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # ratchet:docker/setup-qemu-action@v4
@@ -115,9 +104,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # ratchet:docker/build-push-action@v7
         with:
           context: ./source
-          file: ./bundle/Dockerfile.aws-bundle
-          build-contexts: |
-            bundle=./bundle
+          file: ./source/Dockerfile.aws-bundle
           target: enterprise
           platforms: linux/amd64,linux/arm64
           push: true
@@ -127,4 +114,4 @@ jobs:
             OPENHOUND_VERSION=${{ inputs.tag }}
             OPENHOUND_AWS_COMMIT=${{ inputs.aws_commit }}
           secrets: |
-            OPENHOUND_AWS_GITHUB_TOKEN=${{ steps.openhound-aws-token.outputs.token }}
+            OPENHOUND_AWS_APP_TOKEN=${{ steps.openhound-aws-token.outputs.token }}

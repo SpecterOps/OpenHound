@@ -9,22 +9,37 @@ from importlib.metadata import version
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+import tomlkit
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 
 def patch_packaging(destination: Path, local_version: str) -> None:
-    """Keep the selected OpenHound build installed; reject changed AWS metadata."""
+    """Select the local OpenHound build while preserving other AWS requirements."""
     metadata = destination / "pyproject.toml"
-    text = metadata.read_text()
-    replacements = {
-        '"openhound==0.2.13"': (f'"openhound=={Version(local_version)}"', 2),
-        '"boto3==1.43.68"': ('"boto3>=1.43.90"', 1),
-    }
-    for old, (new, expected_count) in replacements.items():
-        if text.count(old) != expected_count:
-            raise ValueError(f"Unexpected AWS packaging metadata: {old}")
-        text = text.replace(old, new)
-    metadata.write_text(text)
+    document = tomlkit.parse(metadata.read_text())
+    project = document.get("project", {})
+    dependency_lists = [project.get("dependencies", [])]
+    dependency_lists.extend(project.get("optional-dependencies", {}).values())
+    dependency_lists.append(document.get("build-system", {}).get("requires", []))
+    dependency_lists.extend(document.get("dependency-groups", {}).values())
+    selected_version = Version(local_version)
+    for dependencies in dependency_lists:
+        for index, dependency in enumerate(dependencies):
+            # Dependency groups may also contain include-group tables.
+            if not isinstance(dependency, str):
+                continue
+            requirement = Requirement(dependency)
+            if canonicalize_name(requirement.name) == "openhound":
+                extras = (
+                    f"[{','.join(sorted(requirement.extras))}]"
+                    if requirement.extras
+                    else ""
+                )
+                marker = f"; {requirement.marker}" if requirement.marker else ""
+                dependencies[index] = f"openhound{extras}=={selected_version}{marker}"
+    metadata.write_text(tomlkit.dumps(document))
     # Maturin's root-level include does not place the manifest inside the Python
     # package, where CollectorManager reads it via importlib.resources.
     shutil.copyfile(
@@ -36,9 +51,9 @@ def patch_packaging(destination: Path, local_version: str) -> None:
 def main(commit: str) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("OPENHOUND_AWS_COMMIT must be a full, pinned commit SHA")
-    token = Path("/run/secrets/OPENHOUND_AWS_GITHUB_TOKEN").read_text().strip()
+    token = Path("/run/secrets/OPENHOUND_AWS_APP_TOKEN").read_text().strip()
     if not token:
-        raise ValueError("OPENHOUND_AWS_GITHUB_TOKEN must not be empty")
+        raise ValueError("OPENHOUND_AWS_APP_TOKEN must not be empty")
     request = Request(
         f"https://api.github.com/repos/SpecterOps/openhound-aws/tarball/{commit}",
         headers={
