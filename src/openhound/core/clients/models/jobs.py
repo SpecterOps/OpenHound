@@ -1,6 +1,9 @@
-from pydantic import BaseModel
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
+from uuid import UUID
+
+from pydantic import BaseModel
 
 
 class Job(BaseModel):
@@ -51,6 +54,42 @@ class JobsCurrent(BaseModel):
 
 class JobsEnd(BaseModel):
     data: Job
+
+
+class CollectorJob(BaseModel):
+    id: UUID
+    job_schedule_id: UUID | None
+    job_profile_id: UUID | None
+    job_type_id: int
+    job_key: str
+    version: str
+    params: dict[str, Any]
+    scope_client_id: UUID | None
+    external_secret_key_id: str | None
+    secret_key_id: str | None
+    priority: int
+    status: str
+    run_at: datetime
+    unclaimed_deadline_at: datetime
+    attempts: int
+    max_attempts: int
+    last_failure: str | None
+    claimed_by: UUID | None
+    claimed_at: datetime | None
+    claim_expires_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CollectorJobsAvailableData(BaseModel):
+    jobs: list[CollectorJob]
+
+
+class CollectorJobsAvailable(BaseModel):
+    count: int
+    skip: int
+    limit: int
+    data: CollectorJobsAvailableData
 
 
 class ManagementOperationType(StrEnum):

@@ -19,6 +19,8 @@ dependencies = [
     "jinja2>=3.1.6",
     "types-requests==2.33.0.20260503",
     "pydantic-extra-types>=2.11.1",
+    "boto3>=1.43.90",
+    "filelock>=3.32.0",
 ]
 
 [project.optional-dependencies]

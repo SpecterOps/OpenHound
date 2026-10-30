@@ -8,14 +8,255 @@ import os
 import re
 import sys
 import time
+import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
+from copy import copy
 from enum import Enum
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, TimedRotatingFileHandler
+from multiprocessing.managers import SyncManager
 from pathlib import Path
+from threading import RLock
+from typing import Any
 
 import dlt
-import openhound
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markup import escape
+
+import openhound
+from openhound.config import get_mode_defaults
+
+
+class _ValueRedactor(logging.Filter):
+    def __init__(self, values: tuple[str, ...]):
+        super().__init__()
+        self.values = tuple(value for value in values if value)
+        self.handlers: set[logging.Handler] = set()
+
+    def _redact(self, value):
+        if isinstance(value, str):
+            for secret in self.values:
+                value = value.replace(secret, "[REDACTED]")
+            return value
+        if isinstance(value, dict):
+            return {self._redact(k): self._redact(v) for k, v in value.items()}
+        if isinstance(value, (tuple, list)):
+            return type(value)(self._redact(item) for item in value)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return self._redact(str(value))
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Preserve argument types during interpolation, then redact the result.
+        record.msg = self._redact(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = self._redact(
+                "".join(traceback.format_exception(*record.exc_info))
+            )
+            # Rich handlers can format the exception again, including locals.
+            record.exc_info = None
+        record.__dict__.update(
+            self._redact(
+                {
+                    key: value
+                    for key, value in record.__dict__.items()
+                    if key not in ("msg", "args")
+                }
+            )
+        )
+        return True
+
+
+_active_redactors: list[_ValueRedactor] = []
+_worker_handler: "_WorkerQueueHandler | None" = None
+_worker_context: dict[str, Any] = {}
+_worker_extension: str | None = None
+
+
+class _WorkerQueueHandler(QueueHandler):
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        # QueueHandler's default prepare folds exceptions into msg and discards
+        # exc_text. Keep them separate for JSON/text/Rich and avoid duplication.
+        record = copy(record)
+        for key, value in _worker_context.items():
+            record.__dict__.setdefault(key, value)
+        if _worker_extension and record.name.split(".")[0] == "dlt":
+            record._openhound_extension = _worker_extension
+        # Normalize non-serializable extras and format exceptions in the worker.
+        # Redact the complete record before even the queue proxy serializes it.
+        _ValueRedactor(()).filter(record)
+        for redactor in _active_redactors:
+            redactor.filter(record)
+        return record
+
+
+def _install_worker_handlers() -> None:
+    assert _worker_handler is not None
+    root = logging.getLogger()
+    root.handlers[:] = [_worker_handler]
+    dlt_logger = logging.getLogger("dlt")
+    dlt_logger.handlers[:] = [_worker_handler]
+    dlt_logger.propagate = False
+    dlt_logger.disabled = False
+
+
+def configure_worker_logging(queue: Any, level: int) -> None:
+    """Executor initializer: workers forward, and only the parent owns files."""
+    global _worker_handler
+    loggers = [logging.getLogger(), *logging.Logger.manager.loggerDict.values()]
+    handlers = set()
+    for logger in loggers:
+        if isinstance(logger, logging.Logger):
+            handlers.update(logger.handlers)
+            logger.handlers.clear()
+            logger.propagate = True
+    for handler in handlers:
+        handler.close()
+    logger_override._file_handlers.clear()
+    _worker_handler = _WorkerQueueHandler(queue)
+    logging.getLogger().setLevel(level)
+    logging.getLogger("dlt").setLevel(level)
+    # Queue proxy connection diagnostics must never recurse into that same queue.
+    multiprocessing_logger = logging.getLogger("multiprocessing")
+    multiprocessing_logger.handlers[:] = [logging.NullHandler()]
+    multiprocessing_logger.propagate = False
+    _install_worker_handlers()
+
+
+@contextmanager
+def worker_log_context(job_id: int | str, collector: str) -> Iterator[None]:
+    global _worker_context, _worker_extension
+    previous, extension = _worker_context, _worker_extension
+    _worker_context = {"job_id": job_id, "collector_extension": collector}
+    _worker_extension = None
+    try:
+        yield
+    finally:
+        _worker_context, _worker_extension = previous, extension
+
+
+def _destination(handler: logging.Handler) -> Any:
+    if isinstance(handler, logging.FileHandler):
+        return ("file", handler.baseFilename)
+    if isinstance(handler, RichHandler):
+        return ("stream", id(handler.console.file))
+    if isinstance(handler, logging.StreamHandler):
+        return ("stream", id(handler.stream))
+    return ("handler", id(handler))
+
+
+class _ParentWorkerHandler(logging.Handler):
+    def __init__(self, configuration: "CustomLogger"):
+        super().__init__()
+        self.configuration = configuration
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Read current destinations so parent-only handlers and reconfiguration
+        # take effect for workers too. Always include the main destinations,
+        # including for DLT's normally non-propagating logger.
+        handlers = list(logging.getLogger().handlers)
+        logger = logging.getLogger(record.name)
+        while logger.parent is not None:
+            handlers.extend(logger.handlers)
+            if not logger.propagate:
+                break
+            logger = logger.parent
+        extension = getattr(record, "_openhound_extension", None)
+        if extension:
+            config = self.configuration
+            try:
+                path = config._is_valid_path(
+                    config.base_path, config.base_path / f"ext_{extension}.log"
+                )
+                handlers.append(config._get_file_handler(path))
+            except (ValueError, OSError):
+                # Main destinations still receive the record if an optional
+                # extension file is unavailable. Never report supplied paths.
+                sys.stderr.write("OpenHound could not open worker extension log\n")
+        seen = set()
+        for handler in handlers:
+            destination = _destination(handler)
+            if destination not in seen and record.levelno >= handler.level:
+                seen.add(destination)
+                try:
+                    handler.handle(record)
+                except Exception:  # noqa: BLE001 - isolate arbitrary parent handlers
+                    # One custom destination must not kill the listener thread
+                    # and strand every other worker logging destination.
+                    sys.stderr.write("OpenHound worker logging destination failed\n")
+
+
+class WorkerLogRouter:
+    """Parent-owned logging resources for one scheduler, across pool resets.
+
+    A manager-backed multiprocessing queue has no worker feeder thread or shared
+    write lock: killing a producer cannot corrupt the listener's input pipe.
+    Its server and listener are explicitly stopped after all executors exit.
+    """
+
+    def __init__(self, context: Any, configuration: "CustomLogger | None" = None):
+        self.context = context
+        self.configuration = configuration or logger_override
+        self.manager: SyncManager | None = None
+        self.listener: QueueListener | None = None
+        self._queue: Any = None
+
+    @property
+    def queue(self) -> Any:
+        if self.manager is None:
+            self.manager = SyncManager(ctx=self.context)
+            try:
+                self.manager.start()
+                self._queue = self.manager.Queue()
+                self.listener = QueueListener(
+                    self._queue, _ParentWorkerHandler(self.configuration)
+                )
+                self.listener.start()
+            except BaseException:
+                self.close()
+                raise
+        return self._queue
+
+    def close(self) -> None:
+        # Workers have exited before the sentinel; synchronous proxy puts mean
+        # every completed log submission is already ahead of it in the queue.
+        try:
+            if self.listener is not None:
+                self.listener.stop()
+        finally:
+            self.listener = None
+            if self.manager is not None and hasattr(self.manager, "shutdown"):
+                self.manager.shutdown()
+            self.manager = None
+            self._queue = None
+
+
+def _protect_handler[H: logging.Handler](handler: H) -> H:
+    for redactor in _active_redactors:
+        handler.addFilter(redactor)
+        redactor.handlers.add(handler)
+    return handler
+
+
+@contextmanager
+def redact_log_values(values: tuple[str, ...]) -> Iterator[None]:
+    """Protect current and newly configured OpenHound handlers for one worker."""
+    redactor = _ValueRedactor(values)
+    _active_redactors.append(redactor)
+    loggers = [logging.getLogger(), *logging.Logger.manager.loggerDict.values()]
+    for logger in loggers:
+        if isinstance(logger, logging.Logger):
+            for handler in logger.handlers:
+                _protect_handler(handler)
+    try:
+        yield
+    finally:
+        _active_redactors.remove(redactor)
+        for handler in redactor.handlers:
+            handler.removeFilter(redactor)
+
 
 VALID_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
@@ -101,7 +342,11 @@ class RotatingFileHandler(TimedRotatingFileHandler):
             #     self.stream = self._open()
             #     size = self.stream.seek(0, os.SEEK_END)
 
-            base_file_size = os.path.getsize(self.baseFilename)
+            base_file_size = (
+                os.path.getsize(self.baseFilename)
+                if os.path.exists(self.baseFilename)
+                else 0
+            )
             if base_file_size >= self.max_bytes:
                 self._size_triggered = True
                 return True
@@ -145,7 +390,9 @@ class OpenHoundJSONFormatter(logging.Formatter):
             "openhound_version": openhound.__version__,
         }
 
-        if record.exc_info:
+        if record.exc_text:
+            log_data["exception"] = record.exc_text
+        elif record.exc_info:
             log_data["exception"] = self.formatException(record.exc_info)
 
         for key, value in record.__dict__.items():
@@ -193,7 +440,9 @@ class OpenHoundTextFormatter(logging.Formatter):
             extra_str = " ".join(f"{key}={value}" for key, value in extras.items())
             log_line = f"{log_line} | {extra_str}"
 
-        if record.exc_info:
+        if record.exc_text:
+            log_line = f"{log_line}\n{record.exc_text}"
+        elif record.exc_info:
             log_line = f"{log_line}\n{self.formatException(record.exc_info)}"
 
         return log_line
@@ -212,6 +461,10 @@ class OpenHoundRichFormatter(logging.Formatter):
             str: A formatted string for Rich logging
         """
         log_fmt = f"time={self.formatTime(record, '%Y-%m-%d %H:%M:%S')}, msg={record.getMessage()} (openhound_version={openhound.__version__})"
+        if record.exc_text and not record.exc_info:
+            # The redactor cleared exc_info, so Rich cannot render the original.
+            # Treat the sanitized traceback (including [REDACTED]) as literal text.
+            log_fmt = f"{log_fmt}\n{escape(record.exc_text)}"
         return log_fmt
 
 
@@ -226,7 +479,7 @@ class CustomLogger:
         interval: int = 1,
         cli_level: str = "ERROR",
         base_path: str | None = None,
-        log_format: str = "text",
+        log_format: str | None = None,
     ):
         self.level = level
         self.name = name
@@ -237,14 +490,16 @@ class CustomLogger:
         self.backup_count = backup_count
         self.interval = interval
         self.cli_level = cli_level
-        self.log_format = log_format
+        self._log_format_override = log_format
+        self.log_format = self._validate_format(log_format or "text")
 
         self.base_path = Path(base_path) if base_path else self.default_platform_path()
         self.log_file_path: Path | None = None
 
         # Share one rotating handler per file across loggers; opening the same file
         # with multiple handlers breaks rotation on Windows (WinError 32).
-        self._file_handlers: dict[Path, "RotatingFileHandler"] = {}
+        self._file_handlers: dict[Path, RotatingFileHandler] = {}
+        self._file_handler_lock = RLock()
 
         self.handlers = {
             LogMode.CLI: self.cli_handlers,
@@ -315,6 +570,11 @@ class CustomLogger:
         Args:
             name (str): Name of the extension or pipeline to create a specific logger for
         """
+        global _worker_extension
+        if _worker_handler is not None:
+            _worker_extension = name
+            _install_worker_handlers()
+            return
         log_file_path = self.base_path / f"ext_{name}.log"
         valid_path = self._is_valid_path(self.base_path, log_file_path)
         self.dlt_logger.setLevel(self.root_logger.level)
@@ -324,6 +584,10 @@ class CustomLogger:
 
     def setup(self) -> None:
         """Set the correct logging handler based on the detected mode"""
+
+        if _worker_handler is not None:
+            _install_worker_handlers()
+            return
 
         # Get values from DLT config if set
         dlt_level = dlt.config.get("runtime.log_level", str)
@@ -342,8 +606,10 @@ class CustomLogger:
         self.cli_level = self._validate_level(
             dlt_cli_level or self.cli_level, default="ERROR"
         )
+        mode_log_format = get_mode_defaults().log_format
         self.log_format = self._validate_format(
-            dlt_log_format or self.log_format, default="text"
+            dlt_log_format or self._log_format_override or mode_log_format,
+            default=mode_log_format,
         )
 
         # Override the base path if log_path is set in DLT config, otherwise use the default platform path
@@ -386,6 +652,7 @@ class CustomLogger:
             interval=self.interval,
             backupCount=self.backup_count,
             max_bytes=self.max_bytes,
+            delay=True,
         )
         rotating_file_handler.setFormatter(self._file_formatter())
         # This regular expression overrides the default extMatch to recognize both
@@ -398,11 +665,18 @@ class CustomLogger:
     def _get_file_handler(self, file_path: Path) -> "RotatingFileHandler":
         """Return a shared rotating file handler for the path (one open file per path)."""
         key = Path(file_path).resolve()
-        handler = self._file_handlers.get(key)
-        if handler is None:
-            handler = self._build_file_handler(file_path)
-            self._file_handlers[key] = handler
-        return handler
+        # Parent reconfiguration and the worker listener can request the same
+        # extension file concurrently. Keep a single rotation owner per path.
+        with self._file_handler_lock:
+            handler = self._file_handlers.get(key)
+            if handler is None:
+                handler = self._build_file_handler(file_path)
+                self._file_handlers[key] = handler
+            else:
+                # setup() may be called again after configuration changes. Keep a
+                # cached handler's formatter aligned with the newly resolved mode.
+                handler.setFormatter(self._file_formatter())
+            return _protect_handler(handler)
 
     def container_handlers(self, logger: logging.Logger, file_path: Path) -> None:
         """Set the logging handler/format when running in a container"""
@@ -413,7 +687,7 @@ class CustomLogger:
         # Output is human-readable text by default; set runtime.log_format = "JSON" for structured JSON.
         stdout_handler = logging.StreamHandler(sys.stdout)
         stdout_handler.setFormatter(formatter)
-        logger.addHandler(stdout_handler)
+        logger.addHandler(_protect_handler(stdout_handler))
 
         # But also log the same format to a file for persistence and debugging when needed
         logger.addHandler(self._get_file_handler(file_path))
@@ -433,7 +707,7 @@ class CustomLogger:
             rich_tracebacks=True,
         )
         console_handler.setFormatter(rich_formatter)
-        logger.addHandler(console_handler)
+        logger.addHandler(_protect_handler(console_handler))
 
         # But also save the logs to a file using the configured format (text by default)
         logger.addHandler(self._get_file_handler(file_path))

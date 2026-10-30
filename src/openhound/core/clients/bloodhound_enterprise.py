@@ -6,19 +6,25 @@ import logging
 import math
 import socket
 import time
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Any, BinaryIO, TypeVar
+from urllib.parse import quote
+from uuid import UUID
 
-import openhound
 import requests
+
+from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound import BloodHound, BloodHoundHTTPError
 from openhound.core.clients.models.jobs import (
+    ArtifactUploadSession,
+    CollectorJob,
+    CollectorJobsAvailable,
     JobsAvailable,
     JobsCurrent,
     JobsEnd,
     JobStart,
-    ArtifactUploadSession,
     ManagementAvailable,
     ManagementOperationResult,
     ManagementOperationStatus,
@@ -32,16 +38,90 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+class ManagedJobOutcome(str, Enum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+MANAGED_JOB_END_MAX_ATTEMPTS = 4
+MANAGED_JOB_END_RETRY_DELAY_SECONDS = 2
+MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS = 10
+MANAGED_JOB_END_READ_TIMEOUT_SECONDS = 120
+MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS = 10
+MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS = 20
 SUPPORT_BUNDLE_PART_SIZE = 8 * 1024 * 1024  # 8 MiB
 SUPPORT_BUNDLE_MAX_RETRIES = 3
 SUPPORT_BUNDLE_RETRY_DELAY_SECONDS = 2
 SUPPORT_BUNDLE_CONNECT_TIMEOUT_SECONDS = 10
 SUPPORT_BUNDLE_READ_TIMEOUT_SECONDS = 120
+MANAGED_COLLECTOR_JOB_AVAILABLE_CONNECT_TIMEOUT_SECONDS = 10
+MANAGED_COLLECTOR_JOB_AVAILABLE_READ_TIMEOUT_SECONDS = 20
+MANAGED_JOB_CLAIM_MAX_ATTEMPTS = 4
+MANAGED_JOB_CLAIM_RETRY_DELAY_SECONDS = 2
+MANAGED_JOB_CLAIM_CONNECT_TIMEOUT_SECONDS = 10
+MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS = 20
 
 T = TypeVar("T")
 
 
+def _safe_managed_request_error(error: Exception) -> Exception:
+    """Preserve actionable status/type without exposing provider response content."""
+    if isinstance(error, BloodHoundHTTPError):
+        return BloodHoundHTTPError("Managed collector request failed", error.code)
+    if isinstance(error, requests.RequestException):
+        return type(error)("Managed collector request failed")
+    return RuntimeError("Managed collector request failed")
+
+
 class BloodHoundEnterprise(BloodHound):
+    def __init__(
+        self,
+        token_key: str,
+        token_id: str,
+        bhe_uri: str = "http://localhost:8000",
+        credential_refresh: Callable[[], BHECredentials] | None = None,
+    ) -> None:
+        super().__init__(token_key=token_key, token_id=token_id, bhe_uri=bhe_uri)
+        self._credential_refresh = credential_refresh
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | BinaryIO | None = None,
+        extra_headers: dict[str, str] | None = None,
+        timeout: tuple[float, float] | None = None,
+    ):
+        """Make a BHE request, refreshing managed credentials once after a 401."""
+        position = (
+            body.tell() if body is not None and not isinstance(body, bytes) else None
+        )
+        try:
+            return super().request(
+                method=method,
+                path=path,
+                body=body,
+                extra_headers=extra_headers,
+                timeout=timeout,
+            )
+        except BloodHoundHTTPError as error:
+            if error.code != 401 or self._credential_refresh is None:
+                raise
+
+        if body is not None and not isinstance(body, bytes) and position is not None:
+            body.seek(position)
+        logger.info("BHE authentication failed; refreshing managed credentials.")
+        credentials = self._credential_refresh()
+        self.token_key = credentials.token_key
+        self.token_id = credentials.token_id
+        return super().request(
+            method=method,
+            path=path,
+            body=body,
+            extra_headers=extra_headers,
+            timeout=timeout,
+        )
+
     @property
     def jobs_available(self) -> JobsAvailable:
         path = "/api/v2/jobs/available"
@@ -53,6 +133,88 @@ class BloodHoundEnterprise(BloodHound):
         path = "/api/v2/jobs/current"
         response = self.request(method="GET", path=path)
         return JobsCurrent.model_validate(response.json())
+
+    def available_collector_jobs(self, job_key: str) -> CollectorJobsAvailable:
+        """Return the next job from BHE's managed collector queue.
+
+        This endpoint is used only by managed OpenHound deployments and is not
+        part of the standard open-source/self-hosted collector workflow.
+        """
+        encoded_job_key = quote(f"eq:{job_key}", safe="")
+        path = (
+            "/api/v2/collie-job-queue/available?limit=1&job_key="
+            f"{encoded_job_key}&sort_by=-priority&sort_by=created_at"
+        )
+        logger.debug(
+            "Polling managed collector job queue.",
+            extra={"endpoint": path, "job_key": job_key},
+        )
+        try:
+            response = self.request(
+                method="GET",
+                path=path,
+                timeout=(
+                    MANAGED_COLLECTOR_JOB_AVAILABLE_CONNECT_TIMEOUT_SECONDS,
+                    MANAGED_COLLECTOR_JOB_AVAILABLE_READ_TIMEOUT_SECONDS,
+                ),
+            )
+        except (BloodHoundHTTPError, requests.RequestException) as error:
+            logger.error(
+                "Managed collector job queue request failed.",
+                extra={"endpoint": path, "job_key": job_key},
+            )
+            raise _safe_managed_request_error(error) from None
+        try:
+            return CollectorJobsAvailable.model_validate(response.json())
+        except (ValueError, TypeError, KeyError):
+            raise RuntimeError("Invalid managed collector queue response") from None
+
+    def claim_managed_job(self, job_id: str) -> CollectorJob:
+        """Claim job from BHE's managed collector job queue.
+
+        This is used only by managed OpenHound deployments and is not
+        part of the standard open-source/self-hosted collector workflow.
+        """
+        path = f"/api/v2/collie-job-queue/{job_id}/claim"
+        for attempt in range(1, MANAGED_JOB_CLAIM_MAX_ATTEMPTS + 1):
+            context = {
+                "endpoint": path,
+                "job_id": job_id,
+                "attempt": attempt,
+                "max_attempts": MANAGED_JOB_CLAIM_MAX_ATTEMPTS,
+            }
+            logger.debug("Sending managed collector claim request.", extra=context)
+            try:
+                response = self.request(
+                    method="POST",
+                    path=path,
+                    timeout=(
+                        MANAGED_JOB_CLAIM_CONNECT_TIMEOUT_SECONDS,
+                        MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS,
+                    ),
+                )
+            except Exception as error:  # noqa: BLE001 - redact provider errors
+                retryable = self._is_transient_request_error(
+                    error, (requests.ConnectionError, requests.Timeout)
+                )
+                logger.debug(
+                    "Managed collector claim request failed.",
+                    extra={
+                        **context,
+                        "retryable": retryable,
+                        "status_code": getattr(error, "code", None),
+                    },
+                )
+                if not retryable or attempt == MANAGED_JOB_CLAIM_MAX_ATTEMPTS:
+                    raise _safe_managed_request_error(error) from None
+                time.sleep(MANAGED_JOB_CLAIM_RETRY_DELAY_SECONDS)
+                continue
+            try:
+                return CollectorJob.model_validate(response.json()["data"]["job"])
+            except (ValueError, TypeError, KeyError):
+                raise RuntimeError("Invalid managed collector claim response") from None
+
+        raise AssertionError("Managed collector claim retry loop exited unexpectedly.")
 
     def start_job(self, job_id: int) -> JobStart:
         path = "/api/v2/jobs/start"
@@ -67,6 +229,122 @@ class BloodHoundEnterprise(BloodHound):
         response = self.request(method="POST", path=path, body=job_content.encode())
         return JobsEnd.model_validate(response.json())
 
+    def start_collector_job(self, job_id: str) -> None:
+        """Move a claimed managed collector job to running."""
+        self.request(
+            method="POST",
+            path=f"/api/v2/collie-job-queue/{job_id}/start",
+            timeout=(
+                MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
+                MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
+            ),
+        )
+
+    def heartbeat_collector_job(self, job_id: str) -> None:
+        """Renew the claim for a running managed collector job."""
+        self.request(
+            method="POST",
+            path=f"/api/v2/collie-job-queue/{job_id}/heartbeat",
+            timeout=(
+                MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
+                MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
+            ),
+        )
+
+    def end_managed_job(
+        self,
+        job_id: str,
+        outcome: ManagedJobOutcome,
+        failure_message: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """End a claimed managed collector job."""
+        path = f"/api/v2/collie-job-queue/{job_id}/end"
+        payload: dict[str, Any] = {"outcome": outcome.value}
+        if failure_message is not None:
+            payload["failure_message"] = failure_message
+        if metadata is not None:
+            payload["metadata"] = metadata
+        body = json.dumps(payload).encode()
+        for attempt in range(1, MANAGED_JOB_END_MAX_ATTEMPTS + 1):
+            log_context = {
+                "job_id": job_id,
+                "outcome": outcome.value,
+                "attempt": attempt,
+                "max_attempts": MANAGED_JOB_END_MAX_ATTEMPTS,
+            }
+            logger.info(
+                "Attempting to end managed collector job %s (%s/%s).",
+                job_id,
+                attempt,
+                MANAGED_JOB_END_MAX_ATTEMPTS,
+                extra=log_context,
+            )
+            logger.debug(
+                "Sending managed collector end-job request.",
+                extra={
+                    **log_context,
+                    "endpoint": path,
+                    "has_failure_message": failure_message is not None,
+                    "has_metadata": metadata is not None,
+                },
+            )
+
+            try:
+                self.request(
+                    method="POST",
+                    path=path,
+                    body=body,
+                    timeout=(
+                        MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS,
+                        MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
+                    ),
+                )
+            except Exception as error:  # noqa: BLE001 - redact provider errors
+                if isinstance(error, BloodHoundHTTPError) and error.code == 404:
+                    logger.info(
+                        "Managed collector job is no longer actionable; discarding local state.",
+                        extra=log_context,
+                    )
+                    return
+                retryable = self._is_transient_request_error(
+                    error,
+                    (requests.ConnectionError, requests.Timeout),
+                )
+                logger.info(
+                    "Managed collector job %s end attempt failed.",
+                    job_id,
+                    extra={**log_context, "retryable": retryable},
+                )
+                logger.debug(
+                    "Managed collector job end request failed.",
+                    extra={
+                        **log_context,
+                        "retryable": retryable,
+                        "status_code": getattr(error, "code", None),
+                    },
+                )
+
+                if not retryable or attempt == MANAGED_JOB_END_MAX_ATTEMPTS:
+                    raise _safe_managed_request_error(error) from None
+
+                logger.debug(
+                    "Retrying managed collector job end request in %s seconds.",
+                    MANAGED_JOB_END_RETRY_DELAY_SECONDS,
+                    extra={
+                        **log_context,
+                        "retry_delay_seconds": MANAGED_JOB_END_RETRY_DELAY_SECONDS,
+                    },
+                )
+                time.sleep(MANAGED_JOB_END_RETRY_DELAY_SECONDS)
+            else:
+                logger.info(
+                    "Managed collector job %s ended successfully.",
+                    job_id,
+                    extra=log_context,
+                )
+                return
+
     def ingest(self, data: str) -> None:
         path = "/api/v2/ingest"
         headers = {
@@ -76,6 +354,30 @@ class BloodHoundEnterprise(BloodHound):
         compressed_data = gzip.compress(data.encode())
         self.request(
             method="POST", path=path, body=compressed_data, extra_headers=headers
+        )
+
+    def upload_collector_job_data(
+        self,
+        collector_job_id: UUID | str,
+        data: bytes | BinaryIO,
+        content_type: str = "application/json",
+        content_encoding: str | None = None,
+    ) -> None:
+        """Upload one data file before ending a running managed queue job.
+
+        Media type and encoding must match the supplied file. Credentials are
+        refreshed through the same request path used by other managed calls.
+        """
+        job_id = UUID(str(collector_job_id))
+        headers = {"Content-Type": content_type}
+        if content_encoding is not None:
+            headers["Content-Encoding"] = content_encoding
+        self.request(
+            method="POST",
+            path=f"/api/v2/collie-job-queue/{job_id}/ingest",
+            body=data,
+            extra_headers=headers,
+            timeout=(10, 120),
         )
 
     @property
@@ -218,8 +520,11 @@ class BloodHoundEnterprise(BloodHound):
         return digest.hexdigest()
 
     @staticmethod
-    def _is_transient_support_bundle_error(error: Exception) -> bool:
-        if isinstance(error, requests.RequestException):
+    def _is_transient_request_error(
+        error: Exception,
+        retryable_request_errors: tuple[type[requests.RequestException], ...],
+    ) -> bool:
+        if isinstance(error, retryable_request_errors):
             return True
         return isinstance(error, BloodHoundHTTPError) and error.code in {
             408,
@@ -237,7 +542,10 @@ class BloodHoundEnterprise(BloodHound):
             try:
                 return request()
             except Exception as error:
-                if not self._is_transient_support_bundle_error(error):
+                if not self._is_transient_request_error(
+                    error,
+                    (requests.RequestException,),
+                ):
                     raise
                 if retry == SUPPORT_BUNDLE_MAX_RETRIES:
                     raise

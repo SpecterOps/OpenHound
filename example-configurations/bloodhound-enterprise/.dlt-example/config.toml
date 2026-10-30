@@ -1,4 +1,14 @@
 # Example configuration: https://bloodhound.specterops.io/openhound/enterprise#full-configuration-example
+[openhound]
+managed = false
+
+# Managed deployments read BHE HMAC credentials from AWS Secrets Manager rather
+# than secrets.toml. The named secret must be a JSON object with token_id and
+# token_key fields. poll_interval controls the BHE scheduler cadence in seconds.
+# [openhound.aws_secrets_manager]
+# secret_name = "openhound/bhe-credentials"
+# poll_interval = 30
+
 [runtime]
 http_show_error_body = true
 log_cli_level = "WARNING"
@@ -10,8 +20,9 @@ request_max_attempts = 15
 request_backoff_factor = 1.3
 request_max_retry_delay = 900
 
-# Default: logs are set to human readable text
-# To switch to structured JSON instead, uncomment the line below (must be uppercase "JSON")
+# Self-managed mode defaults to human-readable text; managed mode defaults to
+# structured JSON. To override either default, uncomment the line below (DLT
+# requires the value to be uppercase "JSON").
 # log_format = "JSON"
 
 # BHE destination URL (non-sensitive; tokens go in secrets.toml)
