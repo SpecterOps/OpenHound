@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Development version, e.g. 0.5.0.dev9346005"
+        description: "Release-candidate image tag, e.g. 0.5.0-rc9346008"
         required: true
         type: string
       aws_commit:
@@ -64,6 +64,15 @@ jobs:
           path: source
           persist-credentials: false
 
+      - name: Validate release-candidate tag
+        env:
+          IMAGE_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$IMAGE_TAG" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc(0|[1-9][0-9]*)$ ]]; then
+            echo "Expected a release-candidate tag such as 0.5.0-rc9346008" >&2
+            exit 1
+          fi
+
       - name: Generate Metadata
         id: metadata
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # ratchet:docker/metadata-action@v5
@@ -71,7 +80,7 @@ jobs:
           images: |
             ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}
           tags: |
-            type=raw,prefix=ecr-enterprise,value=${{ inputs.tag }},enable=true
+            type=raw,value=${{ inputs.tag }}
             type=raw,value=candidate
 
       - name: Set up QEMU
