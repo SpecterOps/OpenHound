@@ -52,6 +52,137 @@ Follow the docs for setup, CLI usage, and collector development:
 
 - **Convert**: The raw resources are read from disk and converted to OpenGraph nodes and edges.
 
+## Uploading to BloodHound
+
+BloodHound needs two things from a collector: the extension **schema**, which describes the node and
+relationship kinds, and the **collection**, which is the data itself. OpenHound can send both.
+
+### Configure where BloodHound is
+
+Put the BloodHound address in `.dlt/config.toml` and the credentials in `.dlt/secrets.toml`, under the
+`destination.bloodhound` section. This is the same section the saved-search and privilege-zone uploads use.
+Use an API token pair (created under *My Profile → API Key Management* in BloodHound) or a bearer token from
+a signed-in session.
+
+```toml
+# .dlt/config.toml
+[destination.bloodhound]
+url = "http://localhost:8080"
+```
+
+```toml
+# .dlt/secrets.toml, with an API token pair...
+[destination.bloodhound]
+token_id = "..."
+token_key = "..."
+
+# ...or with a bearer token instead
+[destination.bloodhound]
+token = "..."
+```
+
+As environment variables these are `DESTINATION__BLOODHOUND__URL`, `DESTINATION__BLOODHOUND__TOKEN_ID`,
+`DESTINATION__BLOODHOUND__TOKEN_KEY`, and `DESTINATION__BLOODHOUND__TOKEN`. The token pair is used when both
+halves are present; otherwise the bearer token is used.
+
+When `destination.bloodhound` holds no credentials, the upload commands read the
+`destination.bloodhoundenterprise` section, the one Enterprise ingest uses. `convert --method ingest` to
+Enterprise reads `destination.bloodhoundenterprise`.
+
+### Install or update a schema
+
+```console
+# One schema file, or a zip bundle containing schema.json
+openhound schema upload ./schema.json
+openhound schema upload ./my-extension-bundle.zip
+
+# Every .json and .zip file in a folder
+openhound schema upload ./schemas
+
+# The schema.json that an installed collector ships next to its extension.yaml
+openhound schema upload sccm
+
+# Check the files without contacting BloodHound
+openhound schema upload ./schemas --dry-run
+```
+
+The command prints one line per file (`created`, `updated`, `skipped`, or `failed`) and exits with
+status 1 when any file failed. BloodHound matches extensions by the `schema.name` field, so uploading a
+changed file with the same name updates the existing extension.
+
+Collectors that want `openhound schema upload <name>` to work should ship their schema as `schema.json`
+in the same package folder as `extension.yaml`.
+
+### Upload a collection
+
+After `openhound convert` has written OpenGraph JSON files, send them to BloodHound:
+
+```console
+# An OpenHound convert output folder (every .json and .zip directly inside it)
+openhound graph upload ./out/graph
+
+# A single OpenGraph JSON file, or a zip of them such as ConfigManBearPig's bundle
+openhound graph upload ./out/graph/users-1.json
+openhound graph upload ./out/configmanbearpig_collection.zip
+
+# Check the files without contacting BloodHound
+openhound graph upload ./out/graph --dry-run
+
+# Return as soon as the files are sent instead of waiting for BloodHound to process them
+openhound graph upload ./out/graph --no-wait
+
+# Cut large JSON files into parts of at most 2,000 nodes plus edges (default 5,000; 0 sends each file whole)
+openhound graph upload ./out/graph --batch-size 2000
+
+# Send JSON files uncompressed (they are gzip-compressed by default)
+openhound graph upload ./out/graph --no-compress
+```
+
+The command opens one BloodHound file-upload job, attaches every file to it, and ends the job. It
+prints one line per file (`uploaded`, `skipped`, or `failed`) and the job number. By default it then
+waits, for up to ten minutes (`--timeout`), until BloodHound reports the job complete and prints the
+result. It exits with status 1 when any file failed or the job did not complete. Progress is also
+visible under *Administration → File Ingest* in BloodHound.
+
+Each JSON file is checked locally before anything is sent: it must parse and must have a top-level
+`graph` section. JSON files are gzip-compressed before sending, which makes large collections much
+smaller on the wire; BloodHound unpacks them on arrival. Zip files are already compressed, so they are
+sent as they are and checked by BloodHound.
+
+A JSON file with more than `--batch-size` nodes plus edges (default 5,000) is cut into parts that are
+all attached to the same job. Each part keeps the file's `metadata` section, and all node parts are sent
+before any edge part. Parts are named `<file>.part-0001.json`, `<file>.part-0002.json`, and so on. Zip
+files cannot be cut and are always sent whole.
+
+### Convert straight into BloodHound
+
+`openhound convert` can send its output to BloodHound instead of writing files, with `--method ingest`:
+
+```console
+openhound convert <collector> ./collected/<collector> ./unused --method ingest
+```
+
+The output folder argument is required but not used with `--method ingest`; nothing is written to it.
+The default, `--method write`, saves OpenGraph JSON files to the output folder.
+
+OpenHound asks the configured BloodHound which edition it is and sends the data the way that edition
+expects:
+
+- **Community Edition**: the settings come from `destination.bloodhound`, or from
+  `destination.bloodhoundenterprise` when `destination.bloodhound` holds no credentials (see
+  [Configure where BloodHound is](#configure-where-bloodhound-is)). The run opens one BloodHound
+  file-upload job, attaches every batch of 1,000 converted items to it as a gzip-compressed OpenGraph
+  file, and ends the job. Each file carries the collector's source kind in its `metadata` section, so
+  the data can later be removed by source kind under *Administration → Database Management*. The command
+  does not wait for BloodHound to process the job; watch it under *Administration → File Ingest*.
+  BloodHound runs its analysis once, after the job ends. If the conversion fails part-way, the job is
+  ended anyway, so BloodHound processes whatever arrived.
+- **Enterprise**: the data goes to `/api/v2/ingest` using the `destination.bloodhoundenterprise`
+  settings. OpenHound also takes this route when the edition cannot be determined: neither section
+  holds credentials, or BloodHound cannot be reached or does not answer the question.
+
+The Enterprise scheduler service always takes the Enterprise route.
+
 ## Available extensions
 
 Extend OpenHound with pre-built extensions for other services. Additional collectors can be installed
