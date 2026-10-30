@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Development version, e.g. 0.4.1.dev9346005 (without ecr-enterprise)"
+        description: "Development version, e.g. 0.5.0.dev9346005"
         required: true
         type: string
       aws_commit:
@@ -72,6 +72,7 @@ jobs:
             ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}
           tags: |
             type=raw,prefix=ecr-enterprise,value=${{ inputs.tag }},enable=true
+            type=raw,value=candidate
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # ratchet:docker/setup-qemu-action@v4
