@@ -68,11 +68,12 @@ Replace `main` with the OpenHound branch to build. Add
 extension changes, run again with the desired SHA and a new development version.
 
 Bundle preparation updates the AWS extension's OpenHound requirements to the
-selected OpenHound build version, regardless of the original version pins. Other
-requirements, including boto3, are preserved and resolved against the frozen
-OpenHound build environment. Incompatible requirements fail the build before the
-image tag is published to ECR; reconcile the dependency requirements before
-retrying.
+selected OpenHound build version, regardless of the original version pins. It
+also pins the extension's boto3 requirements to the SDK version already installed
+by OpenHound's frozen dependency sync, regardless of the original AWS bounds.
+The helper reads the installed version rather than hard-coding an SDK version.
+Other requirements are preserved. Dependency resolution and `uv pip check` still
+run before publication; unresolved conflicts fail the build.
 
 ## Deployment guidance
 

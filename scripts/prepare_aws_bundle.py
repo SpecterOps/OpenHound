@@ -16,7 +16,7 @@ from packaging.version import Version
 
 
 def patch_packaging(destination: Path, local_version: str) -> None:
-    """Select the local OpenHound build while preserving other AWS requirements."""
+    """Align AWS OpenHound and boto3 requirements with the frozen build environment."""
     metadata = destination / "pyproject.toml"
     document = tomlkit.parse(metadata.read_text())
     project = document.get("project", {})
@@ -24,21 +24,26 @@ def patch_packaging(destination: Path, local_version: str) -> None:
     dependency_lists.extend(project.get("optional-dependencies", {}).values())
     dependency_lists.append(document.get("build-system", {}).get("requires", []))
     dependency_lists.extend(document.get("dependency-groups", {}).values())
-    selected_version = Version(local_version)
+    selected_versions = {"openhound": Version(local_version)}
     for dependencies in dependency_lists:
         for index, dependency in enumerate(dependencies):
             # Dependency groups may also contain include-group tables.
             if not isinstance(dependency, str):
                 continue
             requirement = Requirement(dependency)
-            if canonicalize_name(requirement.name) == "openhound":
+            name = canonicalize_name(requirement.name)
+            if name in {"openhound", "boto3"}:
+                if name not in selected_versions:
+                    selected_versions[name] = Version(version(name))
                 extras = (
                     f"[{','.join(sorted(requirement.extras))}]"
                     if requirement.extras
                     else ""
                 )
                 marker = f"; {requirement.marker}" if requirement.marker else ""
-                dependencies[index] = f"openhound{extras}=={selected_version}{marker}"
+                dependencies[index] = (
+                    f"{name}{extras}=={selected_versions[name]}{marker}"
+                )
     metadata.write_text(tomlkit.dumps(document))
     # Maturin's root-level include does not place the manifest inside the Python
     # package, where CollectorManager reads it via importlib.resources.
