@@ -76,7 +76,11 @@ class EdgeProperties:
     """Core model specifying required fields for an OpenGraph edge properties."""
 
     composed: bool = field(default=False, kw_only=True)
-    traversable: bool = field(default=False, kw_only=True)
+    traversable: bool | None = field(default=None, kw_only=True)
+
+    def __post_init__(self):
+        """Accept but discard traversable properties. None will be discarded during conversion."""
+        self.traversable = None
 
 
 @dataclass
