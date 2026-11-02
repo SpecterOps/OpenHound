@@ -36,23 +36,31 @@ def preprocess(extension: OpenHound) -> list[str]:
     return extracted_resources(load_info)
 
 
-def convert(extension: OpenHound) -> list[str]:
+def convert(extension: OpenHound, output_path: Path | None = None) -> list[str]:
+    options = {}
+    if output_path is not None:
+        options["output_path"] = output_path
     load_info = extension.converter(
         input_path=Path("/tmp/openhound") / extension.name,
-        method=Method.ingest,  # type: ignore
+        method=Method.write if output_path is not None else Method.ingest,  # type: ignore
         progress=Progress.log,  # type: ignore
+        **options,
     )
     return extracted_resources(load_info)
 
 
-def pipeline(extension: OpenHound) -> dict[str, list[str]]:
+def pipeline(
+    extension: OpenHound, output_path: Path | None = None
+) -> dict[str, list[str]]:
     collect_result = collect(extension)
 
     preprocessor_result = []
     if extension.preprocessor is not None:
         preprocessor_result = preprocess(extension)
 
-    convert_result = convert(extension)
+    convert_result = (
+        convert(extension) if output_path is None else convert(extension, output_path)
+    )
     return {
         "collect": collect_result,
         "preprocess": preprocessor_result,
