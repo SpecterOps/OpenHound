@@ -7,6 +7,7 @@ import math
 import socket
 import time
 from collections.abc import Callable
+from copy import copy
 from enum import Enum
 from pathlib import Path
 from typing import Any, BinaryIO, TypeVar
@@ -64,8 +65,14 @@ MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS = 20
 T = TypeVar("T")
 
 
+class ManagedJobClaimLost(RuntimeError):
+    """Completion I/O finished after the scheduler lost ownership of the job."""
+
+
 def _safe_managed_request_error(error: Exception) -> Exception:
     """Preserve actionable status/type without exposing provider response content."""
+    if isinstance(error, ManagedJobClaimLost):
+        return error
     if isinstance(error, BloodHoundHTTPError):
         return BloodHoundHTTPError("Managed collector request failed", error.code)
     if isinstance(error, requests.RequestException):
@@ -83,6 +90,39 @@ class BloodHoundEnterprise(BloodHound):
     ) -> None:
         super().__init__(token_key=token_key, token_id=token_id, bhe_uri=bhe_uri)
         self._credential_refresh = credential_refresh
+        self.completion_request_runner: (
+            Callable[[Callable[[], requests.Response]], requests.Response] | None
+        ) = None
+
+    def _request_once(
+        self,
+        method: str,
+        path: str,
+        body: bytes | BinaryIO | None,
+        extra_headers: dict[str, str] | None,
+        timeout: tuple[float, float] | None,
+    ) -> requests.Response:
+        runner = None
+        if path.startswith("/api/v2/collie-job-queue/") and path.endswith(
+            ("/ingest", "/end")
+        ):
+            runner = self.completion_request_runner
+        # Snapshot credentials before handing I/O to another thread. Refresh and
+        # credential updates still belong to the calling scheduler thread.
+        client = copy(self) if runner is not None else self
+
+        def send() -> requests.Response:
+            return super(BloodHoundEnterprise, client).request(
+                method=method,
+                path=path,
+                body=body,
+                extra_headers=extra_headers,
+                timeout=timeout,
+            )
+
+        if runner is not None:
+            return runner(send)
+        return send()
 
     def request(
         self,
@@ -97,7 +137,7 @@ class BloodHoundEnterprise(BloodHound):
             body.tell() if body is not None and not isinstance(body, bytes) else None
         )
         try:
-            return super().request(
+            return self._request_once(
                 method=method,
                 path=path,
                 body=body,
@@ -114,7 +154,7 @@ class BloodHoundEnterprise(BloodHound):
         credentials = self._credential_refresh()
         self.token_key = credentials.token_key
         self.token_id = credentials.token_id
-        return super().request(
+        return self._request_once(
             method=method,
             path=path,
             body=body,

@@ -3,6 +3,7 @@ import multiprocessing
 import shutil
 import signal
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -13,6 +14,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
+
+from requests import Response
 
 import openhound
 import openhound.core.logging as openhound_logging
@@ -25,6 +28,7 @@ from openhound.core.clients.bloodhound import BloodHoundHTTPError
 from openhound.core.clients.bloodhound_enterprise import (
     BloodHoundEnterprise,
     JobStatus,
+    ManagedJobClaimLost,
     ManagedJobOutcome,
 )
 from openhound.core.clients.models.jobs import (
@@ -52,12 +56,9 @@ from openhound.scheduler.credentials import (
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 30  # seconds; fixed poll/check-in cadence, must remain below BHE's 600s client-checkin timeout
-HEARTBEAT_INTERVAL = (
-    300  # seconds; BHE expires managed jobs after 15 minutes without a heartbeat
-)
-# TODO: Remove this constant and the guard in _send_managed_heartbeat once BHE
-# supports managed collector heartbeats. This is deliberately not configurable.
-_MANAGED_HEARTBEATS_DISABLED = True
+# BHE renews using each job type's claim_ttl. Renew every five minutes, leaving
+# headroom for transient failures with the deployed job types' TTLs.
+HEARTBEAT_INTERVAL = 300  # seconds
 
 
 class ExtensionNotFoundError(Exception):
@@ -302,6 +303,7 @@ class Service:
         self.job_running: int | str | None = None
         self.managed_job_id: str | None = None
         self.next_heartbeat_at: float | None = None
+        self.client.completion_request_runner = self._request_with_managed_heartbeats
 
         # Futures/results from the subprocess executor
         self.future: Future[Result] | None = None
@@ -327,7 +329,7 @@ class Service:
         while self.future is not None and not self.future.done():
             self._poll_running_job()
             if self.future is not None:
-                time.sleep(self.interval)
+                time.sleep(self._sleep_interval())
         if self.managed_job_id is not None:
             self._finish_managed_job_on_shutdown()
         elif self.future is not None:
@@ -359,7 +361,55 @@ class Service:
                     "retaining result for retry."
                 )
             if self.future is not None:
-                time.sleep(self.interval)
+                time.sleep(self._sleep_interval())
+
+    def _sleep_interval(self) -> float:
+        """Never sleep past an active managed job's next renewal opportunity."""
+        if self.managed_job_id is not None and self.next_heartbeat_at is not None:
+            return min(self.interval, max(0, self.next_heartbeat_at - time.monotonic()))
+        return self.interval
+
+    def _request_with_managed_heartbeats(
+        self, send: Callable[[], Response]
+    ) -> Response:
+        """Keep renewing while one completion HTTP attempt is in flight.
+
+        Only the I/O thread touches the request body; all lifecycle and credential
+        changes remain on the scheduler thread. Requests cannot safely be forcibly
+        cancelled. On claim loss, clean up immediately, then drain the existing
+        attempt before releasing its stream. Its response is discarded, and the
+        exception prevents credential refresh, retries, or subsequent completion
+        requests. Shutdown uses this same path and waits for in-flight I/O.
+        """
+        job_id = self.managed_job_id
+        if job_id is None:
+            return send()
+        self._poll_running_job()
+        if self.managed_job_id != job_id:
+            raise ManagedJobClaimLost("Managed collector claim lost")
+
+        request_result: Future[Response] = Future()
+
+        def run_request() -> None:
+            try:
+                request_result.set_result(send())
+            except BaseException as error:  # noqa: BLE001 - always resolve the waiting future
+                request_result.set_exception(error)
+
+        request_thread = threading.Thread(
+            target=run_request, name="managed-job-request"
+        )
+        request_thread.start()
+        try:
+            while not request_result.done():
+                request_thread.join(timeout=min(1, self._sleep_interval()))
+                if self.managed_job_id == job_id and not request_result.done():
+                    self._poll_running_job()
+        finally:
+            request_thread.join()
+        if self.managed_job_id != job_id:
+            raise ManagedJobClaimLost("Managed collector claim lost")
+        return request_result.result()
 
     def _clear_running_job(self) -> None:
         self.future = None
@@ -744,9 +794,6 @@ class Service:
             self.client.end_job(status, message)
 
     def _send_managed_heartbeat(self, job_id: str) -> None:
-        if _MANAGED_HEARTBEATS_DISABLED:
-            return
-
         try:
             self.client.heartbeat_collector_job(job_id)
         except Exception as error:  # noqa: BLE001
@@ -799,6 +846,10 @@ class Service:
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
         """Report the completed worker's outcome through the active job API."""
+        if self.managed_job_id is not None:
+            self._poll_running_job()
+            if self.managed_job_id is None:
+                return
         result: Result | None = None
         try:
             result = future.result()
@@ -848,6 +899,9 @@ class Service:
                 while result.upload_failure is None and result.uploaded_files < len(
                     result.data_files
                 ):
+                    self._poll_running_job()
+                    if self.managed_job_id is None:
+                        return
                     data_file = result.data_files[result.uploaded_files]
                     try:
                         data = data_file.open("rb")
@@ -880,6 +934,10 @@ class Service:
             else:
                 status = JobStatus.COMPLETE
                 message = f"Collector '{self.collector_name}' completed successfully"
+        if self.managed_job_id is not None:
+            self._poll_running_job()
+            if self.managed_job_id is None:
+                return
         self._end_job(status, message)
         if self.managed_job_id is not None and result is not None:
             self._remove_job_output(result)
@@ -910,6 +968,10 @@ class Service:
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
         try:
+            if self.managed_job_id is not None:
+                self._poll_running_job()
+                if self.managed_job_id is None:
+                    return
             if self.future is not None and self.future.done():
                 self._handle_completed_job(self.future)
         except Exception:
@@ -979,6 +1041,6 @@ class Service:
                         )
                 else:
                     self._poll()
-                time.sleep(self.interval)
+                time.sleep(self._sleep_interval())
         finally:
             self._shutdown()
