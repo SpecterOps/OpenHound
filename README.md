@@ -52,6 +52,66 @@ Follow the docs for setup, CLI usage, and collector development:
 
 - **Convert**: The raw resources are read from disk and converted to OpenGraph nodes and edges.
 
+## Uploading to BloodHound
+
+BloodHound needs two things from a collector: the extension **schema**, which describes the node and
+relationship kinds, and the **collection**, which is the data itself. OpenHound can send both.
+
+### Configure where BloodHound is
+
+Put the BloodHound address in `.dlt/config.toml` and the credentials in `.dlt/secrets.toml`, under the
+`destination.bloodhound` section. This is the same section the saved-search and privilege-zone uploads use.
+Use an API token pair (created under *My Profile → API Key Management* in BloodHound) or a bearer token from
+a signed-in session.
+
+```toml
+# .dlt/config.toml
+[destination.bloodhound]
+url = "http://localhost:8080"
+```
+
+```toml
+# .dlt/secrets.toml, with an API token pair...
+[destination.bloodhound]
+token_id = "..."
+token_key = "..."
+
+# ...or with a bearer token instead
+[destination.bloodhound]
+token = "..."
+```
+
+As environment variables these are `DESTINATION__BLOODHOUND__URL`, `DESTINATION__BLOODHOUND__TOKEN_ID`,
+`DESTINATION__BLOODHOUND__TOKEN_KEY`, and `DESTINATION__BLOODHOUND__TOKEN`. The token pair is used when both
+halves are present; otherwise the bearer token is used.
+
+Enterprise users need nothing new: when `destination.bloodhound` holds no credentials, the upload commands
+read the `destination.bloodhoundenterprise` section that Enterprise ingest already uses.
+
+### Install or update a schema
+
+```console
+# One schema file, or a zip bundle containing schema.json
+openhound schema upload ./schema.json
+openhound schema upload ./my-extension-bundle.zip
+
+# Every .json and .zip file in a folder
+openhound schema upload ./schemas
+
+# The schema.json that an installed collector ships next to its extension.yaml
+openhound schema upload sccm
+
+# Check the files without contacting BloodHound
+openhound schema upload ./schemas --dry-run
+```
+
+The command prints one line per file (`created`, `updated`, `skipped`, or `failed`) and exits with
+status 1 when any file failed. BloodHound matches extensions by the `schema.name` field, so uploading a
+changed file with the same name updates the existing extension.
+
+Collectors that want `openhound schema upload <name>` to work should ship their schema as `schema.json`
+in the same package folder as `extension.yaml`.
+
 ## Available extensions
 
 Extend OpenHound with pre-built extensions for other services. Additional collectors can be installed
