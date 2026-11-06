@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from copy import copy
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, BinaryIO, TypeVar
 from urllib.parse import quote
@@ -66,7 +67,7 @@ T = TypeVar("T")
 
 
 class ManagedJobClaimLost(RuntimeError):
-    """Completion I/O finished after the scheduler lost ownership of the job."""
+    """Raised when BHE reports that this collector no longer owns the job."""
 
 
 def _safe_managed_request_error(error: Exception) -> Exception:
@@ -94,36 +95,6 @@ class BloodHoundEnterprise(BloodHound):
             Callable[[Callable[[], requests.Response]], requests.Response] | None
         ) = None
 
-    def _request_once(
-        self,
-        method: str,
-        path: str,
-        body: bytes | BinaryIO | None,
-        extra_headers: dict[str, str] | None,
-        timeout: tuple[float, float] | None,
-    ) -> requests.Response:
-        runner = None
-        if path.startswith("/api/v2/collie-job-queue/") and path.endswith(
-            ("/ingest", "/end")
-        ):
-            runner = self.completion_request_runner
-        # Snapshot credentials before handing I/O to another thread. Refresh and
-        # credential updates still belong to the calling scheduler thread.
-        client = copy(self) if runner is not None else self
-
-        def send() -> requests.Response:
-            return super(BloodHoundEnterprise, client).request(
-                method=method,
-                path=path,
-                body=body,
-                extra_headers=extra_headers,
-                timeout=timeout,
-            )
-
-        if runner is not None:
-            return runner(send)
-        return send()
-
     def request(
         self,
         method: str,
@@ -131,19 +102,38 @@ class BloodHoundEnterprise(BloodHound):
         body: bytes | BinaryIO | None = None,
         extra_headers: dict[str, str] | None = None,
         timeout: tuple[float, float] | None = None,
+        *,
+        request_runner: (
+            Callable[[Callable[[], requests.Response]], requests.Response] | None
+        ) = None,
     ):
-        """Make a BHE request, refreshing managed credentials once after a 401."""
+        """Send an API request, refreshing credentials once after a 401.
+
+        For managed uploads and outcome reports, ``request_runner`` lets the
+        scheduler send the request in a background thread and keep sending job
+        heartbeats while it waits for the response.
+        """
         position = (
             body.tell() if body is not None and not isinstance(body, bytes) else None
         )
-        try:
-            return self._request_once(
+
+        def send_attempt() -> requests.Response:
+            # A heartbeat can refresh credentials while a completion request is
+            # signing its body. Give that attempt a stable token key/ID pair.
+            client = copy(self) if request_runner is not None else self
+            send = partial(
+                BloodHound.request,
+                client,
                 method=method,
                 path=path,
                 body=body,
                 extra_headers=extra_headers,
                 timeout=timeout,
             )
+            return request_runner(send) if request_runner is not None else send()
+
+        try:
+            return send_attempt()
         except BloodHoundHTTPError as error:
             if error.code != 401 or self._credential_refresh is None:
                 raise
@@ -154,13 +144,7 @@ class BloodHoundEnterprise(BloodHound):
         credentials = self._credential_refresh()
         self.token_key = credentials.token_key
         self.token_id = credentials.token_id
-        return self._request_once(
-            method=method,
-            path=path,
-            body=body,
-            extra_headers=extra_headers,
-            timeout=timeout,
-        )
+        return send_attempt()
 
     @property
     def jobs_available(self) -> JobsAvailable:
@@ -339,6 +323,7 @@ class BloodHoundEnterprise(BloodHound):
                         MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS,
                         MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
                     ),
+                    request_runner=self.completion_request_runner,
                 )
             except Exception as error:  # noqa: BLE001 - redact provider errors
                 if isinstance(error, BloodHoundHTTPError) and error.code == 404:
@@ -418,6 +403,7 @@ class BloodHoundEnterprise(BloodHound):
             body=data,
             extra_headers=headers,
             timeout=(10, 120),
+            request_runner=self.completion_request_runner,
         )
 
     @property
