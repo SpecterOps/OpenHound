@@ -3,10 +3,9 @@ import multiprocessing
 import shutil
 import signal
 import tempfile
-import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -363,7 +362,7 @@ class Service:
         while self.future is not None and not self.future.done():
             self._poll_running_job()
             if self.future is not None:
-                time.sleep(self._sleep_interval())
+                time.sleep(self._next_poll_delay())
         if self.managed_job_id is not None:
             self._finish_managed_job_on_shutdown()
         elif self.future is not None:
@@ -395,26 +394,25 @@ class Service:
                     "retaining result for retry."
                 )
             if self.future is not None:
-                time.sleep(self._sleep_interval())
+                time.sleep(self._next_poll_delay())
 
-    def _sleep_interval(self) -> float:
-        """Never sleep past an active managed job's next renewal opportunity."""
-        if self.managed_job_id is not None and self.next_heartbeat_at is not None:
-            return min(self.interval, max(0, self.next_heartbeat_at - time.monotonic()))
-        return self.interval
+    def _time_until_next_heartbeat(self) -> float | None:
+        if self.next_heartbeat_at is None:
+            return None
+        remaining_seconds = self.next_heartbeat_at - time.monotonic()
+        return max(0, remaining_seconds)
+
+    def _next_poll_delay(self) -> float:
+        """Return the time to wait before the next poll or heartbeat."""
+        heartbeat_delay = self._time_until_next_heartbeat()
+        if self.managed_job_id is None or heartbeat_delay is None:
+            return self.interval
+        return min(self.interval, heartbeat_delay)
 
     def _request_with_managed_heartbeats(
         self, send: Callable[[], Response]
     ) -> Response:
-        """Keep renewing while one completion HTTP attempt is in flight.
-
-        Only the I/O thread touches the request body; all lifecycle and credential
-        changes remain on the scheduler thread. Requests cannot safely be forcibly
-        cancelled. On claim loss, clean up immediately, then drain the existing
-        attempt before releasing its stream. Its response is discarded, and the
-        exception prevents credential refresh, retries, or subsequent completion
-        requests. Shutdown uses this same path and waits for in-flight I/O.
-        """
+        """Send a request without blocking the scheduler's job heartbeats."""
         job_id = self.managed_job_id
         if job_id is None:
             return send()
@@ -422,28 +420,19 @@ class Service:
         if self.managed_job_id != job_id:
             raise ManagedJobClaimLost("Managed collector claim lost")
 
-        request_result: Future[Response] = Future()
-
-        def run_request() -> None:
-            try:
-                request_result.set_result(send())
-            except BaseException as error:  # noqa: BLE001 - always resolve the waiting future
-                request_result.set_exception(error)
-
-        request_thread = threading.Thread(
-            target=run_request, name="managed-job-request"
-        )
-        request_thread.start()
-        try:
+        # Leaving the executor waits for in-flight I/O before its stream is closed,
+        # including when claim loss makes us discard the response.
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="managed-job-request"
+        ) as executor:
+            request_result = executor.submit(send)
             while not request_result.done():
-                request_thread.join(timeout=min(1, self._sleep_interval()))
-                if self.managed_job_id == job_id and not request_result.done():
+                wait([request_result], timeout=self._time_until_next_heartbeat())
+                if not request_result.done():
                     self._poll_running_job()
-        finally:
-            request_thread.join()
-        if self.managed_job_id != job_id:
-            raise ManagedJobClaimLost("Managed collector claim lost")
-        return request_result.result()
+                    if self.managed_job_id != job_id:
+                        raise ManagedJobClaimLost("Managed collector claim lost")
+            return request_result.result()
 
     def _clear_running_job(self) -> None:
         self._cleanup_aws_profile_workspace()
@@ -1106,6 +1095,6 @@ class Service:
                         )
                 else:
                     self._poll()
-                time.sleep(self._sleep_interval())
+                time.sleep(self._next_poll_delay())
         finally:
             self._shutdown()

@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -3938,15 +3938,24 @@ def managed_completion(mock_service, mock_bloodhound_api, monkeypatch, tmp_path)
 @pytest.mark.parametrize("phase", ["ingest", "end"])
 @pytest.mark.parametrize("during_shutdown", [False, True])
 @pytest.mark.parametrize("lose_claim", [False, True])
+@pytest.mark.parametrize("request_started_at", [0, 280])
 def test_heartbeats_continue_inside_slow_completion_http_requests(
-    managed_completion, monkeypatch, phase, during_shutdown, lose_claim
+    managed_completion,
+    monkeypatch,
+    phase,
+    during_shutdown,
+    lose_claim,
+    request_started_at,
 ):
     job = managed_completion
+    job.clock.now = request_started_at
     entered = threading.Event()
     release = threading.Event()
     original_request = requests.request
     original_abort = job.service._abort_managed_job
+    original_wait = scheduler_service.wait
     heartbeat_times = []
+    request_waits = []
     slow_requests = []
     refresh_threads = []
 
@@ -3957,21 +3966,21 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
     job.service.client._credential_refresh = refresh
     job.state.collector_job_heartbeat_statuses = [401, 200]
 
-    class ControlledThread(threading.Thread):
-        def start(self):
+    class ControlledExecutor(ThreadPoolExecutor):
+        def submit(self, function, *args, **kwargs):
             entered.clear()
             release.clear()
-            super().start()
-            assert entered.wait(5), "HTTP attempt never started"
+            return super().submit(function, *args, **kwargs)
 
-        def join(self, timeout=None):
-            if timeout is not None and not release.is_set():
-                # Advance time while the actual HTTP call is still blocked.
-                job.clock.now += 100
-                super().join(0)
-            else:
-                super().join(5)
-                assert not self.is_alive(), "in-flight HTTP attempt did not drain"
+    def wait_for_request(futures, *, timeout):
+        assert entered.wait(5), "HTTP attempt never started"
+        if not release.is_set():
+            request_waits.append(timeout)
+            job.clock.now += timeout
+            return set(), set(futures)
+        completed, pending = original_wait(futures, timeout=5)
+        assert not pending, "in-flight HTTP attempt did not finish"
+        return completed, pending
 
     def abort(job_id):
         original_abort(job_id)
@@ -3997,10 +4006,10 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
                 release.set()
             return response
         if path.endswith(("/ingest", "/end")):
-            entered.set()
             if path.endswith(f"/{phase}") and not slow_requests:
                 assert kwargs["headers"]["Authorization"] == "bhesignature test-id"
                 slow_requests.append(path)
+                entered.set()
                 assert release.wait(5), "scheduler never renewed the in-flight claim"
                 # The in-flight attempt owns its original credential snapshot.
                 assert kwargs["headers"]["Authorization"] == "bhesignature test-id"
@@ -4008,6 +4017,7 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
                     assert not kwargs["data"].closed
             else:
                 release.set()
+                entered.set()
         response = original_request(method, url, **kwargs)
         if lose_claim and path.endswith(f"/{phase}"):
             # A late response must not trigger credential refresh or /end retries
@@ -4015,9 +4025,8 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
             response.status_code = 401 if phase == "ingest" else 500
         return response
 
-    monkeypatch.setattr(
-        scheduler_service, "threading", SimpleNamespace(Thread=ControlledThread)
-    )
+    monkeypatch.setattr(scheduler_service, "ThreadPoolExecutor", ControlledExecutor)
+    monkeypatch.setattr(scheduler_service, "wait", wait_for_request)
     monkeypatch.setattr(job.service, "_abort_managed_job", abort)
     monkeypatch.setattr(requests, "request", request)
     if during_shutdown:
@@ -4026,6 +4035,8 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
         job.service._poll()
 
     assert heartbeat_times == ([300, 600] if lose_claim else [300, 600, 900, 1200])
+    heartbeat_count = 2 if lose_claim else 4
+    assert request_waits == [300 - request_started_at] + [300] * (heartbeat_count - 1)
     assert refresh_threads == [threading.get_ident()]
     assert job.service.client.token_id == "renewed-id"
     assert job.service.future is job.service.managed_job_id is None
