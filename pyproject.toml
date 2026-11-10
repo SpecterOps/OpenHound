@@ -21,7 +21,6 @@ dependencies = [
     "pydantic-extra-types>=2.11.1",
     "boto3>=1.43.90",
     "filelock>=4.2.4",
-    # Security minimums for transitive dependencies also apply to PyPI installs.
     "certifi>=2026.10.23",
     "gitpython>=3.2.1",
     "setuptools>=84.2.1",
