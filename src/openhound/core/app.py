@@ -16,7 +16,9 @@ from openhound.cli.convert import convert
 from openhound.cli.preproc import preprocess
 from openhound.core import validate
 from openhound.core.asset import BaseAsset, EdgeDef, NodeDef
+from openhound.core.clients.bloodhound import BloodHoundClient
 from openhound.core.collect import CollectContext, Collector
+from openhound.core.community_ingest import community_edition_client_for_ingest
 from openhound.core.convert import ConvertContext, Converter, Method
 from openhound.core.models.extension import Extension
 from openhound.core.preproc import PreProcContext, PreProcessor
@@ -170,6 +172,7 @@ class OpenHound:
                 lookup_file: Path = DEFAULT_LOOKUP_FILE,
                 progress: Progress = Progress.tqdm,
                 method: Method = Method.write,
+                community_edition_client: BloodHoundClient | None = None,
             ) -> LoadInfo:
                 lookup_session = None
                 if lookup:
@@ -187,6 +190,7 @@ class OpenHound:
                     lookup=lookup_session,
                     progress=progress,
                     method=method,
+                    community_edition_client=community_edition_client,
                 )
 
                 source_method, extra_context = func(
@@ -229,13 +233,32 @@ class OpenHound:
                         help="DuckDB lookup file path",
                     ),
                 ] = DEFAULT_LOOKUP_FILE,
+                method: Method = typer.Option(
+                    Method.write,
+                    help=(
+                        "write: save OpenGraph JSON files to the output path. "
+                        "ingest: send the data straight to BloodHound. Community Edition "
+                        "uses the destination.bloodhound settings, or "
+                        "destination.bloodhoundenterprise when those hold no credentials; "
+                        "Enterprise uses destination.bloodhoundenterprise. The output path "
+                        "is then not used"
+                    ),
+                ),
             ) -> LoadInfo:
+                # For ingest, find out whether the configured BloodHound is Community Edition.
+                # Only this command line does that; the Enterprise scheduler calls run_convert
+                # directly without a client, so it always keeps the Enterprise route.
+                community_edition_client = None
+                if method == Method.ingest:
+                    community_edition_client = community_edition_client_for_ingest()
+
                 return run_convert(
                     input_path=input_path,
                     output_path=output_path,
                     lookup_file=lookup_file,
                     progress=progress,
-                    method=Method.write,
+                    method=method,
+                    community_edition_client=community_edition_client,
                 )
 
             logger.debug(f"Registering convert command for {self.name}")
