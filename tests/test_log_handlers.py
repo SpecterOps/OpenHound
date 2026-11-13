@@ -532,7 +532,9 @@ WORKER_ACCESS = "worker-example-access-key"
 WORKER_SECRET = "worker-example-secret-key"
 
 
-def _spawned_log_collection(collector, job_id, params, credentials, managed, directory):
+def _spawned_log_collection(
+    collector, job_id, params, credentials, managed, environment
+):
     """Run the real job/configuration bridge; replace only collection/network IO."""
     from dlt.common import logger as dlt_logger
 
@@ -540,6 +542,9 @@ def _spawned_log_collection(collector, job_id, params, credentials, managed, dir
     from openhound.scheduler import service
 
     def collect(*args):
+        directory = Path(os.environ["WORKER_TEST_DIRECTORY"])
+        assert os.environ["AWS_ACCESS_KEY_ID"] == WORKER_ACCESS
+        assert os.environ["AWS_SECRET_ACCESS_KEY"] == WORKER_SECRET
         # DLT runtime initialization can configure its logger, as can each of
         # OpenHound's collect/preprocess/convert stages. All must keep forwarding.
         dlt.pipeline(
@@ -564,7 +569,7 @@ def _spawned_log_collection(collector, job_id, params, credentials, managed, dir
                 "path": Path("structured-path"),
             },
         )
-        logging.getLogger("openhound_aws.auth").warning(
+        logging.getLogger("example_extension.auth").warning(
             "forwarded-extension %s",
             WORKER_SECRET,
             extra={
@@ -585,10 +590,8 @@ def _spawned_log_collection(collector, job_id, params, credentials, managed, dir
         return service.Result({}, job_id)
 
     service._collect_in_worker = collect
-    # Network IO is out of scope for this logging-only worker.
-    service.validate_aws_profile = lambda profile: None
     return service._subprocess_collect(
-        collector, job_id, params, credentials, managed, directory
+        collector, job_id, params, credentials, managed, environment
     )
 
 
@@ -619,14 +622,12 @@ def logging_scheduler(configured_logger, monkeypatch):
         yield scheduler
     finally:
         scheduler.executor.shutdown(wait=True, cancel_futures=True)
-        scheduler._cleanup_aws_profile_workspace()
         scheduler._worker_logging.close()
 
 
 def test_real_spawned_worker_routes_redacted_records_and_survives_replacement(
     logging_scheduler, configured_logger, tmp_path, monkeypatch
 ):
-    from openhound.scheduler.aws_profile import AWSAccessKeyCredentials
     from openhound.scheduler.configuration import ManagedConfigurationError
 
     scheduler = logging_scheduler
@@ -657,7 +658,12 @@ def test_real_spawned_worker_routes_redacted_records_and_survives_replacement(
                 scheduler.run_claimed_job(
                     f"job-{index}",
                     {"test": {"fail": index == 1}},
-                    AWSAccessKeyCredentials(WORKER_ACCESS, WORKER_SECRET),
+                    {},
+                    environment={
+                        "AWS_ACCESS_KEY_ID": WORKER_ACCESS,
+                        "AWS_SECRET_ACCESS_KEY": WORKER_SECRET,
+                        "WORKER_TEST_DIRECTORY": str(tmp_path),
+                    },
                 )
             if index == 1:
                 with pytest.raises(ManagedConfigurationError) as error:
@@ -704,7 +710,8 @@ def test_real_spawned_worker_routes_redacted_records_and_survives_replacement(
             for record in extension
         )
         assert all(
-            record.name == "openhound_aws.auth" and record.levelno == logging.WARNING
+            record.name == "example_extension.auth"
+            and record.levelno == logging.WARNING
             for record in extension
         )
         assert all(

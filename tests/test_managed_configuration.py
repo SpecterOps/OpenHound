@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import traceback
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import dlt
 import pytest
 from dlt.common.configuration import configspec
 from dlt.common.configuration.container import Container
+from dlt.common.configuration.providers.toml import ConfigTomlProvider
 from dlt.common.configuration.specs import BaseConfiguration, CredentialsConfiguration
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
 from dlt.common.configuration.utils import TraceLogContext
@@ -17,60 +19,60 @@ from dlt.common.configuration.utils import TraceLogContext
 from openhound.scheduler import service
 from openhound.scheduler.configuration import (
     ManagedConfigurationError,
+    job_environment,
     managed_job_configuration,
 )
+from openhound.scheduler.credentials import managed_collection_configuration
 
 DATA = Path(__file__).parent / "test_data"
 
 
-# The relevant openhound-aws model shapes. Exercise the actual DLT source
-# resolver without requiring the AWS extension's native build or AWS requests.
+# Synthetic extension settings exercise DLT resolution without depending on an
+# extension's schema, validation rules or collection behavior.
 @configspec
-class BucketPolicyRule(BaseConfiguration):
+class SelectionRule(BaseConfiguration):
     include: bool = True
-    match_bucket: str | None = None
-    match_object: str | None = None
+    match_resource: str | None = None
+    match_record: str | None = None
 
 
 @configspec
-class BucketPolicy(BaseConfiguration):
+class SelectionConfiguration(BaseConfiguration):
     include: bool = False
-    max_objects: int = 10
-    rule: list[BucketPolicyRule] | None = None
+    limit: int = 10
+    rule: list[SelectionRule] | None = None
 
 
 @configspec
-class AWSProfiles(CredentialsConfiguration):
-    profile_names: list[str] = None
-    region_name: str | None = "us-east-1"
+class ExampleCredentials(CredentialsConfiguration):
+    secret_value: str | None = None
+    workspace: str | None = "default-workspace"
     endpoint_url: str | None = None
 
 
-@dlt.source(name="aws", section="source")
-def aws_configuration_source(
-    credentials: AWSProfiles = dlt.secrets.value,
-    bucket_policy: BucketPolicy = dlt.config.value,
+@dlt.source(name="example", section="source")
+def configuration_source(
+    credentials: ExampleCredentials = dlt.secrets.value,
+    selection: SelectionConfiguration = dlt.config.value,
 ):
-    rules = [
-        BucketPolicyRule.from_init_value(rule) for rule in bucket_policy.rule or []
-    ]
+    rules = [SelectionRule.from_init_value(rule) for rule in selection.rule or []]
     return dlt.resource(
         [
             {
-                "profiles": credentials.profile_names,
-                "region": credentials.region_name,
+                "secret_value": credentials.secret_value,
+                "workspace": credentials.workspace,
                 "endpoint": credentials.endpoint_url,
-                "include": bucket_policy.include,
-                "max_objects": bucket_policy.max_objects,
-                "bucket_rules": [
-                    (rule.match_bucket, rule.include)
+                "include": selection.include,
+                "limit": selection.limit,
+                "resource_rules": [
+                    (rule.match_resource, rule.include)
                     for rule in rules
-                    if rule.match_bucket
+                    if rule.match_resource
                 ],
-                "object_rules": [
-                    (rule.match_object, rule.include)
+                "record_rules": [
+                    (rule.match_record, rule.include)
                     for rule in rules
-                    if rule.match_object
+                    if rule.match_record
                 ],
             }
         ],
@@ -80,38 +82,71 @@ def aws_configuration_source(
 
 @pytest.fixture
 def params():
-    return json.loads((DATA / "managed_aws_configuration.json").read_text())
+    """BHE job params contain configuration only."""
+    return json.loads((DATA / "managed_configuration.json").read_text())
 
 
 @pytest.fixture
 def secrets():
-    return json.loads((DATA / "managed_aws_secrets.json").read_text())
+    """Simulate a retrieved secret document for the generic document handoff."""
+    return json.loads((DATA / "managed_secrets.json").read_text())
 
 
-@pytest.mark.parametrize("include,max_objects", [(True, 50), (False, 0)])
-def test_dlt_source_resolves_nested_aws_settings_and_rule_arrays(
-    params, include, max_objects
-):
-    bucket = params["sources"]["source"]["aws"]["bucket_policy"]
-    bucket.update(include=include, max_objects=max_objects)
+def test_job_environment_applies_and_restores_overrides(monkeypatch):
+    monkeypatch.setenv("COLLECTION_TOKEN", "scheduler-token")
+    monkeypatch.setenv("INHERITED_TOKEN", "scheduler-inherited-token")
+    monkeypatch.delenv("JOB_ONLY_SETTING", raising=False)
+    scheduler_environment = dict(os.environ)
+    worker_environment = {
+        "COLLECTION_TOKEN": "job-token",
+        "INHERITED_TOKEN": None,
+        "JOB_ONLY_SETTING": "job-setting",
+    }
+
+    with job_environment(worker_environment):
+        assert os.environ["COLLECTION_TOKEN"] == "job-token"
+        assert "INHERITED_TOKEN" not in os.environ
+        assert os.environ["JOB_ONLY_SETTING"] == "job-setting"
+
+    assert dict(os.environ) == scheduler_environment
+
+
+def test_job_environment_restores_scheduler_token_after_worker_failure(monkeypatch):
+    monkeypatch.setenv("COLLECTION_TOKEN", "scheduler-token")
+
+    with (
+        pytest.raises(RuntimeError, match="collection failed"),
+        job_environment({"COLLECTION_TOKEN": "job-token"}),
+    ):
+        raise RuntimeError("collection failed")
+
+    assert os.environ["COLLECTION_TOKEN"] == "scheduler-token"
+
+
+@pytest.mark.parametrize("include,limit", [(True, 50), (False, 0)])
+def test_dlt_source_resolves_nested_settings_and_rule_arrays(params, include, limit):
+    selection = params["sources"]["source"]["example"]["selection"]
+    selection.update(include=include, limit=limit)
     with managed_job_configuration(params, {}):
-        (row,) = list(aws_configuration_source())
+        (row,) = list(configuration_source())
 
     assert row == {
-        "profiles": ["bhe-profile"],
-        "region": "us-west-2",
-        "endpoint": "https://aws.example.test",
+        "secret_value": None,
+        "workspace": "job-workspace",
+        "endpoint": "https://collector.example.test",
         "include": include,
-        "max_objects": max_objects,
-        "bucket_rules": [(".*", True)],
-        "object_rules": [("private/.*", False)],
+        "limit": limit,
+        "resource_rules": [(".*", True)],
+        "record_rules": [("private/.*", False)],
     }
 
 
 def test_dlt_resolves_retrieved_secrets_per_setting_and_preserves_siblings(
     params, secrets, monkeypatch, caplog
 ):
-    monkeypatch.setenv("SOURCES__SOURCE__AWS__CREDENTIALS__PROFILE_NAMES", '["local"]')
+    monkeypatch.setenv(
+        "SOURCES__SOURCE__EXAMPLE__CREDENTIALS__SECRET_VALUE", "local-secret"
+    )
     # The BHE URL and bootstrap secret reference belong to deployment config;
     # the job documents supply only collector settings and collector secrets.
     monkeypatch.setenv(
@@ -123,12 +158,12 @@ def test_dlt_resolves_retrieved_secrets_per_setting_and_preserves_siblings(
     previous = providers.providers
     previous_traces = Container()[TraceLogContext]
     with caplog.at_level(logging.DEBUG), managed_job_configuration(params, secrets):
-        (row,) = list(aws_configuration_source())
-        assert row["profiles"] == ["retrieved-profile-a", "retrieved-profile-b"]
-        assert row["region"] == "us-west-2"
-        assert row["endpoint"] == "https://aws.example.test"
+        (row,) = list(configuration_source())
+        assert row["secret_value"] == "retrieved-secret-value"
+        assert row["workspace"] == "job-workspace"
+        assert row["endpoint"] == "https://collector.example.test"
         assert row["include"] is True
-        assert row["max_objects"] == 50
+        assert row["limit"] == 50
         assert (
             dlt.config.get("destination.bloodhoundenterprise.url", str)
             == "https://bhe.example.test"
@@ -143,8 +178,7 @@ def test_dlt_resolves_retrieved_secrets_per_setting_and_preserves_siblings(
     assert Container()[TraceLogContext] is previous_traces
     assert params == original_params
     assert secrets == original_secrets
-    for credential in ("retrieved-profile-a", "retrieved-profile-b"):
-        assert credential not in caplog.text
+    assert "retrieved-secret-value" not in caplog.text
 
 
 def test_dynamic_nested_mappings_lists_and_falsy_values_resolve(params):
@@ -154,42 +188,43 @@ def test_dynamic_nested_mappings_lists_and_falsy_values_resolve(params):
         "empty_list": [],
         "empty_mapping": {},
     }
-    params["sources"]["source"]["aws"]["future_options"] = options
+    params["sources"]["source"]["example"]["future_options"] = options
     overrides = {
         "sources": {
             "source": {
-                "aws": {"future_options": {"new_nested_section": {"enabled": True}}}
+                "example": {"future_options": {"new_nested_section": {"enabled": True}}}
             }
         }
     }
     with managed_job_configuration(params, overrides):
-        resolved = dlt.config.get("sources.source.aws.future_options", dict)
+        resolved = dlt.config.get("sources.source.example.future_options", dict)
         assert resolved == {
             **options,
             "new_nested_section": {"enabled": True, "limit": 0},
         }
-        assert dlt.config.get("sources.source.aws.future_options.labels", list) == [
+        assert dlt.config.get("sources.source.example.future_options.labels", list) == [
             "one",
             "two",
         ]
         assert (
-            dlt.config.get("sources.source.aws.future_options.empty_list", list) == []
+            dlt.config.get("sources.source.example.future_options.empty_list", list)
+            == []
         )
 
 
 def test_retrieved_false_zero_and_rule_list_replace_matching_settings(params, secrets):
-    secrets["sources"]["source"]["aws"]["bucket_policy"] = {
+    secrets["sources"]["source"]["example"]["selection"] = {
         "include": False,
-        "max_objects": 0,
-        "rule": [{"include": True, "match_object": "public/.*"}],
+        "limit": 0,
+        "rule": [{"include": True, "match_record": "public/.*"}],
     }
     with managed_job_configuration(params, secrets):
-        (row,) = list(aws_configuration_source())
+        (row,) = list(configuration_source())
     assert row["include"] is False
-    assert row["max_objects"] == 0
-    assert row["bucket_rules"] == []
-    assert row["object_rules"] == [("public/.*", True)]
-    assert row["endpoint"] == "https://aws.example.test"
+    assert row["limit"] == 0
+    assert row["resource_rules"] == []
+    assert row["record_rules"] == [("public/.*", True)]
+    assert row["endpoint"] == "https://collector.example.test"
 
 
 @pytest.mark.parametrize("failed", [False, True], ids=["successful-job", "failed-job"])
@@ -199,38 +234,98 @@ def test_successive_jobs_do_not_inherit_configuration_or_secrets(
     original_environment = dict(os.environ)
     try:
         with managed_job_configuration(params, secrets):
-            assert next(iter(aws_configuration_source()))["profiles"] == [
-                "retrieved-profile-a",
-                "retrieved-profile-b",
-            ]
+            assert (
+                next(iter(configuration_source()))["secret_value"]
+                == "retrieved-secret-value"
+            )
             if failed:
                 raise RuntimeError("collection failed")
     except RuntimeError:
         assert failed
 
     second_job = {
-        "sources": {
-            "source": {"aws": {"credentials": {"profile_names": ["second-job"]}}}
-        }
+        "sources": {"source": {"example": {"credentials": {"workspace": "second-job"}}}}
     }
     with managed_job_configuration(second_job, {}):
-        (row,) = list(aws_configuration_source())
-        assert row["profiles"] == ["second-job"]
-        assert row["region"] == "us-east-1"
+        (row,) = list(configuration_source())
+        assert row["secret_value"] is None
+        assert row["workspace"] == "second-job"
         assert row["endpoint"] is None
         assert row["include"] is False
-        assert row["max_objects"] == 10
-        assert row["bucket_rules"] == row["object_rules"] == []
+        assert row["limit"] == 10
+        assert row["resource_rules"] == row["record_rules"] == []
     assert dict(os.environ) == original_environment
+
+
+@pytest.mark.parametrize(
+    "configure", [managed_job_configuration, managed_collection_configuration]
+)
+@pytest.mark.parametrize("failed", [False, True], ids=["successful-job", "failed-job"])
+def test_dlt_runtime_writes_are_job_scoped(
+    params, secrets, configure, failed, monkeypatch, tmp_path
+):
+    providers = Container()[PluggableRunContext].providers
+    deployment = ConfigTomlProvider(str(tmp_path))
+    deployment.set_value("workers", 8, None, "load")
+    deployment_config = deployment.to_toml()
+    monkeypatch.setattr(providers, "providers", [deployment])
+    previous = providers.providers
+    original_params, original_secrets = deepcopy(params), deepcopy(secrets)
+    error_type = (
+        ManagedConfigurationError
+        if configure is managed_collection_configuration
+        else RuntimeError
+    )
+    configured = False
+
+    with (
+        pytest.raises(error_type) if failed else nullcontext(),
+        configure(params, secrets),
+    ):
+        assert dlt.config.get("load.workers", int) == 8
+        # Extensions can tune DLT during preprocessing/conversion.
+        dlt.config["load.workers"] = 1
+        dlt.config["data_writer.buffer_max_items"] = 5000
+        assert dlt.config.get("load.workers", int) == 1
+        assert dlt.config.get("data_writer.buffer_max_items", int) == 5000
+        assert (
+            next(iter(configuration_source()))["secret_value"]
+            == "retrieved-secret-value"
+        )
+        configured = True
+        if failed:
+            raise RuntimeError("collection failed")
+
+    assert configured
+    assert providers.providers is previous
+    assert deployment.to_toml() == deployment_config
+    assert params == original_params
+    assert secrets == original_secrets
+    with configure(params, secrets):
+        assert dlt.config.get("load.workers", int) == 8
+        assert dlt.config.get("data_writer.buffer_max_items", int) is None
+
+
+@pytest.mark.parametrize(
+    "configure", [managed_job_configuration, managed_collection_configuration]
+)
+def test_runtime_writes_preserve_managed_setting_precedence(configure):
+    params = {"load": {"workers": 4}}
+    secrets = {"load": {"workers": 2}}
+    with configure(params, secrets):
+        dlt.config["load.workers"] = 1
+        assert dlt.config.get("load.workers", int) == 2
+    assert params == {"load": {"workers": 4}}
+    assert secrets == {"load": {"workers": 2}}
 
 
 @pytest.mark.parametrize(
     "document",
     [
-        {"max_objects": 50},
-        {"sources.source.aws.bucket_policy.include": True},
-        {"SOURCES__SOURCE__AWS__BUCKET_POLICY__INCLUDE": True},
-        {"profile_names": ["private-credential"]},
+        {"limit": 50},
+        {"sources.source.example.selection.include": True},
+        {"SOURCES__SOURCE__EXAMPLE__SELECTION__INCLUDE": True},
+        {"labels": ["private-credential"]},
         {"sources": {}, "private-key": "private-credential"},
     ],
 )
@@ -270,32 +365,30 @@ def test_custom_sections_and_values_are_passed_to_dlt_without_schema_validation(
 
 def test_unused_nested_settings_are_ignored_during_dlt_source_resolution(params):
     with managed_job_configuration(params, {}):
-        expected = list(aws_configuration_source())
+        expected = list(configuration_source())
 
     params["unrelated_pipeline"] = {"extra_metadata": ["ignored"]}
-    aws = params["sources"]["source"]["aws"]
-    aws["unused_source_setting"] = {"arbitrary": None}
-    aws["credentials"]["unused_credential_setting"] = [False, 0]
-    aws["bucket_policy"]["unused_bucket_setting"] = "not a collector option"
-    for rule in aws["bucket_policy"]["rule"]:
+    source = params["sources"]["source"]["example"]
+    source["unused_source_setting"] = {"arbitrary": None}
+    source["credentials"]["unused_credential_setting"] = [False, 0]
+    source["selection"]["unused_selection_setting"] = "not a collector option"
+    for rule in source["selection"]["rule"]:
         rule["unused_rule_setting"] = {"arbitrary": None}
 
     with managed_job_configuration(params, {}):
-        assert list(aws_configuration_source()) == expected
+        assert list(configuration_source()) == expected
 
 
 def test_dlt_type_errors_are_sanitized_and_provider_is_removed(params, caplog):
     providers = Container()[PluggableRunContext].providers
     previous = providers.providers
-    params["sources"]["source"]["aws"]["bucket_policy"][
-        "max_objects"
-    ] = "private-credential"
+    params["sources"]["source"]["example"]["selection"]["limit"] = "private-credential"
     with (
         caplog.at_level(logging.DEBUG),
         pytest.raises(ManagedConfigurationError) as error,
         managed_job_configuration(params, {}),
     ):
-        list(aws_configuration_source())
+        list(configuration_source())
     assert "could not be resolved" in str(error.value)
     assert "private-credential" not in "".join(traceback.format_exception(error.value))
     assert "private-credential" not in caplog.text
@@ -308,12 +401,12 @@ def test_worker_applies_configuration_before_collector_loading(
     observed = []
 
     def load_collectors():
-        observed.append(next(iter(aws_configuration_source())))
+        observed.append(next(iter(configuration_source())))
         return SimpleNamespace(
             collectors=[
                 SimpleNamespace(
-                    name="aws",
-                    dlt_source=aws_configuration_source,
+                    name="example",
+                    dlt_source=configuration_source,
                     package_version="test",
                     metadata=None,
                 )
@@ -326,6 +419,6 @@ def test_worker_applies_configuration_before_collector_loading(
         "pipeline",
         lambda extension: {"settings": list(extension.dlt_source())},
     )
-    result = service._subprocess_collect("aws", "job-1", params, secrets)
+    result = service._subprocess_collect("example", "job-1", params, secrets)
     assert result.results["settings"] == observed
-    assert observed[0]["profiles"] == ["retrieved-profile-a", "retrieved-profile-b"]
+    assert observed[0]["secret_value"] == "retrieved-secret-value"

@@ -1,0 +1,16 @@
+{
+  "sources": {
+    "source": {
+      "aws": {
+        "credentials": {
+          "management_account_id": "111111111111",
+          "management_role_name": "OpenHoundManagementRole",
+          "collector_assumed_role_name": "OpenHoundCollectorRole",
+          "member_role_source": "source",
+          "runtime_auth_mode": "default_chain"
+        },
+        "max_attempts": 2
+      }
+    }
+  }
+}

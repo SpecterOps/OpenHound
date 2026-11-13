@@ -1,0 +1,27 @@
+{
+  "sources": {
+    "source": {
+      "aws": {
+        "bucket_policy": {
+          "include": true,
+          "rule": [
+            {
+              "include": true,
+              "match_bucket": "\\A[\\s\\S]*\\Z",
+              "match_object": "\\A[\\s\\S]*\\Z"
+            }
+          ]
+        },
+        "credentials": {
+          "management_account_id": "594194277364",
+          "management_role_name": "kng-openhound-organization-role",
+          "collector_assumed_role_name": "OpenHoundCollectorRole",
+          "collector_assumed_role_session_name": "product-openhound-collection",
+          "member_role_source": "source",
+          "runtime_auth_mode": "default_chain"
+        },
+        "read_timeout": 60
+      }
+    }
+  }
+}
