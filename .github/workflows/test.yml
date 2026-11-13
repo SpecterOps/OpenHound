@@ -78,6 +78,10 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_preproc.py -v
 
+      - name: Run pipeline retry and recovery tests
+        run: |
+          .venv/bin/pytest tests/test_pipeline_retry.py tests/test_pipeline_recovery.py -v
+
       - name: Run DuckDB lookup exception handling tests
         run: |
           .venv/bin/pytest tests/test_lookup.py -v

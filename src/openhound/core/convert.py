@@ -27,6 +27,8 @@ class Method(str, Enum):
 
 
 class Converter(BasePipeline):
+    _retry_normalization_worker_failure = True
+
     def __init__(
         self,
         name: str,
