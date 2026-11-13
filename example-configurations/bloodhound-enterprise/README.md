@@ -17,10 +17,9 @@ Full configuration reference: https://bloodhound.specterops.io/openhound/enterpr
 
 ## Managed AWS compatibility: organization survey
 
-The OpenHound-only `poc/managed-aws-dlt-credentials` branch supports the updated
-AWS extension using its existing SDK environment authentication. The extension
-is unmodified. The profile adapter, file generation, profile injection,
-authentication preflights and workspace cleanup have been removed.
+Managed AWS jobs use the AWS extension's SDK environment authentication.
+OpenHound delivers customer credentials to the worker; the extension handles
+authentication, organization survey and collection.
 
 ### Job params: configuration only
 
@@ -125,7 +124,7 @@ the customer has to put in their JSON.
 
 ### Credentials: worker environment only
 
-The existing BHE retrieval contract is preserved:
+BHE supplies the starting credentials as follows:
 
 1. `external_secret_key_id` supplies the access key ID.
 2. The scheduler retrieves the text secret access key from Secrets Manager using
@@ -139,7 +138,7 @@ The existing BHE retrieval contract is preserved:
    secret documents remain supported when `external_secret_key_id` is null.
 
 **Do not put secret values in job-params JSON.** Raw keys are SDK environment
-credentials, not DLT credential fields. No new JSON/TOML/credentials file stores
+credentials, not DLT credential fields. No JSON/TOML/credentials file stores
 them. The extension generates its own account/role routing config with
 `credential_source = Environment`; collection and subsequent role assumptions
 continue using the worker's supplied identity. The current split-key contract
@@ -180,8 +179,8 @@ member trust path or provide a JSON-only account allowlist.
   the managed job. Denied members and optional resource reads retain the
   extension's best-effort behavior and can produce partial success.
 - Environment values are scoped to a single worker job and restored on exit.
-  The scheduler retains its Secrets Manager identity. No starting-credential
-  refresh is added, and a generated routing file needs the credentials again
+  The scheduler retains its Secrets Manager identity. Starting credentials are
+  not refreshed, and a generated routing file needs the credentials again
   when reused in another process.
 - Each collection job surveys again when `aws_config_file` is omitted, even if a
   previous job left a generated file. A successful survey backs up the old file
@@ -191,8 +190,8 @@ member trust path or provide a JSON-only account allowlist.
   job-scoped artifact cleanup and isolation between concurrent workers require
   an extension lifecycle contract.
 
-Logging ownership is unchanged for this fix: OpenHound retains redaction,
-disabled DLT value tracing, safe SDK diagnostics and boto3/botocore protections
+OpenHound handles credential redaction, DLT value-trace suppression,
+safe SDK diagnostics and boto3/botocore logging protections
 in `scheduler/credentials.py`. Credential retrieval and validation use the same
 preparation path for every extension. A temporary binding table maps BHE's
 identifier/secret inputs to the current AWS SDK environment names and isolation
