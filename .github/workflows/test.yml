@@ -46,9 +46,9 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_aws_secrets_manager.py -v
 
-      - name: Run managed configuration and AWS profile adapter tests
+      - name: Run managed configuration and credential handoff tests
         run: |
-          .venv/bin/pytest tests/test_managed_configuration.py tests/test_aws_profile_adapter.py -v
+          .venv/bin/pytest tests/test_managed_configuration.py tests/test_managed_credentials.py -v
 
       - name: Run log handling tests
         run: |

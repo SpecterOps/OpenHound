@@ -1,5 +1,6 @@
 """Job-scoped configuration using the same DLT resolver as local TOML files."""
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -12,9 +13,30 @@ from dlt.common.configuration.specs.pluggable_run_context import PluggableRunCon
 from dlt.common.configuration.utils import TraceLogContext
 from dlt.common.utils import update_dict_nested
 
+JobEnvironment = dict[str, str | None]
+
 
 class ManagedConfigurationError(ValueError):
     """A managed configuration failure safe to report without its values."""
+
+
+@contextmanager
+def job_environment(environment: JobEnvironment) -> Iterator[None]:
+    """Install resolved environment values only for this worker job, then restore."""
+    previous = {key: os.environ.get(key) for key in environment}
+    try:
+        for key, value in environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _validate_document(document: dict[str, Any], *, allow_empty: bool = False) -> None:
@@ -48,12 +70,17 @@ def managed_job_configuration(
     provider = CustomLoaderDocProvider(
         "Managed job configuration", lambda: document, supports_secrets=True
     )
+    # DLT config writes require a writable non-secret provider. Keep extension
+    # runtime tuning in this job instead of mutating deployment fallback providers.
+    runtime_provider = CustomLoaderDocProvider(
+        "Managed job runtime configuration", dict, supports_secrets=False
+    )
     container = Container()
     providers = container[PluggableRunContext].providers
     previous = providers.providers
     # Managed workers run one job at a time. Leave environment/TOML providers as
     # fallback for deployment defaults, with this job's document taking priority.
-    providers.providers = [provider, *previous]
+    providers.providers = [provider, runtime_provider, *previous]
     # Credential model fields can be plain strings, not DLT secret hints. Do not
     # retain their values in DLT's configuration traces (including pipeline traces).
     traces = TraceLogContext()

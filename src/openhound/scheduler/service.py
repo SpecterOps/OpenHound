@@ -10,7 +10,6 @@ from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from importlib import import_module
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -20,7 +19,6 @@ import openhound.core.logging as openhound_logging
 from openhound.config import is_managed
 from openhound.core.clients.aws_secrets_manager import (
     AWSSecretsManager,
-    SecretRetrievalError,
 )
 from openhound.core.clients.bhe_credentials import BHECredentials
 from openhound.core.clients.bloodhound import BloodHoundHTTPError
@@ -39,21 +37,16 @@ from openhound.core.clients.models.jobs import (
 from openhound.core.manager import CollectorManager
 from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import dataflow
-from openhound.scheduler.aws_profile import (
-    AWSAccessKeyCredentials,
-    AWSAccessKeyError,
-    AWSProfileWorkspace,
-    aws_profile_params,
-    cleanup_orphaned_aws_profiles,
-    managed_aws_profile,
-    prepare_aws_credentials,
-    validate_aws_profile,
-    validate_configured_aws_profiles,
-)
 from openhound.scheduler.configuration import (
+    JobEnvironment,
     ManagedConfigurationError,
-    _validate_document,
+    job_environment,
     managed_job_configuration,
+)
+from openhound.scheduler.credentials import (
+    CredentialPreparationError,
+    managed_collection_configuration,
+    prepare_job_credentials,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,12 +59,6 @@ HEARTBEAT_INTERVAL = (
 # supports managed collector heartbeats. This is deliberately not configurable.
 _MANAGED_HEARTBEATS_DISABLED = True
 
-# Explicit source registration for the collectors shipped with this PoC.
-MANAGED_SOURCE_MODULES = {
-    "faker": "openhound_faker.source",
-    "aws": "openhound_aws.source",
-}
-
 
 class ExtensionNotFoundError(Exception):
     """Raised when the configured collector extension cannot be found."""
@@ -82,7 +69,7 @@ class ManagedRuntimeUnavailableError(RuntimeError):
 
 
 class CredentialValidationError(ValueError):
-    """A managed job's required credential document could not be loaded."""
+    """A managed job's credential inputs could not be prepared."""
 
     def __init__(
         self,
@@ -107,7 +94,8 @@ class PreparedManagedJob:
     """
 
     job: CollectorJob = field(repr=False)
-    credentials: dict[str, Any] | AWSAccessKeyCredentials = field(repr=False)
+    credentials: dict[str, Any] = field(repr=False)
+    environment: JobEnvironment = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -124,9 +112,9 @@ def _subprocess_collect(
     collector_name: str,
     job_id: int | str,
     params: dict[str, Any] | None = None,
-    secrets: dict[str, Any] | AWSAccessKeyCredentials | None = None,
+    secrets: dict[str, Any] | None = None,
     managed: bool = False,
-    aws_profile_directory: Path | None = None,
+    environment: JobEnvironment | None = None,
 ) -> Result:
     """A subprocess which runs the DLT pipeline for the specified collector.
 
@@ -146,18 +134,15 @@ def _subprocess_collect(
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     # Context and redaction surround imports, configuration, pipeline setup, and
     # failure diagnostics. The queue handler applies them before serialization.
-    values = (
-        (secrets.access_key_id, secrets.secret_access_key)
-        if isinstance(secrets, AWSAccessKeyCredentials)
-        else tuple(_credential_log_values(secrets))
-    )
+    values = (*_credential_log_values(secrets), *_credential_log_values(environment))
     with (
         openhound_logging.worker_log_context(job_id, collector_name),
         openhound_logging.redact_log_values(values),
+        job_environment(environment or {}),
     ):
         try:
             return _configured_worker_collect(
-                collector_name, job_id, params, secrets, managed, aws_profile_directory
+                collector_name, job_id, params, secrets, managed
             )
         except ManagedConfigurationError:
             # AWS failures were diagnosed inside the SDK logging controls;
@@ -191,49 +176,33 @@ def _configured_worker_collect(
     collector_name: str,
     job_id: int | str,
     params: dict[str, Any] | None,
-    secrets: dict[str, Any] | AWSAccessKeyCredentials | None,
+    secrets: dict[str, Any] | None,
     managed: bool,
-    aws_profile_directory: Path | None,
 ) -> Result:
-    if isinstance(secrets, AWSAccessKeyCredentials):
-        if collector_name != "aws" or aws_profile_directory is None:
-            raise ManagedConfigurationError(
-                "Managed AWS profile worker context is required"
-            )
-        with managed_aws_profile(
-            params or {}, secrets, aws_profile_directory
-        ) as profile:
-            validate_aws_profile(profile)
-            return _collect_in_worker(collector_name, job_id, managed, True)
     configured = params is not None or secrets is not None
+    # Retain SDK logging and source-credential isolation; authentication belongs
+    # entirely to the extension.
+    # TODO: Replace job-key branching with an extension-owned worker setup contract
+    # once the temporary AWS compatibility behavior moves out of OpenHound.
+    configure = (
+        managed_collection_configuration
+        if managed and collector_name == "aws"
+        else managed_job_configuration
+    )
     configuration = (
-        managed_job_configuration(params or {}, secrets or {})
-        if configured
-        else nullcontext()
+        configure(params or {}, secrets or {}) if configured else nullcontext()
     )
     # Install configuration before importing collectors or constructing pipelines:
     # both can resolve DLT settings. Always remove it, including on worker failure.
     with configuration:
-        if managed and collector_name == "aws":
-            validate_configured_aws_profiles()
-        return _collect_in_worker(collector_name, job_id, managed, configured)
+        return _collect_in_worker(collector_name, job_id, managed)
 
 
-def _collect_in_worker(
-    collector_name: str, job_id: int | str, managed: bool, configured: bool
-) -> Result:
+def _collect_in_worker(collector_name: str, job_id: int | str, managed: bool) -> Result:
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
         if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
-            if (
-                configured
-                and collector.dlt_source is None
-                and collector.name in MANAGED_SOURCE_MODULES
-            ):
-                collector.dlt_source = import_module(
-                    MANAGED_SOURCE_MODULES[collector.name]
-                ).source
             log_fields = {
                 "collector_extension": collector.name,
                 "collector_extension_version": (
@@ -321,9 +290,6 @@ class Service:
 
         # Managed collection settings and recovery state
         self.managed = is_managed() if managed is None else managed
-        self._aws_profile_workspace: AWSProfileWorkspace | None = None
-        if self.managed and self.collector_name == "aws":
-            cleanup_orphaned_aws_profiles()
         self.secrets_manager = secrets_manager or AWSSecretsManager()
         self.managed_job_runner = managed_job_runner or self._run_prepared_managed_job
         self._pending_managed_claim: str | None = None
@@ -396,16 +362,10 @@ class Service:
                 time.sleep(self.interval)
 
     def _clear_running_job(self) -> None:
-        self._cleanup_aws_profile_workspace()
         self.future = None
         self.job_running = None
         self.managed_job_id = None
         self.next_heartbeat_at = None
-
-    def _cleanup_aws_profile_workspace(self) -> None:
-        if self._aws_profile_workspace is not None:
-            self._aws_profile_workspace.cleanup()
-            self._aws_profile_workspace = None
 
     def _reset_executor(self) -> None:
         """Tear down and recreate the process pool after it has entered a broken state."""
@@ -473,7 +433,7 @@ class Service:
 
     def _load_managed_credentials(
         self, job: CollectorJob
-    ) -> dict[str, Any] | AWSAccessKeyCredentials:
+    ) -> tuple[dict[str, Any], JobEnvironment]:
         """Retrieve and validate credentials, exposing only a safe failure message."""
         logger.debug(
             "Retrieving managed collector credentials.",
@@ -484,38 +444,19 @@ class Service:
             },
         )
         try:
-            if job.job_key == "aws":
-                credentials = prepare_aws_credentials(
-                    job, self.secrets_manager.get_secret
-                )
-            else:
-                if job.secret_key_id is None or not job.secret_key_id.strip():
-                    raise CredentialValidationError(
-                        "Managed job has no credential secret identifier"
-                    )
-                credentials = self.secrets_manager.get_secret(job.secret_key_id)
-            if isinstance(credentials, AWSAccessKeyCredentials):
-                return credentials
-            if isinstance(credentials, dict):
-                _validate_document(credentials, allow_empty=True)
-                return credentials
-        except AWSAccessKeyError as error:
+            return prepare_job_credentials(job, self.secrets_manager.get_secret)
+        except CredentialPreparationError as error:
             raise CredentialValidationError(
                 str(error), error.summary, **error.context
             ) from None
-        except CredentialValidationError:
-            raise
         except ManagedConfigurationError as error:
             raise CredentialValidationError(str(error)) from None
-        except SecretRetrievalError as error:
-            raise CredentialValidationError(str(error), error.failure_summary) from None
         except Exception as error:  # noqa: BLE001
             # Unexpected readers can expose payloads.
             raise CredentialValidationError(
                 f"Credential secret reader failed ({type(error).__name__})",
                 "Credential secret retrieval failed",
             ) from None
-        raise CredentialValidationError("Credential document must be a JSON object")
 
     def _validate_managed_claim(self, job: CollectorJob, job_id: str) -> None:
         """Check the job identity and lease confirmed by BHE's claim response."""
@@ -562,7 +503,7 @@ class Service:
         context = {"job_id": job_id}
         logger.info("Job successfully picked up", extra=context)
         try:
-            credentials = self._load_managed_credentials(job)
+            credentials, environment = self._load_managed_credentials(job)
         except CredentialValidationError as error:
             logger.error(
                 "Cannot prepare managed job %s: %s. Reporting this job failed.",
@@ -584,7 +525,9 @@ class Service:
         # Secret retrieval may have consumed the remaining lease time.
         self._validate_managed_claim(job, job_id)
         logger.info("Credential retrieval valid", extra=context)
-        return PreparedManagedJob(job=job, credentials=credentials)
+        return PreparedManagedJob(
+            job=job, credentials=credentials, environment=environment
+        )
 
     def _clear_pending_managed_start(self) -> None:
         """Discard preparation state once start is confirmed or rejected."""
@@ -599,7 +542,12 @@ class Service:
         return self.managed_job_runner
 
     def _run_prepared_managed_job(self, prepared: PreparedManagedJob) -> None:
-        self.run_claimed_job(prepared.job.id, prepared.job.params, prepared.credentials)
+        self.run_claimed_job(
+            prepared.job.id,
+            prepared.job.params,
+            prepared.credentials,
+            environment=prepared.environment,
+        )
 
     def _poll_managed_jobs(self) -> None:
         runner = self._require_managed_runtime()
@@ -693,29 +641,34 @@ class Service:
         self,
         job_id: str | UUID,
         params: dict[str, Any],
-        secrets: dict[str, Any] | AWSAccessKeyCredentials,
+        secrets: dict[str, Any],
+        *,
+        environment: JobEnvironment | None = None,
     ) -> None:
         """Start a validated managed job; the scheduler polls it until completion."""
         # Normalize managed UUIDs once at the runtime boundary. Unmanaged IDs
         # remain integers throughout the shared lifecycle.
-        self._launch_job(str(job_id), params=params, secrets=secrets, managed=True)
+        self._launch_job(
+            str(job_id),
+            params=params,
+            secrets=secrets,
+            managed=True,
+            environment=environment,
+        )
 
     def _launch_job(
         self,
         job_id: int | str,
         *,
         params: dict[str, Any] | None = None,
-        secrets: dict[str, Any] | AWSAccessKeyCredentials | None = None,
+        secrets: dict[str, Any] | None = None,
         managed: bool = False,
+        environment: JobEnvironment | None = None,
     ) -> None:
         """Notify BHE and submit one collector worker."""
         if self.job_running is not None:
             raise RuntimeError(f"Job {self.job_running} is already running")
 
-        if isinstance(secrets, AWSAccessKeyCredentials):
-            params = aws_profile_params(
-                {} if params is None else params, collector_name=self.collector_name
-            )
         logger.info("Starting job %s with collector '%s'.", job_id, self.collector_name)
         managed_job_id: str | None = None
         if managed:
@@ -742,29 +695,14 @@ class Service:
             time.monotonic() + HEARTBEAT_INTERVAL if managed else None
         )
         try:
-            if isinstance(secrets, AWSAccessKeyCredentials):
-                self._cleanup_aws_profile_workspace()
-                self._aws_profile_workspace = AWSProfileWorkspace()
             self.future = self.executor.submit(
                 _subprocess_collect,
                 self.collector_name,
                 job_id,
                 dict(params or {}) if managed else None,
-                (
-                    (
-                        secrets
-                        if isinstance(secrets, AWSAccessKeyCredentials)
-                        else dict(secrets or {})
-                    )
-                    if managed
-                    else None
-                ),
+                dict(secrets or {}) if managed else None,
                 *((True,) if managed else ()),
-                *(
-                    (self._aws_profile_workspace.directory,)
-                    if self._aws_profile_workspace is not None
-                    else ()
-                ),
+                *((dict(environment),) if managed and environment else ()),
             )
         except BrokenProcessPool:
             logger.exception("Failed to submit job %s: process pool is broken.", job_id)
@@ -861,9 +799,6 @@ class Service:
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
         """Report the completed worker's outcome through the active job API."""
-        # Erase credentials before uploads/end retries. This also runs when a
-        # killed worker could not execute its context manager's finally block.
-        self._cleanup_aws_profile_workspace()
         result: Result | None = None
         try:
             result = future.result()

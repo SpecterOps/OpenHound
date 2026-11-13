@@ -4,13 +4,10 @@ import hashlib
 import json
 import logging
 import os
-import subprocess
-import sys
 import time
 import traceback
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,8 +19,6 @@ import dlt
 import pytest
 import requests
 from botocore.exceptions import ClientError
-from botocore.httpsession import URLLib3Session
-from botocore.session import Session as BotocoreSession
 from botocore.stub import Stubber
 from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
@@ -48,7 +43,6 @@ from openhound.core.clients.models.jobs import (
 )
 from openhound.core.models.graph import Graph
 from openhound.scheduler import service as scheduler_service
-from openhound.scheduler.aws_profile import AWSAccessKeyCredentials, AWSAccessKeyError
 from openhound.scheduler.configuration import ManagedConfigurationError
 from openhound.scheduler.service import (
     ExtensionNotFoundError,
@@ -1744,11 +1738,11 @@ def test_managed_job_retrieves_full_hierarchy_secret_before_dlt_resolution(
     bhe_credentials = (service.client.token_id, service.client.token_key)
     state = mock_bloodhound_api.app.state
     data_dir = Path(__file__).parent / "test_data"
-    params = json.loads((data_dir / "managed_aws_configuration.json").read_text())
-    secret_document = (data_dir / "managed_aws_secrets.json").read_text()
-    service.collector_name = "aws"
-    state.collector_job_queue_response["data"]["jobs"][0]["job_key"] = "aws"
-    state.collector_job_claim_response.update(job_key="aws", params=params)
+    params = json.loads((data_dir / "managed_configuration.json").read_text())
+    secret_document = (data_dir / "managed_secrets.json").read_text()
+    service.collector_name = "example"
+    state.collector_job_queue_response["data"]["jobs"][0]["job_key"] = "example"
+    state.collector_job_claim_response.update(job_key="example", params=params)
     requests_seen = []
 
     def get_secret_value(*, SecretId):
@@ -1760,7 +1754,10 @@ def test_managed_job_retrieves_full_hierarchy_secret_before_dlt_resolution(
     )
     service.managed_job_runner = service._run_prepared_managed_job
     collector = SimpleNamespace(
-        name="aws", dlt_source=SimpleNamespace(), package_version="test", metadata=None
+        name="example",
+        dlt_source=SimpleNamespace(),
+        package_version="test",
+        metadata=None,
     )
     monkeypatch.setattr(
         scheduler_service.CollectorManager,
@@ -1771,21 +1768,17 @@ def test_managed_job_retrieves_full_hierarchy_secret_before_dlt_resolution(
 
     def collect(extension, output_path):
         resolved.update(
-            profiles=dlt.secrets.get(
-                "sources.source.aws.credentials.profile_names", list
+            secret_value=dlt.secrets.get(
+                "sources.source.example.credentials.secret_value", str
             ),
-            region=dlt.secrets.get("sources.source.aws.credentials.region_name", str),
-            max_objects=dlt.config.get(
-                "sources.source.aws.bucket_policy.max_objects", int
+            workspace=dlt.secrets.get(
+                "sources.source.example.credentials.workspace", str
             ),
+            limit=dlt.config.get("sources.source.example.selection.limit", int),
         )
         return {"collect": []}
 
     monkeypatch.setattr(scheduler_service.dataflow, "pipeline", collect)
-    # This test verifies configuration handoff, not existing AWS profiles.
-    monkeypatch.setattr(
-        scheduler_service, "validate_configured_aws_profiles", lambda: None
-    )
 
     def submit(function, *args):
         future = Future()
@@ -1799,174 +1792,17 @@ def test_managed_job_retrieves_full_hierarchy_secret_before_dlt_resolution(
 
     assert requests_seen == ["private-secret-reference"]
     assert resolved == {
-        "profiles": ["retrieved-profile-a", "retrieved-profile-b"],
-        "region": "us-west-2",
-        "max_objects": 50,
+        "secret_value": "retrieved-secret-value",
+        "workspace": "job-workspace",
+        "limit": 50,
     }
     assert (service.client.token_id, service.client.token_key) == bhe_credentials
     assert state.collector_job_end_requests[0]["body"] == {"outcome": "succeeded"}
-    for credential in ("retrieved-profile-a", "retrieved-profile-b"):
-        assert credential not in caplog.text
+    assert "retrieved-secret-value" not in caplog.text
 
 
 AWS_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"
 AWS_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-
-
-@pytest.mark.parametrize(
-    "case", ["single-denied", "single-success", "mixed", "all-denied"]
-)
-def test_existing_aws_profiles_report_authentication_outcome_through_queue(
-    managed_service, mock_bloodhound_api, case, monkeypatch, tmp_path, caplog
-):
-    """Exercise discovery/claim/start/end against the local API and real SDK files."""
-    scheduler = managed_service
-    scheduler.collector_name = "aws"
-    scheduler.managed_job_runner = scheduler._run_prepared_managed_job
-    state = mock_bloodhound_api.app.state
-    state.collector_job_queue_response["data"]["jobs"][0]["job_key"] = "aws"
-    config, credentials = tmp_path / "config", tmp_path / "credentials"
-    config.write_text(
-        "[profile good]\nregion=eu-west-1\n[profile denied]\nregion=eu-west-1\n"
-    )
-    contents = "".join(
-        f"[{profile}]\naws_access_key_id={AWS_ACCESS_KEY}\naws_secret_access_key={AWS_SECRET_KEY}\n"
-        for profile in ("good", "denied")
-    )
-    credentials.write_text(contents)
-    options = {"config_file": str(config), "credentials_file": str(credentials)}
-    if case in ("mixed", "all-denied"):
-        options["profile_names"] = ["denied", "good"] if case == "mixed" else ["denied"]
-    else:
-        options["profile_name"] = "good" if case == "single-success" else "denied"
-    document = {"sources": {"source": {"aws": {"credentials": options}}}}
-    scheduler.secrets_manager = AWSSecretsManager(
-        SimpleNamespace(
-            get_secret_value=lambda **kwargs: {"SecretString": json.dumps(document)}
-        )
-    )
-    state.collector_job_claim_response.update(
-        job_key="aws",
-        external_secret_key_id=None,
-        params={
-            "sources": {
-                "source": {"aws": {"credentials": {"region_name": "eu-west-1"}}}
-            }
-        },
-    )
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "scheduler-key")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "scheduler-secret")
-    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-    monkeypatch.setattr(
-        URLLib3Session, "send", lambda *a, **kw: pytest.fail("Live AWS request")
-    )
-    environment = dict(os.environ)
-    create_client = BotocoreSession.create_client
-    identities, stubbers, stages = [], [], []
-
-    def stub_identity(session, name, *args, **kwargs):
-        client = create_client(session, name, *args, **kwargs)
-        assert name == "sts"
-        profile = session.get_config_variable("profile")
-        assert profile in ("good", "denied")
-        assert client._request_signer._credentials.method == "shared-credentials-file"
-        assert client._request_signer._credentials.access_key == AWS_ACCESS_KEY
-        identities.append(profile)
-        stubber = Stubber(client)
-        if profile == "denied":
-            stubber.add_client_error(
-                "get_caller_identity",
-                service_error_code="InvalidClientTokenId",
-                expected_params={},
-            )
-        else:
-            stubber.add_response(
-                "get_caller_identity",
-                {
-                    "Account": "123456789012",
-                    "Arn": "arn:aws:iam::123456789012:user/collector",
-                    "UserId": "collector",
-                },
-                {},
-            )
-        stubber.activate()
-        stubbers.append(stubber)
-        return client
-
-    monkeypatch.setattr(BotocoreSession, "create_client", stub_identity)
-
-    def collect(**kwargs):
-        stages.append("collect")
-        return SimpleNamespace(load_packages=[])
-
-    collector = SimpleNamespace(
-        name="aws",
-        dlt_source=object(),
-        package_version="test",
-        metadata=None,
-        collector=collect,
-        preprocessor=object(),
-    )
-    monkeypatch.setattr(
-        scheduler_service.CollectorManager,
-        "from_entrypoint",
-        lambda: SimpleNamespace(collectors=[collector]),
-    )
-    monkeypatch.setattr(
-        scheduler_service.dataflow,
-        "preprocess",
-        lambda extension: stages.append("preprocess") or [],
-    )
-
-    def convert(extension, output_path):
-        stages.append("convert")
-        (output_path / "graph.json").write_text(Graph(graph={}).model_dump_json())
-        return []
-
-    monkeypatch.setattr(scheduler_service.dataflow, "convert", convert)
-
-    def submit(function, *args):
-        future = Future()
-        try:
-            future.set_result(function(*args))
-        except Exception as error:  # noqa: BLE001 - emulate ProcessPoolExecutor
-            future.set_exception(error)
-        return future
-
-    monkeypatch.setattr(scheduler.executor, "submit", submit)
-    failed = case in ("single-denied", "all-denied")
-    try:
-        scheduler._poll()
-        if failed:
-            with pytest.raises(ManagedConfigurationError):
-                scheduler.future.result()
-            assert stages == []
-        else:
-            assert scheduler.future.result().job_id == scheduler.job_running
-            assert stages == ["collect", "preprocess", "convert"]
-        state.collector_job_queue_response = load_json(
-            "collector_jobs_available_empty.json"
-        )
-        scheduler._poll()
-        assert len(state.collector_job_start_requests) == 1
-        assert len(state.collector_job_end_requests) == 1
-        assert state.collector_job_end_requests[0]["body"]["outcome"] == (
-            "failed" if failed else "succeeded"
-        )
-        assert len(state.managed_ingest_requests) == (0 if failed else 1)
-        assert identities == (
-            ["denied", "good"] if case == "mixed" else ["denied" if failed else "good"]
-        )
-        assert credentials.read_text() == contents
-        assert scheduler._aws_profile_workspace is None
-        assert scheduler.future is scheduler.job_running is None
-        assert dict(os.environ) == environment
-        assert AWS_ACCESS_KEY not in caplog.text and AWS_SECRET_KEY not in caplog.text
-        for stubber in stubbers:
-            stubber.assert_no_pending_responses()
-    finally:
-        for stubber in stubbers:
-            stubber.deactivate()
 
 
 @pytest.fixture
@@ -1979,11 +1815,7 @@ def aws_managed_service(managed_service, mock_bloodhound_api):
     state.collector_job_claim_response.update(
         job_key="aws",
         external_secret_key_id=AWS_ACCESS_KEY,
-        params={
-            "sources": {
-                "source": {"aws": {"credentials": {"region_name": "us-west-2"}}}
-            }
-        },
+        params={"custom": {"option": "job-value"}},
     )
     managed_service.secrets_manager = AWSSecretsManager(
         SimpleNamespace(
@@ -2000,7 +1832,7 @@ def aws_managed_service(managed_service, mock_bloodhound_api):
 @pytest.mark.parametrize(
     "binary_secret", [False, True], ids=["secret-string", "bhe-utf8-binary"]
 )
-def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
+def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_environment(
     aws_managed_service,
     mock_bloodhound_api,
     failed,
@@ -2009,69 +1841,41 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
     tmp_path,
     caplog,
 ):
+    monkeypatch.setenv("AWS_CREDENTIAL_EXPIRATION", "2000-01-01T00:00:00Z")
     scheduler = aws_managed_service
     state = mock_bloodhound_api.app.state
     # Secrets Manager continues using the scheduler's identity. Only the worker
-    # receives the customer's pair and changes its SDK file/config providers.
+    # receives the customer's pair through its job-scoped environment.
     client = boto3.Session(
         aws_access_key_id="scheduler-key",
         aws_secret_access_key="scheduler-secret",
         region_name="us-east-1",
     ).client("secretsmanager")
     scheduler.secrets_manager = AWSSecretsManager(client)
-    handoffs, seen_files = [], []
+    handoffs = []
     runner = scheduler.managed_job_runner
 
     def handoff(prepared):
         handoffs.append(prepared)
         assert prepared.job.external_secret_key_id == AWS_ACCESS_KEY
-        assert isinstance(prepared.credentials, AWSAccessKeyCredentials)
-        assert prepared.credentials.secret_access_key == AWS_SECRET_KEY
+        assert prepared.credentials == {}
+        assert prepared.environment["AWS_ACCESS_KEY_ID"] == AWS_ACCESS_KEY
+        assert prepared.environment["AWS_SECRET_ACCESS_KEY"] == AWS_SECRET_KEY
         runner(prepared)
 
     scheduler.managed_job_runner = handoff
-
-    create_client = BotocoreSession.create_client
-    identity_stubbers = []
-
-    def stub_identity(session, name, *args, **kwargs):
-        sts = create_client(session, name, *args, **kwargs)
-        if name == "sts":
-            assert sts._request_signer._credentials.access_key == AWS_ACCESS_KEY
-            stubber = Stubber(sts)
-            stubber.add_response(
-                "get_caller_identity",
-                {
-                    "Account": "123456789012",
-                    "Arn": "arn:aws:iam::123456789012:user/collector",
-                    "UserId": "collector",
-                },
-                {},
-            )
-            stubber.activate()
-            identity_stubbers.append(stubber)
-        return sts
-
-    monkeypatch.setattr(BotocoreSession, "create_client", stub_identity)
 
     def load_collectors():
         assert state.collector_job_start_requests == [
             (state.collector_job_claim_response["id"], b"")
         ]
-        settings = dlt.secrets.get("sources.source.aws.credentials", dict)
-        assert settings["profile_name"].startswith("openhound-job-")
-        assert settings["region_name"] == "us-west-2"
-        credentials = boto3.Session(
-            profile_name=settings["profile_name"], region_name=settings["region_name"]
-        ).get_credentials()
-        assert credentials.method == "shared-credentials-file"
-        frozen = credentials.get_frozen_credentials()
-        assert (frozen.access_key, frozen.secret_key, frozen.token) == (
-            AWS_ACCESS_KEY,
-            AWS_SECRET_KEY,
-            None,
-        )
-        seen_files.append(Path(os.environ["AWS_SHARED_CREDENTIALS_FILE"]))
+        assert dlt.config.get("custom.option", str) == "job-value"
+        assert os.environ["AWS_ACCESS_KEY_ID"] == AWS_ACCESS_KEY
+        assert os.environ["AWS_SECRET_ACCESS_KEY"] == AWS_SECRET_KEY
+        assert "AWS_SESSION_TOKEN" not in os.environ
+        assert "AWS_CREDENTIAL_EXPIRATION" not in os.environ
+        assert os.environ["AWS_CONFIG_FILE"] == os.devnull
+        assert os.environ["AWS_SHARED_CREDENTIALS_FILE"] == os.devnull
         return SimpleNamespace(
             collectors=[
                 SimpleNamespace(
@@ -2088,9 +1892,8 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
     )
 
     def collect(extension, output_path):
-        assert not seen_files[0].is_relative_to(output_path)
         if failed:
-            logging.getLogger("openhound_aws.auth").error(
+            logging.getLogger("example_extension.auth").error(
                 "Provider failure: %s", AWS_SECRET_KEY
             )
             raise RuntimeError(AWS_SECRET_KEY)
@@ -2120,9 +1923,6 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
             {"SecretId": "private-secret-reference"},
         )
         scheduler._poll()
-        directory = scheduler._aws_profile_workspace.directory
-        assert not seen_files[0].exists()  # Worker cleanup precedes parent reporting.
-        assert directory.exists()
         if not failed:
             result = scheduler.future.result()
             assert AWS_SECRET_KEY not in repr(result)
@@ -2132,8 +1932,6 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
         scheduler._handle_completed_job(scheduler.future)
         stubber.assert_no_pending_responses()
     assert len(handoffs) == 1
-    assert not directory.exists()
-    assert scheduler._aws_profile_workspace is None
     assert dict(os.environ) == environment
     assert client._request_signer._credentials.access_key == "scheduler-key"
     assert state.collector_job_end_requests[0]["body"]["outcome"] == (
@@ -2144,16 +1942,14 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_adapter(
     assert AWS_SECRET_KEY not in caplog.text
     assert AWS_SECRET_KEY not in repr(handoffs)
     assert all(AWS_SECRET_KEY not in repr(record.__dict__) for record in caplog.records)
-    assert len(identity_stubbers) == 1
-    for stubber in identity_stubbers:
-        stubber.assert_no_pending_responses()
-        stubber.deactivate()
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
         ("external_secret_key_id", None),
+        ("external_secret_key_id", ""),
+        ("external_secret_key_id", "  "),
         ("secret_key_id", None),
         ("secret_key_id", ""),
         ("secret_key_id", "  "),
@@ -2177,15 +1973,12 @@ def test_invalid_aws_metadata_fails_before_start_without_runtime_fallback(
     monkeypatch.setattr(aws_managed_service.secrets_manager, "get_secret", retrieve)
     with caplog.at_level(logging.DEBUG):
         aws_managed_service._poll()
-    # A null key ID permits a legacy document, whose shape requires retrieval.
+    # A null key ID permits a nested document, whose shape requires retrieval.
     assert requests_seen == (
-        ["private-secret-reference"]
-        if field == "external_secret_key_id" and value is None
-        else []
+        ["private-secret-reference"] if field == "external_secret_key_id" else []
     )
     assert state.collector_job_start_requests == []
     assert aws_managed_service.executor.submitted == []
-    assert aws_managed_service._aws_profile_workspace is None
     assert state.collector_job_end_requests[0]["body"]["outcome"] == "failed"
     assert AWS_SECRET_KEY not in caplog.text
     assert all(record.exc_info is None for record in caplog.records)
@@ -2219,60 +2012,18 @@ def test_invalid_raw_aws_payloads_are_not_trimmed_wrapped_or_treated_as_document
 @pytest.mark.parametrize(
     "options",
     [
-        {"profile_name": "local"},
-        {"profile_names": ["local"]},
-        {"profile_names": []},
-        {"auth_mode": "workload"},
-        {"authentication_mode": "profile"},
-        {"aws_session_token": "unsupported-token"},
-        {"aws_access_key_id": AWS_ACCESS_KEY},
-        {"source_account": "999999999999"},
-        {"org_role_name": ""},
-        {"org_role_name": 123},
-        {"role_arn": "arn:aws:iam::123456789012:user/Collector"},
-        {"role_arn": "arn:aws:iam::123456789:role/Collector"},
-        {"role_arn": "arn:aws:iam::123456789012:role/Collector\n"},
-        {
-            "role_arn": "arn:aws:iam::123456789012:role/Collector",
-            "role_session_name": "x",
-        },
-        {
-            "role_arn": "arn:aws:iam::123456789012:role/Collector",
-            "role_session_name": "x" * 65,
-        },
-        {
-            "role_arn": "arn:aws:iam::123456789012:role/Collector",
-            "role_session_name": "session\n[profile other]",
-        },
-        {
-            "role_arn": "arn:aws:iam::123456789012:role/Collector",
-            "role_session_name": None,
-        },
-        {
-            "role_arn": "arn:aws:iam::123456789012:role/Collector",
-            "external_id": "contains spaces",
-        },
-        {
-            "role_arn": "arn:aws:iam::123456789012:role/Collector",
-            "external_id": "x" * 1225,
-        },
-        {
-            "role_arn": "arn:aws:iam::123456789012:role/Collector",
-            "external_id": 123,
-        },
-        {
-            "role_arn": "arn:aws:iam::123456789012:role/Collector",
-            "source_account": "123456789012",
-        },
+        {"future_option": None},
+        {"future_option": ""},
+        {"future_option": "arbitrary\nvalue"},
+        {"future_option": [False, 0, {}, []]},
+        {"future_option": {"nested": {"enabled": False}}},
     ],
 )
-def test_raw_aws_settings_reach_worker_handoff_without_aws_validation(
+def test_raw_credential_jobs_forward_opaque_extension_settings(
     aws_managed_service, mock_bloodhound_api, options, monkeypatch
 ):
     state = mock_bloodhound_api.app.state
-    state.collector_job_claim_response["params"] = {
-        "sources": {"source": {"aws": {"credentials": options}}}
-    }
+    state.collector_job_claim_response["params"] = {"custom": options}
     monkeypatch.setattr(
         aws_managed_service.secrets_manager,
         "get_secret",
@@ -2282,47 +2033,11 @@ def test_raw_aws_settings_reach_worker_handoff_without_aws_validation(
     assert len(state.collector_job_start_requests) == 1
     submitted = aws_managed_service.executor.submitted[0][0]
     assert submitted[3] == state.collector_job_claim_response["params"]
-    assert submitted[3]["sources"]["source"]["aws"]["credentials"] == options
-    assert submitted[4].secret_access_key == AWS_SECRET_KEY
+    assert submitted[3]["custom"] == options
+    assert submitted[4] == {}
+    assert submitted[6]["AWS_ACCESS_KEY_ID"] == AWS_ACCESS_KEY
+    assert submitted[6]["AWS_SECRET_ACCESS_KEY"] == AWS_SECRET_KEY
     assert state.collector_job_end_requests == []
-    aws_managed_service._cleanup_aws_profile_workspace()
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"role_session_name": "collection-session"},
-        {"external_id": "customer-123"},
-        {"role_session_name": "collection-session", "external_id": "customer-123"},
-        {"role_arn": None},
-        {"role_arn": ""},
-        {"role_arn": " \t"},
-        {"role_arn": False},
-        {"role_arn": 123},
-        {"role_arn": []},
-        {"role_arn": {}},
-        {"role_arn": "", "role_session_name": "collection-session"},
-        {"role_arn": None, "external_id": "customer-123"},
-    ],
-)
-def test_incomplete_aws_role_settings_fail_before_secret_retrieval_and_start(
-    aws_managed_service, mock_bloodhound_api, options, monkeypatch, caplog
-):
-    state = mock_bloodhound_api.app.state
-    state.collector_job_claim_response["params"] = {
-        "sources": {"source": {"aws": {"credentials": options}}}
-    }
-    monkeypatch.setattr(
-        aws_managed_service.secrets_manager,
-        "get_secret",
-        lambda _: pytest.fail("Incomplete role settings must not retrieve credentials"),
-    )
-    aws_managed_service._poll()
-    assert "Managed AWS role settings require a non-empty role_arn" in caplog.text
-    assert state.collector_job_start_requests == []
-    assert aws_managed_service.executor.submitted == []
-    assert aws_managed_service._aws_profile_workspace is None
-    assert state.collector_job_end_requests[0]["body"]["outcome"] == "failed"
 
 
 def test_missing_new_bhe_job_field_rejects_claim_before_start(
@@ -2572,49 +2287,28 @@ def test_aws_preparation_keeps_safe_runtime_diagnostics(
     assert all(r.exc_info is None for r in caplog.records)
 
 
-@pytest.mark.parametrize("launch_path", ["run_claimed_job", "_launch_job"])
-@pytest.mark.parametrize("wrong_collector", [False, True])
-def test_aws_launch_paths_validate_before_start(
-    mock_service, mock_bloodhound_api, launch_path, wrong_collector
-):
-    mock_service.collector_name = "other" if wrong_collector else "aws"
-    params = (
-        {}
-        if wrong_collector
-        else {"sources": {"source": {"aws": {"credentials": "not-an-object"}}}}
-    )
-    kwargs = {"managed": True} if launch_path == "_launch_job" else {}
-    with pytest.raises(AWSAccessKeyError):
-        getattr(mock_service, launch_path)(
-            "job",
-            params=params,
-            secrets=AWSAccessKeyCredentials(AWS_ACCESS_KEY, AWS_SECRET_KEY),
-            **kwargs,
-        )
-    assert mock_bloodhound_api.app.state.collector_job_start_requests == []
-    assert mock_service.executor.submitted == []
-    assert mock_service._aws_profile_workspace is None
-    assert mock_service.future is mock_service.job_running is None
+@pytest.mark.parametrize("collector_name", ["aws", "other"])
+def test_workers_keep_generic_document_validation(collector_name):
+    with pytest.raises(ManagedConfigurationError, match="nested TOML sections"):
+        _subprocess_collect(collector_name, "job", {"flat": "invalid"}, {}, True)
 
 
 @pytest.mark.parametrize(
     "params",
     [
-        {"credentials": {"profile_names": ["other"]}},
-        {"sources": {"credentials": {"org_role_name": "OtherRole"}}},
-        {"sources": {"source": {"credentials": {"profile_name": "other"}}}},
-        {"sources": {"aws": {"credentials": {"profile_names": ["other"]}}}},
-        {"aws_collector": {"credentials": {"profile_names": ["other"]}}},
+        {"credentials": {"token": "opaque"}},
+        {"sources": {"credentials": {"references": ["opaque"]}}},
+        {"sources": {"source": {"credentials": {"token": "opaque"}}}},
+        {"sources": {"example": {"credentials": {"references": ["opaque"]}}}},
+        {"custom_pipeline": {"credentials": {"references": ["opaque"]}}},
         {
-            "aws_collector": {
-                "sources": {
-                    "source": {"aws": {"credentials": {"profile_name": "other"}}}
-                }
+            "custom_pipeline": {
+                "sources": {"source": {"example": {"credentials": {"token": "opaque"}}}}
             }
         },
     ],
 )
-def test_raw_aws_preserves_alternative_nested_authentication_layouts(
+def test_raw_credential_jobs_preserve_custom_configuration_layouts(
     aws_managed_service, mock_bloodhound_api, params
 ):
     state = mock_bloodhound_api.app.state
@@ -2622,20 +2316,13 @@ def test_raw_aws_preserves_alternative_nested_authentication_layouts(
     aws_managed_service._poll()
     assert len(state.collector_job_start_requests) == 1
     submitted = aws_managed_service.executor.submitted[0][0]
-    expected = deepcopy(params)
-    expected.setdefault("sources", {}).setdefault("source", {}).setdefault(
-        "aws", {}
-    ).setdefault("credentials", {})
-    assert submitted[3] == expected
+    assert submitted[3] == params
     assert state.collector_job_end_requests == []
-    aws_managed_service._cleanup_aws_profile_workspace()
 
 
+@pytest.mark.parametrize("key", ["nonstandard-key", "ASIAIOSFODNN7EXAMPLE", "key\n"])
 @pytest.mark.parametrize(
-    "key", ["", "nonstandard-key", "ASIAIOSFODNN7EXAMPLE", "key\n"]
-)
-@pytest.mark.parametrize(
-    "secret", ["", "short", "%" * 41, '"quoted-key"', '["key"]', " key\n"]
+    "secret", ["short", "%" * 41, '"quoted-key"', '["key"]', " key\n"]
 )
 def test_nonstandard_raw_keys_reach_handoff_unchanged(
     aws_managed_service, mock_bloodhound_api, key, secret
@@ -2647,10 +2334,10 @@ def test_nonstandard_raw_keys_reach_handoff_unchanged(
     )
     aws_managed_service._poll()
     submitted = aws_managed_service.executor.submitted[0][0]
-    assert submitted[4].access_key_id == key
-    assert submitted[4].secret_access_key == secret
+    assert submitted[4] == {}
+    assert submitted[6]["AWS_ACCESS_KEY_ID"] == key
+    assert submitted[6]["AWS_SECRET_ACCESS_KEY"] == secret
     assert len(state.collector_job_start_requests) == 1
-    aws_managed_service._cleanup_aws_profile_workspace()
 
 
 @pytest.mark.parametrize("reference", [" reference with spaces", "reference\nother"])
@@ -2669,7 +2356,6 @@ def test_aws_secret_reference_is_passed_to_reader_unchanged(
     aws_managed_service._poll()
     assert seen == [reference]
     assert len(state.collector_job_start_requests) == 1
-    aws_managed_service._cleanup_aws_profile_workspace()
 
 
 @pytest.mark.parametrize(
@@ -3017,7 +2703,7 @@ def test_missing_managed_secret_reference_fails_without_local_fallback(
     ],
     ids=["aws-permission-error", "aws-missing-secret", "unexpected-reader-error"],
 )
-def test_secret_retrieval_failure_keeps_local_cause_and_reports_safe_summary(
+def test_secret_retrieval_failure_keeps_safe_diagnostics_and_reports_safe_summary(
     managed_service, mock_bloodhound_api, caplog, error, summary
 ):
     state = mock_bloodhound_api.app.state
@@ -3044,9 +2730,10 @@ def test_secret_retrieval_failure_keeps_local_cause_and_reports_safe_summary(
     )
     assert failure_log.secret_id == state.collector_job_claim_response["secret_key_id"]
     if isinstance(error, ClientError):
-        assert error.response["Error"]["Message"] in caplog.text
-        assert "GetSecretValue" in caplog.text
-        assert failure_log.getMessage().count(failure_log.secret_id) == 1
+        assert error.response["Error"]["Message"] not in caplog.text
+        assert failure_log.aws_operation == "GetSecretValue"
+        assert failure_log.aws_error_code == error.response["Error"]["Code"]
+        assert failure_log.sdk_exception_type == "ClientError"
     assert "private-credential-value" not in caplog.text
     assert all(
         "private-credential-value" not in repr(r.__dict__) for r in caplog.records
@@ -3822,32 +3509,6 @@ def test_managed_configuration_failure_is_logged_and_reported_with_the_same_reas
         for record in caplog.records
     )
     assert "private-credential-value" not in json.dumps(request)
-
-
-def test_managed_worker_registers_real_faker_source_in_a_fresh_process(monkeypatch):
-    monkeypatch.setenv("SOURCES__SOURCE__RANDOM__NODE_COUNT", "999")
-    code = """
-from openhound.scheduler.service import _subprocess_collect, dataflow
-
-def inspect_collection(extension):
-    return {"node_count": len(list(extension.dlt_source()))}
-
-dataflow.pipeline = inspect_collection
-result = _subprocess_collect(
-    "faker", "e0d43dbd-2cdf-4d68-9a81-2f95cd58a92f",
-    {"sources": {"source": {"random": {"node_count": 4}}}}, {}
-)
-assert result.results == {"node_count": 4}, result.results
-result = _subprocess_collect(
-    "faker", "second-job", {"sources": {"source": {"random": {"node_count": 2}}}}, {}
-)
-assert result.results == {"node_count": 2}, result.results
-import dlt
-assert dlt.config.get("sources.source.random.node_count", int) == 999
-"""
-    subprocess.run(
-        [sys.executable, "-c", code], check=True, capture_output=True, timeout=30
-    )
 
 
 class FakeClock:
