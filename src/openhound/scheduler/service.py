@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import dlt
+
 import openhound
 import openhound.core.logging as openhound_logging
 from openhound.config import is_managed
@@ -35,6 +37,7 @@ from openhound.core.clients.models.jobs import (
     ManagementOperationType,
 )
 from openhound.core.manager import CollectorManager
+from openhound.core.runs import SavedRun
 from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import dataflow
 from openhound.scheduler.configuration import (
@@ -222,17 +225,45 @@ def _collect_in_worker(collector_name: str, job_id: int | str, managed: bool) ->
                 job_id,
                 extra=log_fields,
             )
-            output_path = (
-                Path(tempfile.mkdtemp(prefix="openhound-job-")) if managed else None
-            )
-            try:
-                results = (
-                    dataflow.pipeline(extension=collector)
-                    if output_path is None
-                    else dataflow.pipeline(extension=collector, output_path=output_path)
+            runs_directory = dlt.config.get("openhound.runs_directory", str)
+            saved_run = (
+                SavedRun.create(
+                    Path(runs_directory),
+                    collector=collector.name,
+                    collector_version=getattr(collector, "package_version", None),
+                    job_id=job_id,
+                    mode="write" if managed else "ingest",
+                    bhe_url=dlt.config.get("destination.bloodhoundenterprise.url", str),
                 )
+                if runs_directory
+                else None
+            )
+            output_path = None
+            if managed:
+                output_path = (
+                    saved_run.graph
+                    if saved_run
+                    else Path(tempfile.mkdtemp(prefix="openhound-job-"))
+                )
+            if saved_run:
+                logger.info(
+                    "Persisting job %s in saved run %s", job_id, saved_run.directory
+                )
+            try:
+                if saved_run:
+                    results = dataflow.pipeline(
+                        extension=collector, output_path=output_path, saved_run=saved_run
+                    )
+                else:
+                    results = (
+                        dataflow.pipeline(extension=collector)
+                        if output_path is None
+                        else dataflow.pipeline(
+                            extension=collector, output_path=output_path
+                        )
+                    )
             except BaseException:
-                if output_path is not None:
+                if output_path is not None and saved_run is None:
                     shutil.rmtree(output_path)
                 raise
             logger.info(
