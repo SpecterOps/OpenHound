@@ -55,10 +55,11 @@ unset/false to survey and collect; true means generate the file and stop.
 OpenHound forwards configuration unchanged; it does not translate these fields
 or validate AWS collection semantics. The extension reports invalid settings.
 
-### Migrating the supplied job example
+### Organization survey examples
 
-Two complete examples preserve the supplied account ID, role names, S3 rules,
-session label and 60-second collection read timeout:
+The examples use placeholder account IDs and role names. Replace them with your
+organization's values before running a job. Both include S3 rules, a collection
+session label and a 60-second collection read timeout:
 
 - [Direct member assumptions](managed-aws-source-members.json): use when member
   roles trust the identity of the stored keys. The management role is used to
@@ -66,7 +67,7 @@ session label and 60-second collection read timeout:
   key identity directly.
 - [Management-chained member assumptions](managed-aws-management-members.json):
   use when member roles trust the management identity. The starting keys assume
-  `kng-openhound-organization-role` in `594194277364`, then that role assumes
+  `OpenHoundManagementRole` in `111111111111`, then that role assumes
   `OpenHoundCollectorRole` in each member account.
 
 Both examples select survey by omitting `aws_config_file`. No `survey: true` or
@@ -81,7 +82,7 @@ DLT reads the JSON settings; the AWS extension writes the AWS config. Customer
 keys are delivered separately in the worker environment. Named roles must already
 exist with the corresponding permissions and trust relationships.
 
-| Supplied field | Migration |
+| Previous field | Migration |
 | --- | --- |
 | `management_account_id` / `management_role_name` | Keep the supplied values. |
 | `org_role_name` | Rename to `collector_assumed_role_name`. |
@@ -93,13 +94,10 @@ exist with the corresponding permissions and trust relationships.
 | `role_arn` | Remove the adapter-only starting-role setting. The examples use role names supported by survey. |
 | `bucket_policy` / `read_timeout` | Preserve unchanged. |
 
-The previous adapter-only starting role
-`arn:aws:iam::604472166808:role/kng-openhound-collection-role` is not recreated by
-these examples. They start from the identity of the stored keys. The member role
-remains `OpenHoundCollectorRole`, matching the old `org_role_name`. If the actual
-role deployed in the member accounts has a different name, use that name for
-`collector_assumed_role_name`; survey uses one member-role name throughout the
-organization.
+The examples start from the identity of the stored keys without an initial
+collection-role assumption. Replace `OpenHoundCollectorRole` with the role name
+deployed in the member accounts for `collector_assumed_role_name`; survey uses
+one member-role name throughout the organization.
 
 The all-match bucket/object expressions are preserved. Object inventory is still
 bounded by `bucket_policy.max_objects`, whose default is 10 per bucket. Matching
@@ -109,8 +107,8 @@ For these examples, the extension generates a management profile with:
 
 ```ini
 [profile openhound-management]
-role_arn = arn:aws:iam::594194277364:role/kng-openhound-organization-role
-role_session_name = product-openhound-collection
+role_arn = arn:aws:iam::111111111111:role/OpenHoundManagementRole
+role_session_name = openhound-collection
 credential_source = Environment
 bloodhound_collect = true
 bloodhound_organization_management = true
