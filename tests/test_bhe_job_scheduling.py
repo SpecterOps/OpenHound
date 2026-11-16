@@ -4424,11 +4424,14 @@ def test_managed_collection_failure_ends_failed_without_upload(
     assert mock_service.job_running is None
 
 
+@pytest.mark.parametrize("saved_runs", [False, True])
 def test_managed_collection_stages_then_uploads_before_job_end(
-    mock_service, mock_bloodhound_api, monkeypatch, tmp_path
+    mock_service, mock_bloodhound_api, monkeypatch, tmp_path, saved_runs
 ):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / ".dlt"))
+    if saved_runs:
+        monkeypatch.setenv("OPENHOUND__RUNS_DIRECTORY", str(tmp_path / "runs"))
     monkeypatch.setattr(
         scheduler_service.dataflow,
         "Path",
@@ -4458,6 +4461,11 @@ def test_managed_collection_stages_then_uploads_before_job_end(
     ]
     assert state.job_ended is False
     assert not result.output_path.exists()
+    if saved_runs:
+        workspace = result.output_path.parent
+        assert (workspace / "run.json").is_file()
+        assert (workspace / "raw" / "faker").is_dir()
+        assert (workspace / "pipelines" / "faker_convert" / "state.json").is_file()
 
 
 def test_failed_managed_conversion_cleans_up_staged_files(monkeypatch, tmp_path):
