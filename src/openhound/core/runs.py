@@ -1,10 +1,12 @@
 """Persistent, exclusively owned collection workspaces and phase checkpoints."""
 
+import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Literal
 from uuid import uuid4
 
@@ -113,6 +115,45 @@ class SavedRun:
             stream.flush()
             os.fsync(stream.fileno())
         pending.replace(self.directory / "run.json")
+
+    def write_collection_inventory(self) -> None:
+        """Record collected JSONL paths and sizes while holding the run lock.
+
+        This is informational metadata, not an input to recovery or packaging.
+        File contents are not read. The caller decides how to handle I/O errors.
+        """
+        files = [
+            {
+                "path": path.relative_to(self.directory).as_posix(),
+                "size_bytes": path.stat().st_size,
+            }
+            for path in sorted(self.raw.rglob("*.jsonl.gz"))
+            if not path.is_symlink() and path.is_file()
+        ]
+        inventory = {
+            "schema_version": 1,
+            "run_id": self.manifest.run_id,
+            "files": files,
+        }
+        pending: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix=".collection-inventory-",
+                suffix=".tmp",
+                dir=self.directory,
+                delete=False,
+            ) as stream:
+                pending = Path(stream.name)
+                json.dump(inventory, stream, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            pending.replace(self.directory / "collection-inventory.json")
+        finally:
+            if pending is not None:
+                pending.unlink(missing_ok=True)
 
     @contextmanager
     def configuration(

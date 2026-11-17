@@ -86,6 +86,10 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_lookup.py -v
 
+      - name: Run collection inventory tests
+        run: |
+          .venv/bin/pytest tests/test_collection_inventory.py -v
+
       - name: Run DLT Pydantic exception handling (override) test
         run: |
           .venv/bin/pytest tests/test_dlt_pydantic_override.py -v
