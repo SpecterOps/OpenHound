@@ -11,6 +11,8 @@ import dlt
 import pytest
 from dlt.common.configuration import configspec
 from dlt.common.configuration.container import Container
+from dlt.common.configuration.providers.doc import CustomLoaderDocProvider
+from dlt.common.configuration.providers.provider import ConfigProvider
 from dlt.common.configuration.providers.toml import ConfigTomlProvider
 from dlt.common.configuration.specs import BaseConfiguration, CredentialsConfiguration
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
@@ -210,6 +212,72 @@ def test_dynamic_nested_mappings_lists_and_falsy_values_resolve(params):
             dlt.config.get("sources.source.example.future_options.empty_list", list)
             == []
         )
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["success", "failure"])
+def test_collection_excludes_deployment_source_credentials_and_restores_providers(
+    params, monkeypatch, failed
+):
+    monkeypatch.setenv(
+        "SOURCES__SOURCE__EXAMPLE__CREDENTIALS__SECRET_VALUE", "deployment-secret"
+    )
+    monkeypatch.setenv(
+        "DESTINATION__BLOODHOUNDENTERPRISE__URL", "https://bhe.example.test"
+    )
+    local = CustomLoaderDocProvider(
+        "Deployment TOML equivalent",
+        lambda: {
+            "sources": {
+                "source": {
+                    "example": {"credentials": {"endpoint_url": "https://local.test"}}
+                }
+            }
+        },
+    )
+
+    class UnsectionedDefaults(ConfigProvider):
+        def get_value(self, key, hint, pipeline_name, *sections):
+            return "unsectioned-value", key
+
+        name = "Unsectioned deployment defaults"
+        supports_secrets = True
+        supports_sections = False
+
+    providers = Container()[PluggableRunContext].providers
+    monkeypatch.setattr(
+        providers, "providers", [*providers.providers, local, UnsectionedDefaults()]
+    )
+    previous = providers.providers
+    previous_traces = Container()[TraceLogContext]
+    del params["sources"]["source"]["example"]["credentials"]["endpoint_url"]
+
+    with (
+        pytest.raises(ManagedConfigurationError) if failed else nullcontext(),
+        managed_collection_configuration(params, {}),
+    ):
+        (row,) = list(configuration_source())
+        assert row["secret_value"] is None
+        assert row["endpoint"] is None
+        assert row["workspace"] == "job-workspace"
+        assert dlt.config.get("deployment_only", str) is None
+        assert (
+            dlt.config.get("destination.bloodhoundenterprise.url", str)
+            == "https://bhe.example.test"
+        )
+        if failed:
+            raise RuntimeError("collection failed")
+
+    assert providers.providers is previous
+    assert Container()[TraceLogContext] is previous_traces
+    assert (
+        dlt.secrets.get("sources.source.example.credentials.secret_value", str)
+        == "deployment-secret"
+    )
+    assert (
+        dlt.secrets.get("sources.source.example.credentials.endpoint_url", str)
+        == "https://local.test"
+    )
+    assert dlt.config.get("deployment_only", str) == "unsectioned-value"
 
 
 def test_retrieved_false_zero_and_rule_list_replace_matching_settings(params, secrets):

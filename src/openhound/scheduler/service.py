@@ -182,8 +182,8 @@ def _configured_worker_collect(
     configured = params is not None or secrets is not None
     # Retain SDK logging and source-credential isolation; authentication belongs
     # entirely to the extension.
-    # TODO: Replace job-key branching with an extension-owned worker setup contract
-    # once the temporary AWS compatibility behavior moves out of OpenHound.
+    # TODO: Revisit job-key branching after the platform-wide credential delivery
+    #  design is agreed; worker isolation and safe logging remain platform-owned.
     configure = (
         managed_collection_configuration
         if managed and collector_name == "aws"

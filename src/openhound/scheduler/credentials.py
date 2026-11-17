@@ -32,9 +32,9 @@ from openhound.scheduler.configuration import (
 logger = logging.getLogger(__name__)
 
 # Select temporary bindings by the extension's job_key, not BHE's numeric job_type_id.
-# TODO: Replace the AWS binding with the generic credential handoff once the AWS
-# extension accepts those inputs and owns SDK environment mapping and isolation.
-# Keep shared secret retrieval, worker-scoped delivery and redaction in OpenHound.
+# TODO: Revisit SDK environment mapping after the platform-wide credential
+#  delivery design is agreed. Worker isolation, secret retrieval and redaction
+#  remain OpenHound responsibilities.
 _TEMPORARY_ENVIRONMENT_BINDINGS: dict[str, tuple[str, str, JobEnvironment]] = {
     "aws": (
         "AWS_ACCESS_KEY_ID",
@@ -78,8 +78,10 @@ def prepare_job_credentials(
             "Managed job requires a valid secret_key_id reference"
         )
     binding = _TEMPORARY_ENVIRONMENT_BINDINGS.get(job.job_key)
-    identified_input = binding is not None and job.external_secret_key_id is not None
-    if identified_input:
+    uses_environment_credentials = (
+        binding is not None and job.external_secret_key_id is not None
+    )
+    if uses_environment_credentials:
         _validate_document(job.params)
     try:
         credentials = load_secret(reference)
@@ -98,7 +100,7 @@ def prepare_job_credentials(
             f"Credential secret reader failed ({type(error).__name__})",
             "Credential secret retrieval failed",
         ) from None
-    if not identified_input and isinstance(credentials, dict):
+    if not uses_environment_credentials and isinstance(credentials, dict):
         _validate_document(credentials, allow_empty=True)
         return credentials, {}
     if binding is None:
@@ -130,8 +132,12 @@ class _SourceCredentialFallback(ConfigProvider):
     def get_value(
         self, key: str, hint: type[Any], pipeline_name: str, *sections: str
     ) -> tuple[Any, str]:
+        # Unsectioned providers cannot distinguish source credentials from other
+        # defaults, so none of their values are safe to use as deployment fallback.
         if not self.provider.supports_sections:
             return None, key
+        # DLT resolves credentials field by field. Missing job fields must not
+        # silently select a deployment identity; destination defaults still apply.
         if (not sections or sections[0] in ("sources", "credentials")) and (
             key == "credentials" or "credentials" in sections
         ):
