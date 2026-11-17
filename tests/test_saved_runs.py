@@ -24,6 +24,7 @@ from typer.testing import CliRunner
 import openhound.cli.runs as runs_cli
 from openhound.cli.runs import runs
 from openhound.core.runs import SavedRun
+from openhound.core.upload_package import package_saved_run
 from openhound.destinations.opengraph.destination import opengraph_file
 from openhound.scheduler import dataflow, service
 
@@ -246,6 +247,10 @@ def test_recovery_uses_saved_collection_and_returns_local_graph(tmp_path, phase)
         dataflow.resume_saved_run(_extension(calls), SavedRun(run.directory)) == output
     )
     assert calls == []
+
+    archive, receipt = package_saved_run(run, tmp_path / "recovered.zip")
+    assert archive.is_file()
+    assert json.loads(receipt.read_text())["node_count"] == 1
 
 
 def test_failed_recovery_reuses_pending_packages_without_graph_extraction(
@@ -490,3 +495,20 @@ def test_recovery_can_resume_interrupted_local_preprocessing(monkeypatch, tmp_pa
     assert calls == ["preprocess", "convert", "graph_extract"]
     assert (run.directory / "recovery/lookup.duckdb").is_file()
     assert not run.lookup.exists()
+
+
+def test_recovery_without_a_preprocessor_can_be_packaged(tmp_path):
+    run = _create(tmp_path)
+    calls = []
+    with pytest.raises(RuntimeError):
+        dataflow.pipeline(
+            _extension(calls, "convert", with_preprocessor=False),
+            run.graph,
+            saved_run=run,
+        )
+    calls.clear()
+    dataflow.resume_saved_run(_extension(calls, with_preprocessor=False), run)
+    assert calls == ["convert", "graph_extract"]
+    assert not run.lookup.exists()
+    _, receipt = package_saved_run(run, tmp_path / "recovered.zip")
+    assert json.loads(receipt.read_text())["node_count"] == 1
