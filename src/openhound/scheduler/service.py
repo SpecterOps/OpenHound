@@ -1,5 +1,6 @@
 import logging
 import multiprocessing
+import os
 import shutil
 import signal
 import tempfile
@@ -226,6 +227,9 @@ def _collect_in_worker(collector_name: str, job_id: int | str, managed: bool) ->
                 extra=log_fields,
             )
             runs_directory = dlt.config.get("openhound.runs_directory", str)
+            if runs_directory is None:
+                # Image defaults must not override explicit TOML or environment settings.
+                runs_directory = os.environ.get("OPENHOUND_DEFAULT_RUNS_DIRECTORY")
             saved_run = (
                 SavedRun.create(
                     Path(runs_directory),

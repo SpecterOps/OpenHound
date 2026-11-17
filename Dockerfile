@@ -31,7 +31,7 @@ FROM gcr.io/distroless/python3:nonroot AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH="/app/src:/app/.venv/lib/python3.13/site-packages" \
-    OPENHOUND__RUNS_DIRECTORY=/var/lib/openhound/runs
+    OPENHOUND_DEFAULT_RUNS_DIRECTORY=/var/lib/openhound/runs
 
 COPY --from=builder --chown=nonroot:nonroot /app /app
 COPY --from=builder --chown=nonroot:nonroot /var/lib/openhound /var/lib/openhound

@@ -96,7 +96,9 @@ it writable by the container user.
 Configuring a directory alone does not make a container's filesystem persistent.
 Without this setting, a local Python scheduler keeps its existing storage paths.
 Docker images enable saved runs at `/var/lib/openhound/runs` by default, using the
-container filesystem. A volume is optional; see the
+container filesystem. This image default applies only when `runs_directory` is
+unset; explicit TOML settings and `OPENHOUND__RUNS_DIRECTORY` take precedence.
+A volume is optional; see the
 [Docker storage configuration](example-configurations/bloodhound-enterprise/README.md#saved-runs-inside-the-container)
 for persistent storage and package retrieval.
 

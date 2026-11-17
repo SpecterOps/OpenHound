@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import dlt
 import pytest
 from dlt.common.configuration.container import Container
+from dlt.common.configuration.providers.environ import EnvironProvider
+from dlt.common.configuration.providers.toml import ConfigTomlProvider
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
 from dlt.common.destination.exceptions import (
     DestinationHasFailedJobs,
@@ -319,6 +321,66 @@ def test_scheduler_opt_in_persists_failed_run(monkeypatch, tmp_path):
     assert run.manifest.results.keys() == {"collect", "preprocess"}
     assert (run.raw / "example").is_dir()
     assert run.lookup.is_file()
+
+
+@pytest.mark.parametrize(
+    ("toml", "environment", "image_default", "expected"),
+    [
+        (None, None, "image", "image"),
+        ("toml", None, "image", "toml"),
+        ("toml", "env", "image", "env"),
+        (None, "env", "image", "env"),
+        (None, "", "image", None),
+        ("toml", "", "image", None),
+        ("", None, "image", None),
+        ("toml", None, None, "toml"),
+        (None, None, None, None),
+    ],
+)
+def test_scheduler_runs_directory_precedence(
+    monkeypatch, tmp_path, toml, environment, image_default, expected
+):
+    """Image defaults must preserve explicit DLT settings and local opt-in."""
+
+    def directory(value):
+        return str(tmp_path / value) if value else value
+
+    for name, value in (
+        ("OPENHOUND__RUNS_DIRECTORY", environment),
+        ("OPENHOUND_DEFAULT_RUNS_DIRECTORY", image_default),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, directory(value))
+    settings = tmp_path / ".dlt"
+    settings.mkdir()
+    if toml is not None:
+        (settings / "config.toml").write_text(
+            "[openhound]\nruns_directory = " + json.dumps(directory(toml)) + "\n"
+        )
+    providers = Container()[PluggableRunContext].providers
+    monkeypatch.setattr(
+        providers, "providers", [EnvironProvider(), ConfigTomlProvider(str(settings))]
+    )
+    monkeypatch.setattr(
+        service.CollectorManager,
+        "from_entrypoint",
+        lambda: SimpleNamespace(collectors=[_extension([])]),
+    )
+    calls = []
+    monkeypatch.setattr(
+        service.dataflow, "pipeline", lambda **kwargs: calls.append(kwargs) or {}
+    )
+
+    service._collect_in_worker("example", 42, managed=True, configured=False)
+
+    run = calls[0].get("saved_run")
+    if expected is None:
+        assert run is None
+    else:
+        assert run.directory.parent == Path(directory(expected))
+        assert (run.directory / "run.json").is_file()
 
 
 def test_cli_resume_recovers_locally_without_collection(monkeypatch, tmp_path):
