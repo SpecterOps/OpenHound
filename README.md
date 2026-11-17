@@ -134,6 +134,30 @@ upload to BHE or reopen a failed BHE job.** A manifest's `complete` status refer
 to local pipeline phases, not confirmation that BHE finished the job. Uploading
 recovered files requires a separately coordinated ingest/job workflow.
 
+Create a ZIP for a BloodHound user to upload after recovery completes:
+
+```sh
+openhound runs package /var/lib/openhound/runs/<run-id> --output recovered-okta.zip
+```
+
+The command creates `recovered-okta.zip` and
+`recovered-okta.zip.manifest.json`. Upload **only the ZIP** through BloodHound's
+file upload workflow, using a user with ingestion permissions. Keep the manifest
+locally for its run/job provenance, node/edge counts, and SHA-256 checksums.
+This is a separate manual ingestion; it does not reopen or change the original
+collector job, and packaging makes no requests to BloodHound.
+
+Packaging locks the run, requires completed recovery, and validates each graph
+part against OpenHound's graph model. It includes only files listed in the graph
+destination's completion markers, with their original bytes unchanged. Missing
+parts, invalid graph documents, and empty graphs are rejected. Raw resources,
+DuckDB, DLT state, staging files, and the audit manifest are excluded from the
+ZIP. Existing outputs are never overwritten; choose another output name to
+create another package. The output parent directory must exist and support
+hard links, which are used to publish completed artifacts without overwriting
+files. Interrupted builds can leave a hidden temporary directory; they do not
+publish a partially written ZIP.
+
 Use the same OpenHound, DLT, and collector versions, plus the same tenant/source
 configuration needed by the collector's conversion hook. No configuration or
 credentials are copied into `run.json`. Recovery can run in a larger container:
