@@ -512,18 +512,20 @@ def test_checkin_swallows_exception(mock_service, monkeypatch):
 
 
 def test_scheduler_ingest_opengraph(mock_service, mock_bloodhound_api, monkeypatch):
-    """Run the DLT pipeline with the openhound-faker collector + check the amount of ingested nodes + edges"""
+    """Run the sample collector and check the number of ingested nodes and edges."""
     monkeypatch.setenv(
         "DESTINATION__BLOODHOUNDENTERPRISE__URL", "http://localhost:8000"
     )
     monkeypatch.setenv("DESTINATION__BLOODHOUNDENTERPRISE__TOKEN_KEY", "test-key")
     monkeypatch.setenv("DESTINATION__BLOODHOUNDENTERPRISE__TOKEN_ID", "test-id")
+    monkeypatch.setenv("SOURCES__SOURCE__SAMPLE__NODE_COUNT", "3")
+    monkeypatch.setenv("SOURCES__SOURCE__SAMPLE__SOFTWARE_PER_COMPUTER", "2")
 
-    result = _subprocess_collect("faker", 123)
+    result = _subprocess_collect("sample", 123)
 
     assert result.job_id == 123
-    assert mock_bloodhound_api.app.state.ingested_nodes == 1000
-    assert mock_bloodhound_api.app.state.ingested_edges == 10000
+    assert mock_bloodhound_api.app.state.ingested_nodes == 13
+    assert mock_bloodhound_api.app.state.ingested_edges == 15
 
 
 def _support_bundle_operation() -> dict:
