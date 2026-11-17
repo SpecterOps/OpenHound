@@ -13,6 +13,9 @@
 .benchmark-results
 dist
 output
+graph
 logs
 *.duckdb
 *.duckdb.*
+*.zip
+*.zip.manifest.json
