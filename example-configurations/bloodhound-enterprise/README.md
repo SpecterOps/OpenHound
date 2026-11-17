@@ -18,10 +18,13 @@ survive a stop/start or restart of the same container, but are deleted when that
 container is removed or replaced. A normal image update using Compose can replace
 the container, so copy needed data first or enable the persistent storage below.
 
-The image sets `OPENHOUND__RUNS_DIRECTORY`; environment variables take precedence
-over TOML. To change the directory in Docker, set that environment variable in
-the service and ensure the new location is writable. Local Python development
-keeps its existing opt-in `runs_directory` setting.
+The image sets `OPENHOUND_DEFAULT_RUNS_DIRECTORY` as a fallback. An explicit
+`[openhound].runs_directory` in TOML overrides it; an explicit
+`OPENHOUND__RUNS_DIRECTORY` environment variable takes precedence over TOML.
+Ensure any chosen directory is writable and mounted on persistent storage when
+needed. Setting `OPENHOUND__RUNS_DIRECTORY` to an empty string disables saved
+runs, including the image fallback. Local Python development keeps its existing
+opt-in `runs_directory` setting.
 
 Inspect and recover a finished run, then create a package for manual upload:
 
