@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 def extracted_resources(load_info: LoadInfo) -> list[str]:
+    # DLT can return normally with terminal failures when deployment settings
+    # disable raise_on_failed_jobs. Never checkpoint an incomplete phase.
+    load_info.raise_on_failed_jobs()
     all_resources = []
     for package in load_info.load_packages:
         for job in package.jobs["completed_jobs"]:

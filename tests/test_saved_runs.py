@@ -12,6 +12,10 @@ import dlt
 import pytest
 from dlt.common.configuration.container import Container
 from dlt.common.configuration.specs.pluggable_run_context import PluggableRunContext
+from dlt.common.destination.exceptions import (
+    DestinationHasFailedJobs,
+    DestinationTerminalException,
+)
 from dlt.normalize.normalize import Normalize
 from dlt.pipeline.exceptions import PipelineStepFailed
 from filelock import FileLock, Timeout
@@ -24,6 +28,60 @@ from openhound.destinations.opengraph.destination import opengraph_file
 from openhound.scheduler import dataflow, service
 
 
+@pytest.mark.parametrize("phase", ["collect", "preprocess", "convert"])
+def test_terminal_load_failure_does_not_complete_phase(monkeypatch, tmp_path, phase):
+    """DLT may return normally even when a load job failed permanently."""
+    monkeypatch.setenv("LOAD__RAISE_ON_FAILED_JOBS", "false")
+    run = _create(tmp_path)
+    extension = _extension([])
+
+    @dlt.destination(batch_size=0)
+    def terminal_destination(items, table):
+        raise DestinationTerminalException("simulated permanent load failure")
+
+    def failed_phase(**kwargs):
+        pipeline = dlt.pipeline(
+            pipeline_name=f"example_{phase}",
+            destination=terminal_destination(),
+            dataset_name="example",
+        )
+        return pipeline.run([{"id": "failed-node"}], table_name="nodes")
+
+    attribute = {
+        "collect": "collector",
+        "preprocess": "preprocessor",
+        "convert": "converter",
+    }[phase]
+    monkeypatch.setattr(extension, attribute, failed_phase)
+    with pytest.raises(DestinationHasFailedJobs):
+        dataflow.pipeline(extension, run.graph, saved_run=run)
+    manifest = SavedRun(run.directory).manifest
+    assert manifest.status == "failed"
+    assert manifest.phase == phase
+    assert phase not in manifest.results
+
+
+def test_terminal_load_failure_does_not_complete_recovery(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOAD__RAISE_ON_FAILED_JOBS", "false")
+    run = _create(tmp_path)
+    with pytest.raises(RuntimeError):
+        dataflow.pipeline(_extension([], "convert"), run.graph, saved_run=run)
+
+    def fail(*args, **kwargs):
+        raise DestinationTerminalException("simulated permanent load failure")
+
+    monkeypatch.setattr(
+        "openhound.destinations.opengraph.destination._write_part", fail
+    )
+    with pytest.raises(DestinationHasFailedJobs):
+        dataflow.resume_saved_run(_extension([]), run)
+    manifest = SavedRun(run.directory).manifest
+    assert manifest.recovery_status == "failed"
+    assert "convert" not in manifest.recovery_results
+    with pytest.raises(ValueError, match="terminal failed load jobs"):
+        dataflow.resume_saved_run(_extension([]), run)
+
+
 def _create(root: Path) -> SavedRun:
     """Create a run matching the local synthetic extension."""
     return SavedRun.create(
@@ -31,7 +89,7 @@ def _create(root: Path) -> SavedRun:
     )
 
 
-def _extension(calls: list, fail_at: str | None = None):
+def _extension(calls: list, fail_at: str | None = None, *, with_preprocessor=True):
     """Use real DLT storage with synthetic local resources and graph records."""
 
     def collect(output_path, **kwargs):
@@ -61,7 +119,8 @@ def _extension(calls: list, fail_at: str | None = None):
     def convert(input_path, output_path, lookup_file, method, **kwargs):
         calls.append("convert")
         assert input_path.is_dir()
-        assert lookup_file.is_file()
+        if with_preprocessor:
+            assert lookup_file.is_file()
         assert method is dataflow.Method.write
         if fail_at == "convert":
             raise RuntimeError("conversion interrupted")
@@ -75,7 +134,11 @@ def _extension(calls: list, fail_at: str | None = None):
                     "content": {
                         "id": "saved-node",
                         "kinds": ["Test"],
-                        "properties": {},
+                        "properties": {
+                            "name": "Saved node",
+                            "displayname": "Saved node",
+                            "environmentid": "test",
+                        },
                     },
                 }
             }
@@ -92,7 +155,7 @@ def _extension(calls: list, fail_at: str | None = None):
         name="example",
         package_version="1",
         collector=collect,
-        preprocessor=preprocess,
+        preprocessor=preprocess if with_preprocessor else None,
         converter=convert,
     )
 
@@ -377,3 +440,53 @@ print(json.dumps({"calls": calls, "output": str(output)}))
     assert recovered["calls"] == []
     assert list(Path(recovered["output"]).glob("*.json"))
     assert SavedRun(run.directory).manifest.recovery_status == "complete"
+
+
+def test_recovery_resumes_normalized_packages_without_extraction(monkeypatch, tmp_path):
+    """An interruption immediately before loading leaves normalized packages."""
+    from dlt.pipeline.pipeline import Pipeline
+
+    run = _create(tmp_path)
+    calls = []
+    with pytest.raises(RuntimeError):
+        dataflow.pipeline(_extension(calls, "convert"), run.graph, saved_run=run)
+    original_load = Pipeline.load
+
+    def interrupt(self, *args, **kwargs):
+        raise RuntimeError("interrupted before loading")
+
+    monkeypatch.setattr(Pipeline, "load", interrupt)
+    with pytest.raises(RuntimeError, match="interrupted before loading"):
+        dataflow.resume_saved_run(_extension(calls), run)
+    packages = run.inspect()["packages"]["recovery/pipelines/example_convert"]
+    assert packages["normalized"]
+    assert not packages["extracted"]
+    calls.clear()
+    monkeypatch.setattr(Pipeline, "load", original_load)
+    output = dataflow.resume_saved_run(_extension(calls), run)
+    assert list(output.glob("*.json"))
+    assert calls == []
+
+
+def test_recovery_can_resume_interrupted_local_preprocessing(monkeypatch, tmp_path):
+    run = _create(tmp_path)
+    calls = []
+    with pytest.raises(RuntimeError):
+        dataflow.pipeline(_extension(calls, "preprocess"), run.graph, saved_run=run)
+    original_single = Normalize.map_single
+
+    def interrupt(self, *args, **kwargs):
+        raise BrokenProcessPool("interrupted preprocessing")
+
+    monkeypatch.setattr(Normalize, "map_single", interrupt)
+    with pytest.raises(PipelineStepFailed):
+        dataflow.resume_saved_run(_extension(calls), run)
+    assert run.manifest.recovery_phase == "preprocess"
+    assert "preprocess" not in run.manifest.recovery_results
+    calls.clear()
+    monkeypatch.setattr(Normalize, "map_single", original_single)
+    output = dataflow.resume_saved_run(_extension(calls), run)
+    assert list(output.glob("*.json"))
+    assert calls == ["preprocess", "convert", "graph_extract"]
+    assert (run.directory / "recovery/lookup.duckdb").is_file()
+    assert not run.lookup.exists()
