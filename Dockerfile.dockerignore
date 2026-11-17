@@ -1,0 +1,18 @@
+# Keep local credentials, collected data, and environments out of runtime images.
+.dlt
+**/.dlt
+.aws
+.ssh
+.env
+.env.*
+.venv
+.worktrees
+**/__pycache__
+.*_cache
+logs
+output
+graph
+*.duckdb
+*.duckdb.*
+*.zip
+*.zip.manifest.json

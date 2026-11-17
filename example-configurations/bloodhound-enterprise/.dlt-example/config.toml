@@ -1,6 +1,10 @@
 # Example configuration: https://bloodhound.specterops.io/openhound/enterprise#full-configuration-example
 [openhound]
 managed = false
+# Docker images default saved runs to /var/lib/openhound/runs. To change that
+# path in Docker, override OPENHOUND__RUNS_DIRECTORY in the service environment.
+# For local Python development, opt in with a writable host path:
+# runs_directory = "/absolute/path/to/openhound-runs"
 
 # Managed deployments read BHE HMAC credentials from AWS Secrets Manager rather
 # than secrets.toml. The named secret must be a JSON object with token_id and
