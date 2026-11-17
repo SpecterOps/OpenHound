@@ -77,3 +77,7 @@ jobs:
       - name: Run DLT Pydantic exception handling (override) test
         run: |
           .venv/bin/pytest tests/test_dlt_pydantic_override.py -v
+
+      - name: Run tests for filtering (collected) resources via config.toml/cli
+        run: |
+          .venv/bin/pytest tests/test_collect_resources.py -v
