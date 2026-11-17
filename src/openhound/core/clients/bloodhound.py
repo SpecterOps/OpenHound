@@ -5,6 +5,7 @@ import hmac
 import logging
 from abc import ABC, abstractmethod
 from datetime import timedelta
+from typing import BinaryIO
 
 import requests
 from dlt.common import json
@@ -45,7 +46,7 @@ class BloodHoundClient(ABC):
         self,
         method: str,
         path: str,
-        body: bytes | None = None,
+        body: bytes | BinaryIO | None = None,
         extra_headers: dict[str, str] | None = None,
         timeout: tuple[float, float] | None = None,
     ): ...
@@ -55,7 +56,7 @@ class BloodHoundClient(ABC):
         method: str,
         path: str,
         headers: dict[str, str],
-        body: bytes | None = None,
+        body: bytes | BinaryIO | None = None,
         extra_headers: dict[str, str] | None = None,
         timeout: tuple[float, float] | None = None,
     ):
@@ -169,7 +170,7 @@ class BloodHound(BloodHoundClient):
         self,
         method: str,
         path: str,
-        body: bytes | None = None,
+        body: bytes | BinaryIO | None = None,
         extra_headers: dict[str, str] | None = None,
         timeout: tuple[float, float] | None = None,
     ):
@@ -187,8 +188,15 @@ class BloodHound(BloodHoundClient):
 
         # HMAC Part 3
         digester = hmac.new(digester.digest(), None, hashlib.sha256)
-        if body is not None:
+        if isinstance(body, bytes):
             digester.update(body)
+        elif body is not None:
+            position = body.tell()
+            try:
+                while chunk := body.read(1024 * 1024):
+                    digester.update(chunk)
+            finally:
+                body.seek(position)
 
         sig = base64.b64encode(digester.digest()).decode()
         headers = {
@@ -217,7 +225,7 @@ class BloodHoundJWT(BloodHoundClient):
         self,
         method: str,
         path: str,
-        body: bytes | None = None,
+        body: bytes | BinaryIO | None = None,
         extra_headers: dict[str, str] | None = None,
         timeout: tuple[float, float] | None = None,
     ):
