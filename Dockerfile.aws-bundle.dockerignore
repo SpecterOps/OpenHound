@@ -1,7 +1,7 @@
 .git
 .venv
-.env
-.env.*
+**/.env
+**/.env.*
 .dlt
 .aws
 .config
@@ -12,10 +12,10 @@
 .*_cache
 .benchmark-results
 dist
-output
-graph
+**/output
+**/graph
 logs
-*.duckdb
-*.duckdb.*
-*.zip
-*.zip.manifest.json
+**/*.duckdb
+**/*.duckdb.*
+**/*.zip
+**/*.zip.manifest.json
