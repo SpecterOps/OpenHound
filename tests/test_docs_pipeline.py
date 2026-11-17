@@ -7,27 +7,27 @@ from openhound.docs.pipeline import CustomCollectorDocs
 
 def test_render_class_table_supports_inherited_fields_and_templates_are_static():
     asset = {
-        "class": "FakeComputer",
-        "path": "openhound_faker.models.computer.FakeComputer",
+        "class": "SampleComputer",
+        "path": "openhound_sample.models.computer.SampleComputer",
         "node": {
-            "kind": "RAND_Computer",
+            "kind": "Sample_Computer",
             "icon": "computer",
-            "properties": "openhound_faker.models.computer.ComputerProperties",
+            "properties": "openhound_sample.models.computer.ComputerProperties",
         },
         "edges": [],
     }
-    docs = CustomCollectorDocs("faker", base_docs_dir=Path.cwd(), assets=[asset])
+    docs = CustomCollectorDocs("sample", base_docs_dir=Path.cwd(), assets=[asset])
 
     node_table = docs.render_class_table(
-        "openhound_faker.models.computer.ComputerProperties",
+        "openhound_sample.models.computer.ComputerProperties",
         include_inherited=True,
     )
     assert "| `name` | `str` | - |" in node_table
-    assert "| `tenant` | `str` | - |" in node_table
-    assert "| `hostname` | `str` | - |" in node_table
+    assert "| `tenant` | `str` | The synthetic tenant name. |" in node_table
+    assert "| `hostname` | `str` | The synthetic computer hostname. |" in node_table
 
     resource_table = docs.render_class_table(
-        "openhound_faker.models.computer.FakeComputer"
+        "openhound_sample.models.computer.SampleComputer"
     )
     assert "| `hostname` | `str` | - |" in resource_table
     assert "| `tenant` | `str` | - |" not in resource_table
@@ -35,9 +35,9 @@ def test_render_class_table_supports_inherited_fields_and_templates_are_static()
     asset_render = docs.asset_templates[0]["render"]
     node_render = docs.node_templates[0]["render"]
 
-    assert "::: openhound_faker.models.computer.ComputerProperties" not in asset_render
-    assert "::: openhound_faker.models.computer.FakeComputer" not in asset_render
-    assert "::: openhound_faker.models.computer.ComputerProperties" not in node_render
+    assert "::: openhound_sample.models.computer.ComputerProperties" not in asset_render
+    assert "::: openhound_sample.models.computer.SampleComputer" not in asset_render
+    assert "::: openhound_sample.models.computer.ComputerProperties" not in node_render
     assert "| `hostname` | `str` | - |" in asset_render
     assert "| `name` | `str` | - |" in node_render
 
@@ -90,35 +90,35 @@ class ChildProperties(BaseProperties):
 
 def test_generated_node_and_edge_pages_inline_custom_descriptions(tmp_path):
     descriptions_dir = tmp_path / "descriptions"
-    (descriptions_dir / "faker" / "nodes").mkdir(parents=True)
-    (descriptions_dir / "faker" / "edges").mkdir(parents=True)
-    (descriptions_dir / "faker" / "nodes" / "RAND_Computer.md").write_text(
+    (descriptions_dir / "sample" / "nodes").mkdir(parents=True)
+    (descriptions_dir / "sample" / "edges").mkdir(parents=True)
+    (descriptions_dir / "sample" / "nodes" / "Sample_Computer.md").write_text(
         "Node-specific handwritten content."
     )
-    (descriptions_dir / "faker" / "edges" / "RAND_ExampleReference.md").write_text(
+    (descriptions_dir / "sample" / "edges" / "Sample_ExampleReference.md").write_text(
         "Edge-specific handwritten content."
     )
 
     asset = {
-        "class": "FakeComputer",
-        "path": "openhound_faker.models.computer.FakeComputer",
+        "class": "SampleComputer",
+        "path": "openhound_sample.models.computer.SampleComputer",
         "node": {
-            "kind": "RAND_Computer",
+            "kind": "Sample_Computer",
             "icon": "computer",
-            "properties": "openhound_faker.models.computer.ComputerProperties",
+            "properties": "openhound_sample.models.computer.ComputerProperties",
         },
         "edges": [
             {
-                "start": "RAND_Computer",
-                "end": "RAND_Computer",
-                "kind": "RAND_ExampleReference",
+                "start": "Sample_Computer",
+                "end": "Sample_Computer",
+                "kind": "Sample_ExampleReference",
                 "description": "Binding DummyComputer to another DummyComputer",
                 "traversable": False,
             }
         ],
     }
     docs = CustomCollectorDocs(
-        "faker",
+        "sample",
         base_docs_dir=tmp_path,
         assets=[asset],
         descriptions_dir=descriptions_dir,
@@ -129,8 +129,8 @@ def test_generated_node_and_edge_pages_inline_custom_descriptions(tmp_path):
 
     assert "Node-specific handwritten content." in node_render
     assert "Edge-specific handwritten content." in edge_render
-    assert '--8<-- "RAND_Computer.md"' not in node_render
-    assert '--8<-- "RAND_ExampleReference.md"' not in edge_render
+    assert '--8<-- "Sample_Computer.md"' not in node_render
+    assert '--8<-- "Sample_ExampleReference.md"' not in edge_render
 
 
 def test_to_markdown_rejects_writes_outside_cli_output_dir(tmp_path):

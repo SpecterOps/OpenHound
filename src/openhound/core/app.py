@@ -6,6 +6,8 @@ from typing import Annotated, Callable, List
 import dlt
 import duckdb
 import typer
+from dlt.common.configuration import configspec, resolve_configuration
+from dlt.common.configuration.specs import BaseConfiguration
 from dlt.common.libs import pydantic as dlt_pydantic
 from dlt.common.pipeline import LoadInfo
 from dlt.extract.resource import DltResource
@@ -49,6 +51,11 @@ class Contract(str, Enum):
     evolve = "evolve"
     freeze = "freeze"
     discard_row = "discard_row"
+
+
+@configspec
+class CollectConfiguration(BaseConfiguration):
+    resources: list[str] | None = None
 
 
 class OpenHound:
@@ -139,6 +146,21 @@ class OpenHound:
                 ctx = CollectContext(pipeline=collector)
                 source_method: DltSource = func(ctx)
                 if source_method:
+                    if not collector.resources:
+                        sections = ("sources", source_method.section, source_method.name)
+                        configured_resources = resolve_configuration(
+                            CollectConfiguration(), sections=sections
+                        ).resources
+                        if configured_resources is not None:
+                            if not isinstance(configured_resources, list) or any(
+                                not isinstance(resource, str) or not resource.strip()
+                                for resource in configured_resources
+                            ):
+                                raise ValueError(
+                                    f"Configuration '{'.'.join(sections)}.resources' "
+                                    "must be a list of nonblank strings"
+                                )
+                            collector.resources = configured_resources
                     return collector.run(source_method)
 
             logger.debug(f"Registering collect command for {self.name}")
