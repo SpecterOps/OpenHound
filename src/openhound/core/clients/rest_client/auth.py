@@ -4,6 +4,7 @@ from base64 import b64encode
 from collections.abc import AsyncGenerator, Generator, Iterable
 from dataclasses import field
 from typing import Annotated, Any, Final, Literal, cast
+from weakref import WeakValueDictionary
 
 import httpx2
 from dlt.common.configuration import configspec
@@ -163,7 +164,11 @@ class OAuth2ClientCredentials(OAuth2AuthBase):
         if self.access_token_request_data is None:
             self.access_token_request_data = {}
         self.token_expiry = pendulum.now()
-        self._refresh_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+        # Callers keep the lock alive while using it; idle locks must not retain
+        # completed extraction loops when this authenticator is reused.
+        self._refresh_locks: WeakValueDictionary[
+            asyncio.AbstractEventLoop, asyncio.Lock
+        ] = WeakValueDictionary()
         if self.session is None:
             self.session = _default_session
 
@@ -195,7 +200,9 @@ class OAuth2ClientCredentials(OAuth2AuthBase):
         response = await self.session.post(
             self.access_token_url, **self.build_access_token_request()
         )
-        response.raise_for_status()
+        # requests raises only for 4xx/5xx; httpx2 also raises for redirects.
+        if response.status_code >= 400:
+            response.raise_for_status()
         response_json = response.json()
         self.parse_native_representation(self.parse_access_token(response_json))
         expires_in_seconds = self.parse_expiration_in_seconds(response_json)
@@ -244,7 +251,9 @@ class OAuthJWTAuth(BearerTokenAuth):
             self.scopes = " ".join(self.scopes)  # type: ignore[arg-type]
         self.token = None  # type: ignore[assignment]
         self.token_expiry: pendulum.DateTime | None = None
-        self._refresh_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+        self._refresh_locks: WeakValueDictionary[
+            asyncio.AbstractEventLoop, asyncio.Lock
+        ] = WeakValueDictionary()
         if self.session is None:
             self.session = _default_session
 
@@ -276,7 +285,7 @@ class OAuthJWTAuth(BearerTokenAuth):
         try:
             import jwt  # type: ignore[import-not-found]  # Optional dependency.
         except ModuleNotFoundError:
-            raise MissingDependencyException("dlt OAuth helpers", ["PyJWT"]) from None
+            raise MissingDependencyException("dlt OAuth helpers", ["PyJWT"])
         payload = self.create_jwt_payload()
         private_key = await asyncio.to_thread(self.load_private_key)
         data = {
@@ -288,7 +297,8 @@ class OAuthJWTAuth(BearerTokenAuth):
         response = await self.session.post(
             self.auth_endpoint, headers=self.headers, data=data
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            response.raise_for_status()
         token_response = response.json()
         self.token = token_response["access_token"]
         self.token_expiry = pendulum.now().add(
@@ -316,9 +326,7 @@ class OAuthJWTAuth(BearerTokenAuth):
                 serialization,
             )
         except ModuleNotFoundError:
-            raise MissingDependencyException(
-                "dlt OAuth helpers", ["cryptography"]
-            ) from None
+            raise MissingDependencyException("dlt OAuth helpers", ["cryptography"])
         return serialization.load_pem_private_key(
             self.private_key.encode(),
             password=(
