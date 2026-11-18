@@ -25,6 +25,7 @@ dependencies = [
     "gitpython>=3.2.1",
     "setuptools>=84.2.1",
     "urllib3>=2.8.0",
+    "httpx2[http2]>=2.16.2",
 ]
 
 [project.optional-dependencies]
