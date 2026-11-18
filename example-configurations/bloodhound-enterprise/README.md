@@ -14,3 +14,6 @@ Full configuration reference: https://bloodhound.specterops.io/openhound/enterpr
  All config and secret files referenced below MUST exist before running
  `docker compose up`. If they are missing, Docker will create them as directories,
  which will cause the collector to fail.
+
+Cloud collection beta examples for internal use are in
+[cloud-collection-beta-examples/](cloud-collection-beta-examples/).

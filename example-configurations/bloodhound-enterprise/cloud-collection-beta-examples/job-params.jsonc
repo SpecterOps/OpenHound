@@ -1,0 +1,28 @@
+// These job params are specifically for use with the OpenHound AWS extension.
+{
+  "sources": {
+    "source": {
+      "aws": {
+        "credentials": {
+          "management_account_id": "111111111111",
+          "management_role_name": "OpenHoundManagementRole",
+          "collector_assumed_role_name": "OpenHoundCollectorRole",
+          "member_role_source": "source", // Either "source" or "management"; see README.md.
+          "runtime_auth_mode": "default_chain"
+        },
+        "max_attempts": 2,
+        "bucket_policy": {
+          "include": true,
+          "max_objects": 50,
+          "rule": [
+            {
+              "include": true,
+              "match_bucket": "\\A[\\s\\S]*\\Z",
+              "match_object": "\\A[\\s\\S]*\\Z"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

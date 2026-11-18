@@ -1,0 +1,20 @@
+{
+  "sources": {
+    "source": {
+      "example": {
+        "credentials": {
+          "workspace": "job-workspace",
+          "endpoint_url": "https://collector.example.test"
+        },
+        "selection": {
+          "include": true,
+          "limit": 50,
+          "rule": [
+            {"include": true, "match_resource": ".*"},
+            {"include": false, "match_record": "private/.*"}
+          ]
+        }
+      }
+    }
+  }
+}
