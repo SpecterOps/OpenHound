@@ -57,3 +57,9 @@ config:
   mountPath: /app/.dlt
   existingConfigMap: ""
   existingSecret: ""
+
+# Optional storage for saved runs. Create the PVC separately in the release namespace.
+persistence:
+  enabled: false
+  existingClaim: ""
+  mountPath: /var/lib/openhound/runs

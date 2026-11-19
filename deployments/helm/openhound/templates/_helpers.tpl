@@ -48,6 +48,17 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- fail "config.existingConfigMap is required" -}}
 {{- end -}}
 
+{{- $persistence := default dict .Values.persistence -}}
+{{- if $persistence.enabled -}}
+  {{- if not $persistence.existingClaim -}}
+    {{- fail "persistence.existingClaim is required when persistence is enabled" -}}
+  {{- end -}}
+  {{- $mountPath := required "persistence.mountPath is required when persistence is enabled" $persistence.mountPath -}}
+  {{- if or (not (hasPrefix "/" $mountPath)) (eq (clean $mountPath) "/") -}}
+    {{- fail "persistence.mountPath must be an absolute directory other than /" -}}
+  {{- end -}}
+{{- end -}}
+
 {{- range $name, $secret := .Values.collector.extraSecretMounts }}
   {{- if not $secret.secretName -}}
     {{- fail (printf "collector.extraSecretMounts.%s.secretName is required" $name) -}}

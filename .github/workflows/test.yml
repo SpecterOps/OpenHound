@@ -89,3 +89,13 @@ jobs:
       - name: Run DLT Pydantic exception handling (override) test
         run: |
           .venv/bin/pytest tests/test_dlt_pydantic_override.py -v
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.0.0
+
+      - name: Validate Helm persistence configuration
+        run: |
+          helm lint deployments/helm/openhound -f deployments/helm/values.example.yaml --strict
+          .venv/bin/pytest tests/test_helm_persistence.py -v

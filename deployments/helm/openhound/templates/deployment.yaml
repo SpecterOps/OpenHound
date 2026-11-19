@@ -1,3 +1,4 @@
+{{- $persistence := default dict .Values.persistence -}}
 {{- include "openhound.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
@@ -7,6 +8,11 @@ metadata:
     {{- include "openhound.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  {{- if $persistence.enabled }}
+  strategy:
+    type: Recreate
+    rollingUpdate: null # Clear settings from earlier RollingUpdate releases.
+  {{- end }}
   selector:
     matchLabels:
       {{- include "openhound.selectorLabels" . | nindent 6 }}
@@ -55,6 +61,10 @@ spec:
           env:
             - name: DESTINATION__BLOODHOUNDENTERPRISE__COLLECTOR_NAME
               value: {{ .Values.collector.name | quote }}
+            {{- if and $persistence.enabled (not (hasKey (default dict .Values.env) "OPENHOUND_DEFAULT_RUNS_DIRECTORY")) (not (hasKey (default dict .Values.collector.env) "OPENHOUND_DEFAULT_RUNS_DIRECTORY")) }}
+            - name: OPENHOUND_DEFAULT_RUNS_DIRECTORY
+              value: {{ $persistence.mountPath | quote }}
+            {{- end }}
             {{- if .Values.destination.bloodhoundEnterprise.url }}
             - name: DESTINATION__BLOODHOUNDENTERPRISE__URL
               value: {{ .Values.destination.bloodhoundEnterprise.url | quote }}
@@ -67,8 +77,12 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
-          {{- if or .Values.config.existingConfigMap .Values.config.existingSecret .Values.collector.extraSecretMounts }}
+          {{- if or .Values.config.existingConfigMap .Values.config.existingSecret .Values.collector.extraSecretMounts $persistence.enabled }}
           volumeMounts:
+            {{- if $persistence.enabled }}
+            - name: saved-runs
+              mountPath: {{ $persistence.mountPath | quote }}
+            {{- end }}
             {{- if .Values.config.existingConfigMap }}
             - name: dlt-config
               mountPath: {{ .Values.config.mountPath }}/config.toml
@@ -92,8 +106,13 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- if or .Values.config.existingConfigMap .Values.config.existingSecret .Values.collector.extraSecretMounts }}
+      {{- if or .Values.config.existingConfigMap .Values.config.existingSecret .Values.collector.extraSecretMounts $persistence.enabled }}
       volumes:
+        {{- if $persistence.enabled }}
+        - name: saved-runs
+          persistentVolumeClaim:
+            claimName: {{ $persistence.existingClaim | quote }}
+        {{- end }}
         {{- if .Values.config.existingConfigMap }}
         - name: dlt-config
           configMap:

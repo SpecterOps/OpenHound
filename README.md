@@ -90,10 +90,20 @@ Enable saved runs for future scheduler jobs in `.dlt/config.toml`:
 runs_directory = "/var/lib/openhound/runs"
 ```
 
-The equivalent environment variable is `OPENHOUND__RUNS_DIRECTORY`. Mount this
-directory on persistent storage and make it writable by the container user.
+The equivalent environment variable is `OPENHOUND__RUNS_DIRECTORY`. For persistence
+across container replacement, mount this directory on persistent storage and make
+it writable by the container user.
 Configuring a directory alone does not make a container's filesystem persistent.
-Without this setting, the scheduler keeps its existing storage paths.
+Without this setting, a local Python scheduler keeps its existing storage paths.
+Docker images enable saved runs at `/var/lib/openhound/runs` by default, using the
+container filesystem. This image default applies only when `runs_directory` is
+unset; explicit TOML settings and `OPENHOUND__RUNS_DIRECTORY` take precedence.
+A volume is optional; see the
+[Docker storage configuration](example-configurations/bloodhound-enterprise/README.md#saved-runs-inside-the-container)
+for persistent storage and package retrieval.
+
+For Kubernetes, the [Helm chart](deployments/helm/openhound/README.md#persistent-saved-runs)
+can mount an existing PersistentVolumeClaim for saved runs.
 
 Each job gets a new run ID, logged with its directory. The workspace contains:
 
