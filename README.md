@@ -110,12 +110,19 @@ Each job gets a new run ID, logged with its directory. The workspace contains:
 ```text
 <runs_directory>/<run-id>/
   run.json             # Job association, versions, and phase checkpoints
+  collection-inventory.json  # Relative paths and sizes of collected JSONL files
   raw/                 # Collected resource files
   lookup.duckdb        # Original preprocessing database, when applicable
   pipelines/           # Original DLT state and packages
   graph/               # Managed job staging; removed by normal upload cleanup
   recovery/            # Separate local recovery pipelines, lookup, and graph files
 ```
+
+After collection completes, OpenHound records the collected `.jsonl.gz` file
+paths and byte sizes in `collection-inventory.json`. Paths are relative to the
+workspace. The inventory is informational: recovery and packaging do not read or
+validate it, and older runs do not need one. File contents are not read or hashed
+to create it. Inventory write failures are logged and do not fail the run.
 
 Inspect a saved run or recover its graph files:
 
