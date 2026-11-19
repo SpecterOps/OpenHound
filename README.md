@@ -102,6 +102,9 @@ A volume is optional; see the
 [Docker storage configuration](example-configurations/bloodhound-enterprise/README.md#saved-runs-inside-the-container)
 for persistent storage and package retrieval.
 
+For Kubernetes, the [Helm chart](deployments/helm/openhound/README.md#persistent-saved-runs)
+can mount an existing PersistentVolumeClaim for saved runs.
+
 Each job gets a new run ID, logged with its directory. The workspace contains:
 
 ```text
