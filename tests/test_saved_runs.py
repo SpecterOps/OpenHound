@@ -305,7 +305,7 @@ def test_scheduler_opt_in_persists_failed_run(monkeypatch, tmp_path):
         lambda: SimpleNamespace(collectors=[extension]),
     )
     with pytest.raises(RuntimeError, match="conversion interrupted"):
-        service._collect_in_worker("example", 42, managed=True, configured=False)
+        service._collect_in_worker("example", 42, managed=True)
     directories = list((tmp_path / "runs").iterdir())
     assert len(directories) == 1
     run = SavedRun(directories[0])
