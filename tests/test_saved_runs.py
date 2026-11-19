@@ -373,7 +373,7 @@ def test_scheduler_runs_directory_precedence(
         service.dataflow, "pipeline", lambda **kwargs: calls.append(kwargs) or {}
     )
 
-    service._collect_in_worker("example", 42, managed=True, configured=False)
+    service._collect_in_worker("example", 42, managed=True)
 
     run = calls[0].get("saved_run")
     if expected is None:
