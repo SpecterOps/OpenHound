@@ -1,7 +1,7 @@
 import re
 from abc import ABC, abstractmethod
-from typing import Any
-from urllib.parse import urljoin
+from typing import Any, cast
+from urllib.parse import urljoin, urlparse
 
 import httpx2
 from dlt.common import json as dlt_json
@@ -16,20 +16,6 @@ def get_response_json(response: httpx2.Response) -> Any:
     if "openhound_json" not in response.extensions:
         response.extensions["openhound_json"] = dlt_json.loadb(response.content)
     return response.extensions["openhound_json"]
-
-
-def _get_has_more(path: jsonpath.JSONPath, body: Any) -> bool:
-    """Read a compiled boolean selector using DLT's string coercion rules."""
-    matches = path.find(body)
-    value = matches[0].value if matches else None
-    if isinstance(value, str):
-        try:
-            return str2bool(value)
-        except ValueError:
-            pass
-    elif isinstance(value, bool):
-        return value
-    raise ValueError(f"Expected a boolean at '{path}', got {value!r}.")
 
 
 class DataSelector:
@@ -58,7 +44,7 @@ class DataSelector:
 class BasePaginator(ABC):
     """DLT-style lifecycle for explicit pagination.
 
-    The client copies each paginator per pagination call to isolate mutable state.
+    The client copies its default paginator, but uses per-call instances directly.
     JSON-based implementations can use get_response_json() to reuse the body
     already decoded for data selection.
     """
@@ -82,6 +68,9 @@ class BasePaginator(ABC):
     @abstractmethod
     def update_request(self, request: Request) -> None:
         """Modify the request arguments for the next page."""
+
+    def __str__(self) -> str:
+        return f"{type(self).__name__} at {id(self):x}"
 
 
 class SinglePagePaginator(BasePaginator):
@@ -158,20 +147,17 @@ class RangePaginator(BasePaginator):
             self._has_next_page = False
             return
 
-        total = None
+        total: Any = None
         if self.total_path is not None:
-            matches = self.total_path.find(get_response_json(response))
-            value = matches[0].value if matches else None
-            if value is None:
-                raise ValueError(
-                    f"Total {self.error_message_items} not found at '{self.total_path}'."
-                )
+            body = get_response_json(response)
+            matches = self.total_path.find(body)
+            total = matches[0].value if matches else None
+            if total is None:
+                self._handle_missing_total(body)
             try:
-                total = int(value)
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"Expected an integer at '{self.total_path}', got {value!r}."
-                ) from None
+                total = int(total)
+            except ValueError:
+                self._handle_invalid_total(total)
 
         self.current_value += self.value_step
         if (total is not None and self.current_value >= total + self.base_index) or (
@@ -179,12 +165,48 @@ class RangePaginator(BasePaginator):
         ):
             self._has_next_page = False
         if self.has_more_path is not None:
-            self._has_next_page = _get_has_more(
-                self.has_more_path, get_response_json(response)
-            )
+            body = get_response_json(response)
+            matches = self.has_more_path.find(body)
+            has_more: Any = matches[0].value if matches else None
+            if has_more is None:
+                self._handle_missing_has_more(body)
+            elif isinstance(has_more, str):
+                try:
+                    has_more = str2bool(has_more)
+                except ValueError:
+                    self._handle_invalid_has_more(has_more)
+            elif not isinstance(has_more, bool):
+                self._handle_invalid_has_more(has_more)
+            self._has_next_page = has_more
 
     def _stop_after_this_page(self, data: list[Any] | None = None) -> bool:
         return self.stop_after_empty_page and not data
+
+    def _handle_missing_total(self, response_json: dict[str, Any]) -> None:
+        raise ValueError(
+            f"Total `{self.error_message_items}` not found in the response in"
+            f" `{self.__class__.__name__}` .Expected a response with a `{self.total_path}` key, got"
+            f" `{response_json}`."
+        )
+
+    def _handle_invalid_total(self, total: Any) -> None:
+        raise ValueError(
+            f"'{self.total_path}' is not an `int` in the response in `{self.__class__.__name__}`."
+            f" Expected an integer, got `{total}`"
+        )
+
+    def _handle_missing_has_more(self, response_json: dict[str, Any]) -> None:
+        raise ValueError(
+            f"Has more value not found in the response in `{self.__class__.__name__}`."
+            f"Expected a response with a `{self.has_more_path}` key, got"
+            f" `{response_json}`."
+        )
+
+    def _handle_invalid_has_more(self, has_more: Any) -> None:
+        raise ValueError(
+            f"'{self.has_more_path}' is not a `bool` in the response in"
+            f" `{self.__class__.__name__}`. Expected a boolean, got `{has_more}`"
+        )
 
     def update_request(self, request: Request) -> None:
         if self.param_body_path:
@@ -210,6 +232,8 @@ class RangePaginator(BasePaginator):
     def _update_request_with_body_path(
         request: Request, body_path: str, current_value: int
     ) -> None:
+        if not body_path:
+            raise ValueError("`body_path` must not be empty.")
         if request.json is None:
             request.json = {}
         jsonpath.set_value_at_path(request.json, body_path, current_value)
@@ -247,6 +271,20 @@ class PageNumberPaginator(RangePaginator):
             error_message_items="pages",
             stop_after_empty_page=stop_after_empty_page,
             has_more_path=has_more_path,
+        )
+
+    def __str__(self) -> str:
+        return (
+            super().__str__()
+            + f": current page: {self.current_value} "
+            + (f"page_param: {self.param_name} " if self.param_name else "")
+            + (
+                f"page_body_path: {self.param_body_path} "
+                if self.param_body_path
+                else ""
+            )
+            + f"total_path: {self.total_path} maximum_value: {self.maximum_value} "
+            f"has_more_path: {self.has_more_path}"
         )
 
 
@@ -289,14 +327,42 @@ class OffsetPaginator(RangePaginator):
         self.limit_param = limit_param
         self.limit_body_path = limit_body_path
 
+    def init_request(self, request: Request) -> None:
+        super().init_request(request)
+        self._update_request_limit(request)
+
     def update_request(self, request: Request) -> None:
         super().update_request(request)
+        self._update_request_limit(request)
+
+    def _update_request_limit(self, request: Request) -> None:
         if self.limit_body_path:
             self._update_request_with_body_path(
                 request, self.limit_body_path, self.limit
             )
         else:
             self._update_request_with_param_name(request, self.limit_param, self.limit)
+
+    def __str__(self) -> str:
+        return (
+            super().__str__()
+            + f": current offset: {self.current_value} "
+            + (f"offset_param: {self.param_name} " if self.param_name else "")
+            + (
+                f"offset_body_path: {self.param_body_path} "
+                if self.param_body_path
+                else ""
+            )
+            + f"limit: {self.value_step} "
+            + (f"limit_param: {self.limit_param} " if self.limit_param else "")
+            + (
+                f"limit_body_path: {self.limit_body_path} "
+                if self.limit_body_path
+                else ""
+            )
+            + f"total_path: {self.total_path} "
+            + f"maximum_value: {self.maximum_value} has_more_path: {self.has_more_path}"
+        )
 
 
 class BaseReferencePaginator(BasePaginator):
@@ -320,10 +386,15 @@ class BaseNextUrlPaginator(BaseReferencePaginator):
     """Update the request URL from a reference returned by the API."""
 
     def update_request(self, request: Request) -> None:
-        if self._next_reference is not None:
-            request.url = urljoin(request.url, self._next_reference)
-            # The continuation URL contains its own query parameters.
-            request.params = None
+        if self._next_reference:
+            parsed_url = urlparse(self._next_reference)
+            if not parsed_url.scheme:
+                self._next_reference = urljoin(
+                    cast(str, request.url), self._next_reference
+                )
+        request.url = self._next_reference
+        # Clear even on the final page, matching DLT's exposed request context.
+        request.params = None
 
 
 class HeaderLinkPaginator(BaseNextUrlPaginator):
@@ -338,24 +409,25 @@ class HeaderLinkPaginator(BaseNextUrlPaginator):
     ) -> None:
         self._next_reference = response.links.get(self.links_next_key, {}).get("url")
 
+    def __str__(self) -> str:
+        return super().__str__() + f": links_next_key: {self.links_next_key}"
+
 
 class JSONLinkPaginator(BaseNextUrlPaginator):
     """Follow a continuation URL selected from the decoded response body."""
 
     def __init__(self, next_url_path: jsonpath.TJsonPath = "next") -> None:
         super().__init__()
-        self._selector = DataSelector(next_url_path)
+        self.next_url_path = jsonpath.compile_path(next_url_path)
 
     def update_state(
         self, response: httpx2.Response, data: list[Any] | None = None
     ) -> None:
-        value = self._selector.select(get_response_json(response))
-        if value is None or value == "" or value == []:
-            self._next_reference = None
-        elif not isinstance(value, str):
-            raise TypeError("Pagination reference must be a URL string")
-        else:
-            self._next_reference = value
+        matches = self.next_url_path.find(get_response_json(response))
+        self._next_reference = matches[0].value if matches else None
+
+    def __str__(self) -> str:
+        return super().__str__() + f": next_url_path: {self.next_url_path}"
 
 
 class JSONResponseCursorPaginator(BaseReferencePaginator):
@@ -397,7 +469,31 @@ class JSONResponseCursorPaginator(BaseReferencePaginator):
             self._has_next_page = False
             return
         if self.has_more_path is not None:
-            self._has_next_page = _get_has_more(self.has_more_path, body)
+            matches = self.has_more_path.find(body)
+            has_more: Any = matches[0].value if matches else None
+            if has_more is None:
+                self._handle_missing_has_more(body)
+            elif isinstance(has_more, str):
+                try:
+                    has_more = str2bool(has_more)
+                except ValueError:
+                    self._handle_invalid_has_more(has_more)
+            elif not isinstance(has_more, bool):
+                self._handle_invalid_has_more(has_more)
+            self._has_next_page = has_more
+
+    def _handle_missing_has_more(self, response_json: dict[str, Any]) -> None:
+        raise ValueError(
+            f"Has more value not found in the response in `{self.__class__.__name__}`."
+            f"Expected a response with a `{self.has_more_path}` key, got"
+            f" `{response_json}`."
+        )
+
+    def _handle_invalid_has_more(self, has_more: Any) -> None:
+        raise ValueError(
+            f"'{self.has_more_path}' is not a `bool` in the response in"
+            f" `{self.__class__.__name__}`. Expected a boolean, got `{has_more}`"
+        )
 
     def update_request(self, request: Request) -> None:
         if self.cursor_body_path:
@@ -406,10 +502,22 @@ class JSONResponseCursorPaginator(BaseReferencePaginator):
             jsonpath.set_value_at_path(
                 request.json, self.cursor_body_path, self._next_reference
             )
-        elif self.cursor_param is not None:
+        else:
             if request.params is None:
                 request.params = {}
-            request.params[self.cursor_param] = self._next_reference
+            request.params[cast(str, self.cursor_param)] = self._next_reference
+
+    def __str__(self) -> str:
+        return (
+            super().__str__()
+            + f": cursor_path: {self.cursor_path}"
+            + (f" cursor_param: {self.cursor_param}" if self.cursor_param else "")
+            + (
+                f" cursor_body_path: {self.cursor_body_path}"
+                if self.cursor_body_path
+                else ""
+            )
+        )
 
 
 class HeaderCursorPaginator(BaseReferencePaginator):
@@ -429,3 +537,9 @@ class HeaderCursorPaginator(BaseReferencePaginator):
         if request.params is None:
             request.params = {}
         request.params[self.cursor_param] = self._next_reference
+
+    def __str__(self) -> str:
+        return (
+            super().__str__()
+            + f": cursor_value: {self._next_reference} cursor_param: {self.cursor_param}"
+        )

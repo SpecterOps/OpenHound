@@ -21,7 +21,7 @@ class Request:
     """
 
     method: str
-    url: str
+    url: str | None
     headers: httpx2.Headers
     params: dict[str, Any] | None = None
     json: Any = None

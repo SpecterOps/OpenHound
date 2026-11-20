@@ -3,7 +3,8 @@ import math
 from base64 import b64encode
 from collections.abc import AsyncGenerator, Generator, Iterable
 from dataclasses import field
-from typing import Annotated, Any, Final, Literal, cast
+from typing import Annotated, Any, Final, Literal
+from urllib.parse import urlencode
 from weakref import WeakValueDictionary
 
 import httpx2
@@ -32,13 +33,13 @@ class AuthConfigBase(httpx2.Auth, CredentialsConfiguration):
     def __bool__(self) -> bool:
         return True
 
-    async def prepare_auth(self) -> httpx2.Auth:
+    async def prepare_auth(self, request: httpx2.Request) -> httpx2.Request:
         """Prepare authentication before REST retries, as DLT prepares requests.
 
-        Refreshing implementations return a token snapshot so token failures are
-        not retried a second time by the enclosing API request.
+        These DLT-style authenticators modify one outgoing request. Apply their
+        headers/query once, rather than creating temporary credential objects.
         """
-        return self
+        return next(self.auth_flow(request))
 
 
 @configspec
@@ -91,7 +92,13 @@ class APIKeyAuth(AuthConfigBase):
         if self.location == "header":
             request.headers[self.name] = self.api_key
         elif self.location in ("query", "param"):
-            request.url = request.url.copy_merge_params({self.name: self.api_key})
+            if self.api_key is not None:
+                # requests.prepare_url appends auth params, preserving existing
+                # query entries even when they have the same name.
+                query = request.url.query.decode("ascii")
+                encoded = urlencode({self.name: self.api_key})
+                query = f"{query}&{encoded}" if query else encoded
+                request.url = request.url.copy_with(query=query.encode("ascii"))
         elif self.location == "cookie":
             raise NotImplementedError()
         yield request
@@ -180,18 +187,16 @@ class OAuth2ClientCredentials(OAuth2AuthBase):
     async def async_auth_flow(
         self, request: httpx2.Request
     ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
-        auth = await self.prepare_auth()
-        for authenticated_request in auth.auth_flow(request):
-            yield authenticated_request
+        yield await self.prepare_auth(request)
 
-    async def prepare_auth(self) -> httpx2.Auth:
+    async def prepare_auth(self, request: httpx2.Request) -> httpx2.Request:
         lock = self._refresh_locks.setdefault(
             asyncio.get_running_loop(), asyncio.Lock()
         )
         async with lock:
             if self.access_token is None or self.is_token_expired():
                 await self.obtain_token()
-            return OAuth2AuthBase(access_token=cast(str, self.access_token))
+            return await super().prepare_auth(request)
 
     def is_token_expired(self) -> bool:
         return pendulum.now() >= self.token_expiry
@@ -265,18 +270,16 @@ class OAuthJWTAuth(BearerTokenAuth):
     async def async_auth_flow(
         self, request: httpx2.Request
     ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
-        auth = await self.prepare_auth()
-        for authenticated_request in auth.auth_flow(request):
-            yield authenticated_request
+        yield await self.prepare_auth(request)
 
-    async def prepare_auth(self) -> httpx2.Auth:
+    async def prepare_auth(self, request: httpx2.Request) -> httpx2.Request:
         lock = self._refresh_locks.setdefault(
             asyncio.get_running_loop(), asyncio.Lock()
         )
         async with lock:
             if self.token is None or self.is_token_expired():
                 await self.obtain_token()
-            return BearerTokenAuth(token=self.token)
+            return await super().prepare_auth(request)
 
     def is_token_expired(self) -> bool:
         return self.token_expiry is None or pendulum.now() >= self.token_expiry
