@@ -16,7 +16,7 @@ from dlt.common.exceptions import MissingDependencyException
 from dlt.common.pendulum import pendulum
 from dlt.common.typing import TSecretStrValue
 
-from .client import AsyncRESTClient
+from .session import AsyncSession
 
 # DLT's configspec currently requires a traditional alias for field hints.
 TApiKeyLocation = Literal["header", "cookie", "query", "param"]
@@ -24,7 +24,7 @@ TApiKeyLocation = Literal["header", "cookie", "query", "param"]
 
 # Like DLT's default requests client, reuse one client across authenticators and
 # refreshes. Its pools are opened lazily and follow the extraction loop lifetime.
-_default_session = AsyncRESTClient(base_url="")
+_default_session = AsyncSession()
 
 
 class AuthConfigBase(httpx2.Auth, CredentialsConfiguration):
@@ -165,7 +165,7 @@ class OAuth2ClientCredentials(OAuth2AuthBase):
     client_secret: TSecretStrValue = None  # type: ignore[assignment]
     access_token_request_data: dict[str, Any] = None  # type: ignore[assignment]
     default_token_expiration: int = 3600
-    session: Annotated[AsyncRESTClient, NotResolved()] = None  # type: ignore[assignment]
+    session: Annotated[AsyncSession, NotResolved()] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.access_token_request_data is None:
@@ -249,7 +249,7 @@ class OAuthJWTAuth(BearerTokenAuth):
     headers: dict[str, str] | None = None
     private_key_passphrase: TSecretStrValue | None = None
     default_token_expiration: int = 3600
-    session: Annotated[AsyncRESTClient, NotResolved()] = None  # type: ignore[assignment]
+    session: Annotated[AsyncSession, NotResolved()] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if not isinstance(self.scopes, str):
