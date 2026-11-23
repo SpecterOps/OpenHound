@@ -28,6 +28,14 @@ async def test_post_echo(rest_client):
 
 
 @pytest.mark.anyio
+async def test_retry_on_service_unavailable(rest_client, api_app):
+    response = await rest_client.get("/retry")
+
+    assert response.status_code == 200
+    assert api_app.state.retry_attempts == 2
+
+
+@pytest.mark.anyio
 async def test_pagination(rest_client):
     pages = [
         page
