@@ -107,16 +107,6 @@ class RangePaginator(BasePaginator):
         param_body_path: str | None = None,
     ) -> None:
         super().__init__()
-        if (
-            total_path is None
-            and maximum_value is None
-            and has_more_path is None
-            and not stop_after_empty_page
-        ):
-            raise ValueError(
-                "One of 'total_path', 'maximum_value', 'has_more_path', or "
-                "'stop_after_empty_page' must be provided."
-            )
         if bool(param_name) == bool(param_body_path):
             raise ValueError(
                 "Either 'param_name' or 'param_body_path' must be provided, not both."
@@ -134,6 +124,16 @@ class RangePaginator(BasePaginator):
         self.has_more_path = (
             jsonpath.compile_path(has_more_path) if has_more_path else None
         )
+        if (
+            self.total_path is None
+            and self.maximum_value is None
+            and self.has_more_path is None
+            and not self.stop_after_empty_page
+        ):
+            raise ValueError(
+                "One of 'total_path', 'maximum_value', 'has_more_path', or "
+                "'stop_after_empty_page' must be provided."
+            )
 
     def init_request(self, request: Request) -> None:
         self._has_next_page = True
@@ -309,6 +309,12 @@ class OffsetPaginator(RangePaginator):
             offset_param = "offset"
         if limit_param is None and limit_body_path is None:
             limit_param = "limit"
+        if offset_param and offset_param == limit_param:
+            raise ValueError("'offset_param' and 'limit_param' must be distinct.")
+        if offset_body_path and offset_body_path == limit_body_path:
+            raise ValueError(
+                "'offset_body_path' and 'limit_body_path' must be distinct."
+            )
         if bool(limit_param) == bool(limit_body_path):
             raise ValueError(
                 "Either 'limit_param' or 'limit_body_path' must be provided, not both."
@@ -462,9 +468,8 @@ class JSONResponseCursorPaginator(BaseReferencePaginator):
     ) -> None:
         body = get_response_json(response)
         matches = self.cursor_path.find(body)
-        self._next_reference = (
-            matches[0].value if matches and matches[0].value else None
-        )
+        cursor = matches[0].value if matches else None
+        self._next_reference = None if cursor is None or cursor == "" else cursor
         if self.stop_after_empty_page and not data:
             self._has_next_page = False
             return
@@ -480,7 +485,7 @@ class JSONResponseCursorPaginator(BaseReferencePaginator):
                     self._handle_invalid_has_more(has_more)
             elif not isinstance(has_more, bool):
                 self._handle_invalid_has_more(has_more)
-            self._has_next_page = has_more
+            self._has_next_page = has_more and self._next_reference is not None
 
     def _handle_missing_has_more(self, response_json: dict[str, Any]) -> None:
         raise ValueError(
