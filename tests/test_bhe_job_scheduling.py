@@ -4236,6 +4236,10 @@ def test_managed_completion_retries_remaining_uploads_before_ending(
     mock_service.job_running = job_id
     mock_service.managed_job_id = job_id
     mock_service.future = future
+    status = scheduler_service.SchedulerStatus()
+    status.start()
+    status.reserve(job_id, "awaiting_upload")
+    mock_service.status = status
     calls = []
 
     def upload(job, data):
@@ -4256,6 +4260,7 @@ def test_managed_completion_retries_remaining_uploads_before_ending(
     assert mock_service.future is future
     assert mock_service.job_running == job_id
     assert output.exists()
+    assert status.snapshot()["jobs"][job_id]["state"] == "uploading"
 
     mock_service._handle_completed_job(future)
     assert calls == [
@@ -4267,6 +4272,7 @@ def test_managed_completion_retries_remaining_uploads_before_ending(
     assert mock_service.future is None
     assert mock_service.job_running is None
     assert not output.exists()
+    assert status.snapshot()["available_slots"] == 1
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 415])
@@ -4342,6 +4348,10 @@ def test_upload_for_missing_or_stopped_job_aborts_without_reporting_outcome(
     mock_service.managed = True
     mock_service.job_running = mock_service.managed_job_id = job_id
     mock_service.future = future
+    scheduler_status = scheduler_service.SchedulerStatus()
+    scheduler_status.start()
+    scheduler_status.reserve(job_id, "awaiting_upload")
+    mock_service.status = scheduler_status
 
     def upload(job, data):
         raise BloodHoundHTTPError("sensitive-response-body", status)
@@ -4357,6 +4367,8 @@ def test_upload_for_missing_or_stopped_job_aborts_without_reporting_outcome(
     assert mock_service.job_running is None
     assert mock_service.managed_job_id is None
     assert mock_service.next_heartbeat_at is None
+    assert scheduler_status.snapshot()["jobs"] == {}
+    assert scheduler_status.snapshot()["available_slots"] == 1
     assert not output.exists()
     assert "sensitive-response-body" not in caplog.text
 
@@ -4378,6 +4390,10 @@ def test_managed_end_retry_does_not_upload_accepted_files_again(
     mock_service.job_running = job_id
     mock_service.managed_job_id = job_id
     mock_service.future = future
+    status = scheduler_service.SchedulerStatus()
+    status.start()
+    status.reserve(job_id, "awaiting_upload")
+    mock_service.status = status
     uploads = []
     ends = []
     monkeypatch.setattr(
@@ -4386,7 +4402,10 @@ def test_managed_end_retry_does_not_upload_accepted_files_again(
         lambda job, data: uploads.append(data.read()),
     )
 
+    snapshots = []
+
     def end(job, outcome, **kwargs):
+        snapshots.append(status.snapshot())
         ends.append((job, outcome))
         if len(ends) == 1:
             raise BloodHoundHTTPError("temporary error", 500)
@@ -4399,6 +4418,9 @@ def test_managed_end_retry_does_not_upload_accepted_files_again(
     mock_service._handle_completed_job(future)
     assert uploads == [b"graph"]
     assert ends == [(str(job_id), ManagedJobOutcome.SUCCEEDED)] * 2
+    assert snapshots[0] == snapshots[1]
+    assert snapshots[0]["jobs"][job_id]["state"] == "finalizing"
+    assert status.snapshot()["available_slots"] == 1
     assert not output.exists()
 
 

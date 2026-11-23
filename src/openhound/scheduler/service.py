@@ -11,7 +11,9 @@ from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
+from threading import Thread
 from typing import Any
 from uuid import UUID
 
@@ -51,6 +53,11 @@ from openhound.scheduler.credentials import (
     CredentialPreparationError,
     managed_collection_configuration,
     prepare_job_credentials,
+)
+from openhound.scheduler.status import (
+    SchedulerStatus,
+    receive_worker_phases,
+    report_worker_phase,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,6 +126,8 @@ def _subprocess_collect(
     secrets: dict[str, Any] | None = None,
     managed: bool = False,
     environment: JobEnvironment | None = None,
+    *,
+    on_phase: Callable[[str], None] | None = None,
 ) -> Result:
     """A subprocess which runs the DLT pipeline for the specified collector.
 
@@ -146,7 +155,7 @@ def _subprocess_collect(
     ):
         try:
             return _configured_worker_collect(
-                collector_name, job_id, params, secrets, managed
+                collector_name, job_id, params, secrets, managed, on_phase
             )
         except ManagedConfigurationError:
             # AWS failures were diagnosed inside the SDK logging controls;
@@ -182,6 +191,7 @@ def _configured_worker_collect(
     params: dict[str, Any] | None,
     secrets: dict[str, Any] | None,
     managed: bool,
+    on_phase: Callable[[str], None] | None = None,
 ) -> Result:
     configured = params is not None or secrets is not None
     # Retain SDK logging and source-credential isolation; authentication belongs
@@ -199,10 +209,17 @@ def _configured_worker_collect(
     # Install configuration before importing collectors or constructing pipelines:
     # both can resolve DLT settings. Always remove it, including on worker failure.
     with configuration:
-        return _collect_in_worker(collector_name, job_id, managed)
+        if on_phase is None:
+            return _collect_in_worker(collector_name, job_id, managed)
+        return _collect_in_worker(collector_name, job_id, managed, on_phase)
 
 
-def _collect_in_worker(collector_name: str, job_id: int | str, managed: bool) -> Result:
+def _collect_in_worker(
+    collector_name: str,
+    job_id: int | str,
+    managed: bool,
+    on_phase: Callable[[str], None] | None = None,
+) -> Result:
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
@@ -254,18 +271,14 @@ def _collect_in_worker(collector_name: str, job_id: int | str, managed: bool) ->
                     "Persisting job %s in saved run %s", job_id, saved_run.directory
                 )
             try:
-                if saved_run:
-                    results = dataflow.pipeline(
-                        extension=collector, output_path=output_path, saved_run=saved_run
-                    )
-                else:
-                    results = (
-                        dataflow.pipeline(extension=collector)
-                        if output_path is None
-                        else dataflow.pipeline(
-                            extension=collector, output_path=output_path
-                        )
-                    )
+                options: dict[str, Any] = {}
+                if output_path is not None or saved_run is not None:
+                    options["output_path"] = output_path
+                if saved_run is not None:
+                    options["saved_run"] = saved_run
+                if on_phase is not None:
+                    options["on_phase"] = on_phase
+                results = dataflow.pipeline(extension=collector, **options)
             except BaseException:
                 if output_path is not None and saved_run is None:
                     shutil.rmtree(output_path)
@@ -306,6 +319,7 @@ class Service:
         managed: bool | None = None,
         secrets_manager: AWSSecretsManager | None = None,
         managed_job_runner: Callable[[PreparedManagedJob], None] | None = None,
+        status: SchedulerStatus | None = None,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
@@ -325,6 +339,9 @@ class Service:
 
         # Managed collection settings and recovery state
         self.managed = is_managed() if managed is None else managed
+        self.status = status if self.managed else None
+        self._phase_queue: Any = None
+        self._phase_listener: Thread | None = None
         self.secrets_manager = secrets_manager or AWSSecretsManager()
         self.managed_job_runner = managed_job_runner or self._run_prepared_managed_job
         self._pending_managed_claim: str | None = None
@@ -344,6 +361,17 @@ class Service:
         self._worker_logging = openhound_logging.WorkerLogRouter(self._worker_context)
         try:
             self.executor = self._create_executor()
+            if self.status is not None:
+                manager = self._worker_logging.manager
+                assert manager is not None
+                self._phase_queue = manager.Queue()
+                self._phase_listener = Thread(
+                    target=receive_worker_phases,
+                    args=(self._phase_queue, self.status),
+                    name="openhound-worker-phases",
+                    daemon=True,
+                )
+                self._phase_listener.start()
         except BaseException:
             self._worker_logging.close()
             raise
@@ -354,6 +382,8 @@ class Service:
     def _exit_handler(self, sig: int, frame):
         """Handle SIGINT and SIGTERM signals. Sets self.exit to True to stop the while loop"""
         self.exit = True
+        if self.status is not None:
+            self.status.draining = True
         logger.warning(f"Received signal {sig}, shutting down gracefully.")
 
     def _shutdown(self) -> None:
@@ -376,7 +406,15 @@ class Service:
         try:
             self.executor.shutdown(wait=True, cancel_futures=True)
         finally:
-            self._worker_logging.close()
+            try:
+                if self._phase_listener is not None:
+                    try:
+                        self._phase_queue.put(None)
+                    except (OSError, EOFError):
+                        logger.warning("Could not stop the worker phase queue")
+                    self._phase_listener.join(timeout=2)
+            finally:
+                self._worker_logging.close()
         logger.info("Collection service stopped.")
 
     def _finish_managed_job_on_shutdown(self) -> None:
@@ -397,6 +435,8 @@ class Service:
                 time.sleep(self.interval)
 
     def _clear_running_job(self) -> None:
+        if self.status is not None and self.managed_job_id is not None:
+            self.status.release(self.managed_job_id)
         self.future = None
         self.job_running = None
         self.managed_job_id = None
@@ -458,6 +498,8 @@ class Service:
     def _report_managed_credential_failure(self, job_id: str) -> None:
         # Retain the unresolved ID if reporting exhausts its retries. On the next
         # poll retry end, rather than claiming or retrieving another job.
+        if self.status is not None:
+            self.status.transition(job_id, "finalizing")
         self._pending_managed_failure = job_id
         self.client.end_managed_job(
             job_id,
@@ -465,6 +507,8 @@ class Service:
             failure_message=self._pending_managed_failure_summary,
         )
         self._pending_managed_failure = None
+        if self.status is not None:
+            self.status.release(job_id)
 
     def _load_managed_credentials(
         self, job: CollectorJob
@@ -519,6 +563,8 @@ class Service:
         """Claim a managed job and validate its credentials."""
         # A timeout can happen after BHE commits the claim. Keep the ID until we
         # reconcile it; discovery no longer lists jobs held by this collector.
+        if self.status is not None and self.status.reserve(job_id, "claiming") is None:
+            return None
         self._pending_managed_claim = job_id
         try:
             job = self.client.claim_managed_job(job_id)
@@ -526,6 +572,8 @@ class Service:
             if error.code in (404, 409):
                 # An existing claimed job held by this client would return 200.
                 self._pending_managed_claim = None
+                if self.status is not None:
+                    self.status.release(job_id)
             if error.code == 409:
                 logger.debug(
                     "Managed collector claim conflict.",
@@ -535,6 +583,8 @@ class Service:
             raise
 
         self._validate_managed_claim(job, job_id)
+        if self.status is not None:
+            self.status.transition(job_id, "preparing")
         context = {"job_id": job_id}
         logger.info("Job successfully picked up", extra=context)
         try:
@@ -606,6 +656,10 @@ class Service:
             if prepared is not None:
                 runner(prepared)
                 self._clear_pending_managed_start()
+                if self.status is not None and self.managed_job_id is None:
+                    job_id = str(prepared.job.id)
+                    if self._pending_managed_failure != job_id:
+                        self.status.release(job_id)
         except Exception:  # noqa: BLE001 - redact managed runtime errors
             raise ManagedJobProcessingError(
                 "Managed collector job processing failed"
@@ -706,14 +760,21 @@ class Service:
 
         logger.info("Starting job %s with collector '%s'.", job_id, self.collector_name)
         managed_job_id: str | None = None
+        attempt = None
         if managed:
             if not isinstance(job_id, str):
                 raise TypeError("Managed job IDs must be strings")
+            if self.status is not None:
+                attempt = self.status.reserve(job_id, "starting")
+                if attempt is None:
+                    return
             try:
                 self.client.start_collector_job(job_id)
             except BloodHoundHTTPError as error:
                 if error.code in (404, 409):
                     self._clear_pending_managed_start()
+                    if self.status is not None:
+                        self.status.release(job_id)
                 raise
             managed_job_id = job_id
             self._clear_pending_managed_start()
@@ -729,9 +790,15 @@ class Service:
         self.next_heartbeat_at = (
             time.monotonic() + HEARTBEAT_INTERVAL if managed else None
         )
+        worker: Callable[..., Result] = _subprocess_collect
+        if attempt is not None:
+            worker = partial(
+                worker,
+                on_phase=partial(report_worker_phase, self._phase_queue, attempt),
+            )
         try:
             self.future = self.executor.submit(
-                _subprocess_collect,
+                worker,
                 self.collector_name,
                 job_id,
                 dict(params or {}) if managed else None,
@@ -763,9 +830,27 @@ class Service:
             finally:
                 self._clear_running_job()
             raise
+        else:
+            if attempt is not None and self.status is not None:
+                self.future.add_done_callback(
+                    partial(self._worker_finished, self.status, attempt)
+                )
+
+    @staticmethod
+    def _worker_finished(
+        status: SchedulerStatus, attempt: str, future: Future[Result]
+    ) -> None:
+        awaiting_upload = (
+            not future.cancelled()
+            and future.exception() is None
+            and bool(future.result().data_files)
+        )
+        status.worker_finished(attempt, awaiting_upload)
 
     def _end_job(self, status: JobStatus, message: str) -> None:
         if self.managed_job_id is not None:
+            if self.status is not None:
+                self.status.transition(self.managed_job_id, "finalizing")
             self.client.end_managed_job(
                 self.managed_job_id,
                 (
@@ -883,6 +968,8 @@ class Service:
                 while result.upload_failure is None and result.uploaded_files < len(
                     result.data_files
                 ):
+                    if self.status is not None:
+                        self.status.transition(self.managed_job_id, "uploading")
                     data_file = result.data_files[result.uploaded_files]
                     try:
                         data = data_file.open("rb")
@@ -969,7 +1056,8 @@ class Service:
 
         if self.managed:
             if self.job_running is None:
-                self._poll_managed_jobs()
+                if not self.exit and (self.status is None or not self.status.draining):
+                    self._poll_managed_jobs()
             else:
                 self._poll_running_job()
             return
@@ -998,8 +1086,10 @@ class Service:
             except Exception:
                 logger.exception("Unable to update client metadata.")
 
+        if self.status is not None:
+            self.status.start()
         try:
-            while not self.exit:
+            while not self.exit and (self.status is None or not self.status.draining):
                 if self.managed:
                     try:
                         self._poll()
@@ -1014,6 +1104,11 @@ class Service:
                         )
                 else:
                     self._poll()
-                time.sleep(self.interval)
+                if self.status is None:
+                    time.sleep(self.interval)
+                else:
+                    self.status.wait_for_shutdown(self.interval)
         finally:
+            if self.status is not None:
+                self.status.draining = True
             self._shutdown()

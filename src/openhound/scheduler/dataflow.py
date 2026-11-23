@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from importlib.metadata import version
 from pathlib import Path
 
@@ -85,15 +86,22 @@ def pipeline(
     output_path: Path | None = None,
     *,
     saved_run: SavedRun | None = None,
+    on_phase: Callable[[str], None] | None = None,
 ) -> dict[str, list[str]]:
     if saved_run is not None:
-        return _saved_pipeline(extension, saved_run, output_path)
+        return _saved_pipeline(extension, saved_run, output_path, on_phase=on_phase)
+    if on_phase is not None:
+        on_phase("collecting")
     collect_result = collect(extension)
 
     preprocessor_result = []
     if extension.preprocessor is not None:
+        if on_phase is not None:
+            on_phase("preprocessing")
         preprocessor_result = preprocess(extension)
 
+    if on_phase is not None:
+        on_phase("converting")
     convert_result = (
         convert(extension) if output_path is None else convert(extension, output_path)
     )
@@ -105,7 +113,11 @@ def pipeline(
 
 
 def _saved_pipeline(
-    extension: OpenHound, run: SavedRun, output_path: Path | None
+    extension: OpenHound,
+    run: SavedRun,
+    output_path: Path | None,
+    *,
+    on_phase: Callable[[str], None] | None = None,
 ) -> dict[str, list[str]]:
     """Checkpoint each original phase and retain its workspace on failure."""
     with run.locked(), run.configuration():
@@ -118,12 +130,18 @@ def _saved_pipeline(
                 run.manifest.phase = phase
                 run.save()
                 if phase == "collect":
+                    if on_phase is not None:
+                        on_phase("collecting")
                     resources = collect(extension, run)
                 elif phase == "preprocess":
-                    resources = (
-                        preprocess(extension, run) if extension.preprocessor else []
-                    )
+                    resources = []
+                    if extension.preprocessor:
+                        if on_phase is not None:
+                            on_phase("preprocessing")
+                        resources = preprocess(extension, run)
                 else:
+                    if on_phase is not None:
+                        on_phase("converting")
                     resources = convert(extension, output_path, run=run)
                 run.manifest.results[phase] = resources
                 run.save()

@@ -30,9 +30,12 @@ def test_conversion_stages_files_only_when_output_path_is_provided(
     assert calls == [expected]
 
 
-def test_pipeline_finishes_collection_and_preprocessing_before_conversion(monkeypatch):
+@pytest.mark.parametrize("has_preprocessor", [False, True])
+def test_pipeline_finishes_collection_and_preprocessing_before_conversion(
+    monkeypatch, has_preprocessor
+):
     calls = []
-    extension = SimpleNamespace(preprocessor=object())
+    extension = SimpleNamespace(preprocessor=object() if has_preprocessor else None)
     output_path = Path("job-output")
 
     def collect(extension):
@@ -51,9 +54,15 @@ def test_pipeline_finishes_collection_and_preprocessing_before_conversion(monkey
     monkeypatch.setattr(dataflow, "preprocess", preprocess)
     monkeypatch.setattr(dataflow, "convert", convert)
 
-    assert dataflow.pipeline(extension, output_path) == {
+    assert dataflow.pipeline(extension, output_path, on_phase=calls.append) == {
         "collect": ["source"],
-        "preprocess": ["lookup"],
+        "preprocess": ["lookup"] if has_preprocessor else [],
         "convert": ["nodes"],
     }
-    assert calls == ["collect", "preprocess", ("convert", output_path)]
+    assert calls == [
+        "collecting",
+        "collect",
+        *(["preprocessing", "preprocess"] if has_preprocessor else []),
+        "converting",
+        ("convert", output_path),
+    ]
