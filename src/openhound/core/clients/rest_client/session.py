@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 from collections.abc import AsyncGenerator, Iterable
+from contextlib import nullcontext
 from typing import Any, Self, cast
 from urllib.parse import urlencode
 
@@ -39,6 +40,8 @@ class AsyncSession:
     generators at extraction shutdown. Outside DLT, use async with or aclose().
     A supplied native client remains caller-owned, keeps its configuration, and
     is not wrapped in retries. Finish shared work before closing owned pools.
+    max_concurrent_requests limits active sends per session and event loop.
+    Streaming sends release their slot when response headers arrive.
     """
 
     def __init__(
@@ -49,7 +52,10 @@ class AsyncSession:
         proxy_url: str | None = None,
         limits: httpx2.Limits | None = None,
         transport: httpx2.AsyncBaseTransport | None = None,
+        max_concurrent_requests: int | None = None,
     ) -> None:
+        if max_concurrent_requests is not None and max_concurrent_requests < 1:
+            raise ValueError("max_concurrent_requests must be at least 1.")
         self.client = client
         self._config = (
             config
@@ -59,6 +65,8 @@ class AsyncSession:
         self.proxy_url = proxy_url
         self.limits = limits
         self.transport = transport
+        self.max_concurrent_requests = max_concurrent_requests
+        self._semaphores: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
         self._runtimes: dict[asyncio.AbstractEventLoop, httpx2.AsyncClient] = {}
         self._lifetimes: dict[
             asyncio.AbstractEventLoop, AsyncGenerator[httpx2.AsyncClient]
@@ -101,6 +109,7 @@ class AsyncSession:
             finally:
                 self._runtimes.pop(loop, None)
                 self._lifetimes.pop(loop, None)
+                self._semaphores.pop(loop, None)
 
     async def _runtime(self) -> httpx2.AsyncClient:
         if self.client is not None:
@@ -128,6 +137,7 @@ class AsyncSession:
         lifetime = self._lifetimes.get(asyncio.get_running_loop())
         if lifetime is not None:
             await lifetime.aclose()
+        self._semaphores.pop(asyncio.get_running_loop(), None)
 
     async def prepare_request(self, request: Request, **kwargs: Any) -> PreparedRequest:
         """Build and authenticate once, before any send retries.
@@ -188,6 +198,12 @@ class AsyncSession:
         """
         client = await self._runtime()
         hook_kwargs = kwargs.copy()
+        semaphore = None
+        if self.max_concurrent_requests is not None:
+            loop = asyncio.get_running_loop()
+            if loop not in self._semaphores:
+                self._semaphores[loop] = asyncio.Semaphore(self.max_concurrent_requests)
+            semaphore = self._semaphores[loop]
         if "timeout" in kwargs:
             prepared.request.extensions["timeout"] = httpx2.Timeout(
                 kwargs.pop("timeout")
@@ -196,7 +212,10 @@ class AsyncSession:
             kwargs.setdefault("follow_redirects", kwargs.pop("allow_redirects"))
 
         async def send() -> httpx2.Response:
-            response = await client.send(prepared.request, auth=prepared.auth, **kwargs)
+            async with semaphore if semaphore is not None else nullcontext():
+                response = await client.send(
+                    prepared.request, auth=prepared.auth, **kwargs
+                )
             try:
                 if prepared.hooks:
                     await response.aread()

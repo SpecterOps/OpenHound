@@ -18,12 +18,16 @@ def api_app():
 
 
 @pytest.fixture
-async def rest_client(api_app, anyio_backend):
+async def rest_client(api_app, anyio_backend, request):
     transport = httpx2.ASGITransport(app=api_app)
     config = RuntimeConfiguration(
         request_max_attempts=2,
         request_backoff_factor=0,
         request_max_retry_delay=0,
     )
-    async with AsyncSession(transport=transport, config=config) as session:
+    async with AsyncSession(
+        transport=transport,
+        config=config,
+        max_concurrent_requests=getattr(request, "param", None),
+    ) as session:
         yield AsyncRESTClient("http://testserver", session=session)

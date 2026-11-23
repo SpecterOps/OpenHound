@@ -11,6 +11,8 @@ BASE_ITEM_COUNT = 20
 def create_app() -> FastAPI:
     app = FastAPI(title="REST client test API")
     app.state.request_started = asyncio.Event()
+    app.state.two_requests_started = asyncio.Event()
+    app.state.wait_requests = 0
     app.state.release_request = asyncio.Event()
     app.state.retry_attempts = 0
     app.state.retry_exhaustion_attempts = 0
@@ -63,6 +65,9 @@ def create_app() -> FastAPI:
 
     @app.get("/wait")
     async def wait_for_release() -> dict[str, bool]:
+        app.state.wait_requests += 1
+        if app.state.wait_requests == 2:
+            app.state.two_requests_started.set()
         app.state.request_started.set()
         await app.state.release_request.wait()
         return {"released": True}

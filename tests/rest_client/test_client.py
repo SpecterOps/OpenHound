@@ -236,6 +236,23 @@ async def test_data_selector_compiled_once(rest_client, monkeypatch):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("rest_client", [2], indirect=True)
+async def test_max_concurrent_requests(rest_client, api_app):
+    requests = [asyncio.create_task(rest_client.get("/wait")) for _ in range(3)]
+    try:
+        await asyncio.wait_for(api_app.state.two_requests_started.wait(), timeout=5)
+
+        assert api_app.state.wait_requests == 2
+        assert all(not request.done() for request in requests)
+    finally:
+        api_app.state.release_request.set()
+        responses = await asyncio.wait_for(asyncio.gather(*requests), timeout=5)
+
+    assert all(response.status_code == 200 for response in responses)
+    assert api_app.state.wait_requests == 3
+
+
+@pytest.mark.anyio
 async def test_requests_are_non_blocking(rest_client, api_app):
     waiting = asyncio.create_task(rest_client.get("/wait"))
     try:
