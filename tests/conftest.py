@@ -2,6 +2,14 @@ import importlib
 import importlib.util
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def disable_saved_runs(monkeypatch):
+    """Require tests to opt into saved storage instead of reading local settings."""
+    monkeypatch.setenv("OPENHOUND__RUNS_DIRECTORY", "")
+
 
 def import_from_path(file_path: Path) -> None:
     module_name = file_path.stem
