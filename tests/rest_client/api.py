@@ -2,7 +2,7 @@ import asyncio
 from math import ceil
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 
 BASE_ITEM_COUNT = 20
 
@@ -27,6 +27,12 @@ def create_app() -> FastAPI:
     @app.post("/echo")
     async def echo(payload: dict[str, Any] | list[Any]) -> dict[str, Any] | list[Any]:
         return payload
+
+    @app.get("/authenticated")
+    async def authenticated(request: Request) -> dict[str, bool]:
+        if request.headers.get("Authorization") != "Bearer test-token":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return {"authenticated": True}
 
     @app.get("/retry")
     async def retry() -> Response:

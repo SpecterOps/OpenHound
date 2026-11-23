@@ -13,6 +13,7 @@ from openhound.core.clients.rest_client import (
     PageNumberPaginator,
     SinglePagePaginator,
 )
+from openhound.core.clients.rest_client.auth import BearerTokenAuth
 
 from .api import BASE_ITEM_COUNT
 
@@ -25,6 +26,16 @@ async def test_post_echo(rest_client):
 
     assert response.status_code == 200
     assert response.json() == payload
+
+
+@pytest.mark.anyio
+async def test_bearer_authentication(rest_client):
+    response = await rest_client.get(
+        "/authenticated", auth=BearerTokenAuth(token="test-token")
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"authenticated": True}
 
 
 @pytest.mark.anyio
