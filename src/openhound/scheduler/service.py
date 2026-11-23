@@ -379,8 +379,20 @@ class Service:
         # Exit condition, changed to True when the process needs to stop
         self.exit = False
 
+    @property
+    def _stopping(self) -> bool:
+        return self.exit or (self.status is not None and self.status.draining)
+
+    @property
+    def _has_pending_managed_job(self) -> bool:
+        return self.managed and (
+            self._pending_managed_claim is not None
+            or self._pending_managed_start is not None
+            or self._pending_managed_failure is not None
+        )
+
     def _exit_handler(self, sig: int, frame):
-        """Handle SIGINT and SIGTERM signals. Sets self.exit to True to stop the while loop"""
+        """Stop job discovery and begin graceful shutdown on SIGINT or SIGTERM."""
         self.exit = True
         if self.status is not None:
             self.status.draining = True
@@ -644,8 +656,10 @@ class Service:
             if prepared is None:
                 job_id = self._pending_managed_claim
                 if job_id is None:
+                    if self._stopping:
+                        return
                     available_job = self.check_managed_collector_jobs()
-                    if available_job is None:
+                    if available_job is None or self._stopping:
                         return
                     job_id = str(available_job.id)
                 prepared = self._claim_and_validate_managed_job(job_id)
@@ -1056,7 +1070,7 @@ class Service:
 
         if self.managed:
             if self.job_running is None:
-                if not self.exit and (self.status is None or not self.status.draining):
+                if not self._stopping or self._has_pending_managed_job:
                     self._poll_managed_jobs()
             else:
                 self._poll_running_job()
@@ -1089,7 +1103,8 @@ class Service:
         if self.status is not None:
             self.status.start()
         try:
-            while not self.exit and (self.status is None or not self.status.draining):
+            # Reconcile reservations before shutdown takes over any running worker.
+            while not self._stopping or self._has_pending_managed_job:
                 if self.managed:
                     try:
                         self._poll()
@@ -1104,7 +1119,9 @@ class Service:
                         )
                 else:
                     self._poll()
-                if self.status is None:
+                if self._stopping and not self._has_pending_managed_job:
+                    break
+                if self.status is None or self._stopping:
                     time.sleep(self.interval)
                 else:
                     self.status.wait_for_shutdown(self.interval)
