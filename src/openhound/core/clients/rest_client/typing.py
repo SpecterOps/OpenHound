@@ -1,10 +1,8 @@
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx2
-
-hookfunction: str
 
 type HookFunction = Callable[
     ..., httpx2.Response | None | Awaitable[httpx2.Response | None]
@@ -22,9 +20,22 @@ class Request:
 
     method: str
     url: str | None
-    headers: httpx2.Headers
+    headers: dict[str, Any]
     params: dict[str, Any] | None = None
     json: Any = None
     data: Any = None
     auth: httpx2.Auth | None = None
-    hooks: Hooks = field(default_factory=dict)
+    hooks: Hooks | None = None
+
+
+@dataclass
+class PreparedRequest:
+    """Native request and frozen auth/hook context for one logical request."""
+
+    request: httpx2.Request
+    auth: httpx2.Auth | None
+    hooks: list[HookFunction]
+
+    @property
+    def url(self) -> httpx2.URL:
+        return self.request.url

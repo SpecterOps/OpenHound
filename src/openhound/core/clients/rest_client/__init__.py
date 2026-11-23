@@ -13,9 +13,11 @@ from .paginators import (
     RangePaginator,
     SinglePagePaginator,
 )
+from .session import AsyncSession
 
 __all__ = [
     "AsyncRESTClient",
+    "AsyncSession",
     "BaseNextUrlPaginator",
     "BasePaginator",
     "BaseReferencePaginator",
