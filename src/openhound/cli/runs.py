@@ -9,9 +9,12 @@ from filelock import Timeout
 
 from openhound.core.manager import CollectorManager
 from openhound.core.runs import SavedRun
+from openhound.core.upload_package import package_saved_run
 from openhound.scheduler.dataflow import resume_saved_run
 
-runs = typer.Typer(help="Inspect saved runs and recover graph files locally")
+runs = typer.Typer(
+    help="Inspect saved runs, recover graph files, and package them for upload"
+)
 RunPath = Annotated[
     Path, typer.Argument(exists=True, file_okay=False, resolve_path=True)
 ]
@@ -50,6 +53,27 @@ def resume_run(
             )
         output = resume_saved_run(extension, run, normalize_workers=workers)
         typer.echo(f"Recovered graph files: {output}\nNo data was uploaded to BHE.")
+    except Timeout:
+        raise typer.BadParameter("Saved run is in use by another process") from None
+    except (ValueError, OSError) as error:
+        raise typer.BadParameter(str(error)) from None
+
+
+@runs.command("package")
+def package_run(
+    directory: RunPath,
+    output: Annotated[
+        Path, typer.Option("--output", "-o", help="New ZIP file to create")
+    ],
+) -> None:
+    """Package a completed recovery for a BloodHound user to upload manually."""
+    try:
+        archive, manifest = package_saved_run(SavedRun(directory), output)
+        typer.echo(
+            f"Upload package: {archive}\nManifest (keep locally): {manifest}\n"
+            "Upload the ZIP through BloodHound's file upload workflow. "
+            "No data was uploaded by this command."
+        )
     except Timeout:
         raise typer.BadParameter("Saved run is in use by another process") from None
     except (ValueError, OSError) as error:
