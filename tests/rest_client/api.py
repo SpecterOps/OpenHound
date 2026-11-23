@@ -13,6 +13,7 @@ def create_app() -> FastAPI:
     app.state.request_started = asyncio.Event()
     app.state.release_request = asyncio.Event()
     app.state.retry_attempts = 0
+    app.state.retry_exhaustion_attempts = 0
     items = [
         {"id": number, "name": f"Item {number}"} for number in range(1, BASE_ITEM_COUNT)
     ]
@@ -54,6 +55,11 @@ def create_app() -> FastAPI:
     async def retry() -> Response:
         app.state.retry_attempts += 1
         return Response(status_code=503 if app.state.retry_attempts == 1 else 200)
+
+    @app.get("/retry-exhaustion")
+    async def retry_exhaustion() -> Response:
+        app.state.retry_exhaustion_attempts += 1
+        return Response(status_code=503)
 
     @app.get("/wait")
     async def wait_for_release() -> dict[str, bool]:

@@ -1,6 +1,7 @@
 import asyncio
 from unittest.mock import Mock, call
 
+import pendulum
 import pytest
 from dlt.common import jsonpath
 
@@ -57,11 +58,37 @@ async def test_oauth2_client_credentials(rest_client):
 
 
 @pytest.mark.anyio
+async def test_oauth2_refresh_expired_token(rest_client):
+    credentials = OAuth2ClientCredentials(
+        access_token="expired-token",
+        access_token_url="http://testserver/token",
+        client_id="test-client",
+        client_secret="test-secret",
+        session=rest_client.session,
+    )
+    credentials.token_expiry = pendulum.now().subtract(seconds=1)
+
+    response = await rest_client.get("/authenticated", auth=credentials)
+
+    assert response.status_code == 200
+    assert response.json() == {"authenticated": True}
+    assert credentials.access_token == "test-token"
+
+
+@pytest.mark.anyio
 async def test_retry_on_service_unavailable(rest_client, api_app):
     response = await rest_client.get("/retry")
 
     assert response.status_code == 200
     assert api_app.state.retry_attempts == 2
+
+
+@pytest.mark.anyio
+async def test_retry_exhaustion(rest_client, api_app):
+    response = await rest_client.get("/retry-exhaustion")
+
+    assert response.status_code == 503
+    assert api_app.state.retry_exhaustion_attempts == 2
 
 
 @pytest.mark.anyio
