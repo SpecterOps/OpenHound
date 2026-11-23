@@ -11,6 +11,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="REST client test API")
     app.state.request_started = asyncio.Event()
     app.state.release_request = asyncio.Event()
+    app.state.retry_attempts = 0
     items = [
         {"id": number, "name": f"Item {number}"} for number in range(1, BASE_ITEM_COUNT)
     ]
@@ -26,6 +27,11 @@ def create_app() -> FastAPI:
     @app.post("/echo")
     async def echo(payload: dict[str, Any] | list[Any]) -> dict[str, Any] | list[Any]:
         return payload
+
+    @app.get("/retry")
+    async def retry() -> Response:
+        app.state.retry_attempts += 1
+        return Response(status_code=503 if app.state.retry_attempts == 1 else 200)
 
     @app.get("/wait")
     async def wait_for_release() -> dict[str, bool]:
