@@ -1,6 +1,7 @@
 import asyncio
 from math import ceil
 from typing import Annotated, Any
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 
@@ -27,6 +28,21 @@ def create_app() -> FastAPI:
     @app.post("/echo")
     async def echo(payload: dict[str, Any] | list[Any]) -> dict[str, Any] | list[Any]:
         return payload
+
+    @app.post("/token")
+    async def token(request: Request) -> dict[str, Any]:
+        form = parse_qs((await request.body()).decode())
+        if form != {
+            "client_id": ["test-client"],
+            "client_secret": ["test-secret"],
+            "grant_type": ["client_credentials"],
+        }:
+            raise HTTPException(status_code=401, detail="Invalid client credentials")
+        return {
+            "access_token": "test-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
 
     @app.get("/authenticated")
     async def authenticated(request: Request) -> dict[str, bool]:
