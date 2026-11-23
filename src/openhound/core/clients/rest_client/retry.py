@@ -41,7 +41,11 @@ class wait_retry_after(wait_exponential):
         if response is not None:
             value = response.headers.get("Retry-After", "")
             if re.fullmatch(r"\s*[0-9]+\s*", value):
-                return max(self.min, min(self.max, int(value)))
+                try:
+                    seconds = int(value)
+                except ValueError:
+                    return super().__call__(retry_state)
+                return max(self.min, min(self.max, seconds))
             date = parsedate_tz(value)
             if date is not None:
                 return max(self.min, min(self.max, mktime_tz(date) - time.time()))
