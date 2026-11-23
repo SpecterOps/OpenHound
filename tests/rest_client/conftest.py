@@ -1,6 +1,8 @@
 import httpx2
 import pytest
-from openhound.core.clients.rest_client import AsyncRESTClient
+from dlt.common.configuration.specs import RuntimeConfiguration
+
+from openhound.core.clients.rest_client import AsyncRESTClient, AsyncSession
 
 from .api import create_app
 
@@ -18,5 +20,10 @@ def api_app():
 @pytest.fixture
 async def rest_client(api_app, anyio_backend):
     transport = httpx2.ASGITransport(app=api_app)
-    async with httpx2.AsyncClient(transport=transport) as session:
+    config = RuntimeConfiguration(
+        request_max_attempts=2,
+        request_backoff_factor=0,
+        request_max_retry_delay=0,
+    )
+    async with AsyncSession(transport=transport, config=config) as session:
         yield AsyncRESTClient("http://testserver", session=session)
