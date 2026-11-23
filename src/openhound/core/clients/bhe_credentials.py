@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
@@ -89,10 +90,15 @@ class AWSBHECredentials:
             )
         return BHECredentials(token_id=token_id, token_key=token_key)
 
-    def poll_until_available(self, interval: int) -> BHECredentials:
+    def poll_until_available(
+        self,
+        interval: int,
+        *,
+        wait_for_shutdown: Callable[[float], bool] | None = None,
+    ) -> BHECredentials | None:
         """Keep checking the configured secret until it contains usable credentials."""
 
-        while True:
+        while wait_for_shutdown is None or not wait_for_shutdown(0):
             try:
                 return self._load_credentials()
             except Exception as error:  # noqa: BLE001 - bootstrap retries all reader failures
@@ -109,4 +115,8 @@ class AWSBHECredentials:
                     else f"Unexpected credential reader failure ({type(error).__name__})",
                     interval,
                 )
-                time.sleep(interval)
+                if wait_for_shutdown is None:
+                    time.sleep(interval)
+                elif wait_for_shutdown(interval):
+                    break
+        return None
