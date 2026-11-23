@@ -1,0 +1,18 @@
+# Optional: include this file explicitly to retain saved runs across replacement.
+services:
+  scheduler-jamf:
+    volumes:
+      - jamf-data:/var/lib/openhound
+
+  scheduler-github:
+    volumes:
+      - github-data:/var/lib/openhound
+
+  scheduler-okta:
+    volumes:
+      - okta-data:/var/lib/openhound
+
+volumes:
+  jamf-data:
+  github-data:
+  okta-data:
