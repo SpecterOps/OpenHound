@@ -1,15 +1,36 @@
 import logging
+import multiprocessing
+import shutil
 import signal
+import tempfile
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
+from typing import Any
+from uuid import UUID
 
 import openhound
 import openhound.core.logging as openhound_logging
-from openhound.core.clients.bloodhound_enterprise import BloodHoundEnterprise, JobStatus
+from openhound.config import is_managed
+from openhound.core.clients.aws_secrets_manager import (
+    AWSSecretsManager,
+    SecretRetrievalError,
+)
+from openhound.core.clients.bhe_credentials import BHECredentials
+from openhound.core.clients.bloodhound import BloodHoundHTTPError
+from openhound.core.clients.bloodhound_enterprise import (
+    BloodHoundEnterprise,
+    JobStatus,
+    ManagedJobOutcome,
+)
 from openhound.core.clients.models.jobs import (
+    CollectorJob,
     Job,
     ManagementOperation,
     ManagementOperationStatus,
@@ -18,25 +39,95 @@ from openhound.core.clients.models.jobs import (
 from openhound.core.manager import CollectorManager
 from openhound.core.support_bundle import create_support_bundle
 from openhound.scheduler import dataflow
+from openhound.scheduler.aws_profile import (
+    AWSAccessKeyCredentials,
+    AWSAccessKeyError,
+    AWSProfileWorkspace,
+    aws_profile_params,
+    cleanup_orphaned_aws_profiles,
+    managed_aws_profile,
+    prepare_aws_credentials,
+    validate_aws_profile,
+    validate_configured_aws_profiles,
+)
+from openhound.scheduler.configuration import (
+    ManagedConfigurationError,
+    _validate_document,
+    managed_job_configuration,
+)
 
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 30  # seconds; fixed poll/check-in cadence, must remain below BHE's 600s client-checkin timeout
+HEARTBEAT_INTERVAL = (
+    300  # seconds; BHE expires managed jobs after 15 minutes without a heartbeat
+)
+# TODO: Remove this constant and the guard in _send_managed_heartbeat once BHE
+# supports managed collector heartbeats. This is deliberately not configurable.
+_MANAGED_HEARTBEATS_DISABLED = True
+
+# Explicit source registration for the collectors shipped with this PoC.
+MANAGED_SOURCE_MODULES = {
+    "faker": "openhound_faker.source",
+    "aws": "openhound_aws.source",
+}
 
 
 class ExtensionNotFoundError(Exception):
     """Raised when the configured collector extension cannot be found."""
 
-    pass
+
+class ManagedRuntimeUnavailableError(RuntimeError):
+    """Managed scheduling requires a configured collection runtime."""
+
+
+class CredentialValidationError(ValueError):
+    """A managed job's required credential document could not be loaded."""
+
+    def __init__(
+        self,
+        message: str,
+        summary: str = "Credential document is invalid",
+        **context: Any,
+    ):
+        super().__init__(message)
+        self.summary = summary
+        self.context = context
+
+
+class ManagedJobProcessingError(RuntimeError):
+    """A sanitized managed polling failure that can be retried next poll."""
+
+
+@dataclass(frozen=True)
+class PreparedManagedJob:
+    """Validated job and credentials for the managed collection runtime.
+
+    Keep credentials in the in-memory worker handoff; never persist or log them.
+    """
+
+    job: CollectorJob = field(repr=False)
+    credentials: dict[str, Any] | AWSAccessKeyCredentials = field(repr=False)
 
 
 @dataclass
 class Result:
     results: dict
-    job_id: int
+    job_id: int | str
+    output_path: Path | None = None
+    data_files: list[Path] = field(default_factory=list)
+    uploaded_files: int = 0
+    upload_failure: str | None = None
 
 
-def _subprocess_collect(collector_name: str, job_id: int) -> Result:
+def _subprocess_collect(
+    collector_name: str,
+    job_id: int | str,
+    params: dict[str, Any] | None = None,
+    secrets: dict[str, Any] | AWSAccessKeyCredentials | None = None,
+    managed: bool = False,
+    aws_profile_directory: Path | None = None,
+) -> Result:
     """A subprocess which runs the DLT pipeline for the specified collector.
 
     Loads the collector by name from Python entrypoints.
@@ -44,6 +135,7 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
     Args:
         collector_name: The name of the extension to run.
         job_id: The Job ID as returned by BHE.
+        managed: Stage OpenGraph files for upload after collection completes.
 
     Returns:
         Result: The result of the collection, including the collected data and the job ID.
@@ -52,10 +144,96 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
         ExtensionNotFoundError: If the collector cannot be found via entrypoints.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Context and redaction surround imports, configuration, pipeline setup, and
+    # failure diagnostics. The queue handler applies them before serialization.
+    values = (
+        (secrets.access_key_id, secrets.secret_access_key)
+        if isinstance(secrets, AWSAccessKeyCredentials)
+        else tuple(_credential_log_values(secrets))
+    )
+    with (
+        openhound_logging.worker_log_context(job_id, collector_name),
+        openhound_logging.redact_log_values(values),
+    ):
+        try:
+            return _configured_worker_collect(
+                collector_name, job_id, params, secrets, managed, aws_profile_directory
+            )
+        except ManagedConfigurationError:
+            # AWS failures were diagnosed inside the SDK logging controls;
+            # configuration-resolution failures deliberately omit their values.
+            logger.exception("Worker configuration or collection failed")
+            raise
+        except ExtensionNotFoundError:
+            logger.exception("Collection worker could not load extension")
+            raise
+        except Exception:
+            logger.exception("Collection worker failed")
+            if managed:
+                raise ManagedConfigurationError(
+                    "Managed collection failed; check worker logs"
+                ) from None
+            raise
+
+
+def _credential_log_values(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _credential_log_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _credential_log_values(item)
+
+
+def _configured_worker_collect(
+    collector_name: str,
+    job_id: int | str,
+    params: dict[str, Any] | None,
+    secrets: dict[str, Any] | AWSAccessKeyCredentials | None,
+    managed: bool,
+    aws_profile_directory: Path | None,
+) -> Result:
+    if isinstance(secrets, AWSAccessKeyCredentials):
+        if collector_name != "aws" or aws_profile_directory is None:
+            raise ManagedConfigurationError(
+                "Managed AWS profile worker context is required"
+            )
+        with managed_aws_profile(
+            params or {}, secrets, aws_profile_directory
+        ) as profile:
+            validate_aws_profile(profile)
+            return _collect_in_worker(collector_name, job_id, managed, True)
+    configured = params is not None or secrets is not None
+    configuration = (
+        managed_job_configuration(params or {}, secrets or {})
+        if configured
+        else nullcontext()
+    )
+    # Install configuration before importing collectors or constructing pipelines:
+    # both can resolve DLT settings. Always remove it, including on worker failure.
+    with configuration:
+        if managed and collector_name == "aws":
+            validate_configured_aws_profiles()
+        return _collect_in_worker(collector_name, job_id, managed, configured)
+
+
+def _collect_in_worker(
+    collector_name: str, job_id: int | str, managed: bool, configured: bool
+) -> Result:
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
         if collector.name == collector_name:  # pyright: ignore[reportAttributeAccessIssue]
+            if (
+                configured
+                and collector.dlt_source is None
+                and collector.name in MANAGED_SOURCE_MODULES
+            ):
+                collector.dlt_source = import_module(
+                    MANAGED_SOURCE_MODULES[collector.name]
+                ).source
             log_fields = {
                 "collector_extension": collector.name,
                 "collector_extension_version": (
@@ -75,13 +253,30 @@ def _subprocess_collect(collector_name: str, job_id: int) -> Result:
                 job_id,
                 extra=log_fields,
             )
-            results = dataflow.pipeline(extension=collector)
+            output_path = (
+                Path(tempfile.mkdtemp(prefix="openhound-job-")) if managed else None
+            )
+            try:
+                results = (
+                    dataflow.pipeline(extension=collector)
+                    if output_path is None
+                    else dataflow.pipeline(extension=collector, output_path=output_path)
+                )
+            except BaseException:
+                if output_path is not None:
+                    shutil.rmtree(output_path)
+                raise
             logger.info(
                 "Collection for job %s completed successfully.",
                 job_id,
                 extra=log_fields,
             )
-            return Result(results=results, job_id=job_id)
+            return Result(
+                results=results,
+                job_id=job_id,
+                output_path=output_path,
+                data_files=sorted(output_path.glob("*.json")) if output_path else [],
+            )
 
     logger.error(f"Collector '{collector_name}' not found in available collectors.")
     raise ExtensionNotFoundError(f"Collector '{collector_name}' not found.")
@@ -101,25 +296,56 @@ class Service:
         token_id: str,
         collector_name: str,
         log_base_path: Path | None = None,
+        interval: int = POLL_INTERVAL,
+        credential_refresh: Callable[[], BHECredentials] | None = None,
+        *,
+        managed: bool | None = None,
+        secrets_manager: AWSSecretsManager | None = None,
+        managed_job_runner: Callable[[PreparedManagedJob], None] | None = None,
     ):
         # BHE client settings
         self.bhe_uri = bhe_uri
-        self.collector_name = collector_name
         self.client = BloodHoundEnterprise(
-            bhe_uri=bhe_uri, token_key=token_key, token_id=token_id
+            bhe_uri=bhe_uri,
+            token_key=token_key,
+            token_id=token_id,
+            credential_refresh=credential_refresh,
         )
-        # Interval how often to check for a job
-        self.interval = POLL_INTERVAL
+
+        # Shared scheduler settings
+        self.collector_name = collector_name
+        self.interval = interval
         self.log_base_path = (
             log_base_path or openhound_logging.logger_override.base_path
         )
 
-        # Stores the ID of currently running BHE job
-        self.job_running: int | None = None
+        # Managed collection settings and recovery state
+        self.managed = is_managed() if managed is None else managed
+        self._aws_profile_workspace: AWSProfileWorkspace | None = None
+        if self.managed and self.collector_name == "aws":
+            cleanup_orphaned_aws_profiles()
+        self.secrets_manager = secrets_manager or AWSSecretsManager()
+        self.managed_job_runner = managed_job_runner or self._run_prepared_managed_job
+        self._pending_managed_claim: str | None = None
+        self._pending_managed_start: PreparedManagedJob | None = None
+        self._pending_managed_failure: str | None = None
+        self._pending_managed_failure_summary = "Credential document is invalid"
+
+        # Stores the ID of the currently running BHE job.
+        # MVP runs one job at a time.
+        self.job_running: int | str | None = None
+        self.managed_job_id: str | None = None
+        self.next_heartbeat_at: float | None = None
 
         # Futures/results from the subprocess executor
         self.future: Future[Result] | None = None
-        self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
+        self._worker_context = multiprocessing.get_context("spawn")
+        self._worker_logging = openhound_logging.WorkerLogRouter(self._worker_context)
+        try:
+            self.executor = self._create_executor()
+        except BaseException:
+            self._worker_logging.close()
+            raise
 
         # Exit condition, changed to True when the process needs to stop
         self.exit = False
@@ -130,18 +356,73 @@ class Service:
         logger.warning(f"Received signal {sig}, shutting down gracefully.")
 
     def _shutdown(self) -> None:
-        """Shut down the executor and wait for running tasks to finish. Executed when the service is shut down."""
+        """Wait for the worker and finish any pending managed uploads."""
         logger.info("Collection service stopping.")
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        while self.future is not None and not self.future.done():
+            self._poll_running_job()
+            if self.future is not None:
+                time.sleep(self.interval)
+        if self.managed_job_id is not None:
+            self._finish_managed_job_on_shutdown()
+        elif self.future is not None:
+            try:
+                self._handle_completed_job(self.future)
+            except Exception:
+                logger.exception(
+                    "Unexpected error handling completed job during shutdown."
+                )
+                self._clear_running_job()
+        try:
+            self.executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            self._worker_logging.close()
         logger.info("Collection service stopped.")
+
+    def _finish_managed_job_on_shutdown(self) -> None:
+        """Retry a completed managed job while maintaining its claim."""
+        while self.future is not None:
+            self._poll_running_job()
+            if self.future is None:
+                return
+            try:
+                self._handle_completed_job(self.future)
+            except Exception:  # noqa: BLE001
+                # Retain managed work and redact sensitive errors.
+                logger.error(
+                    "Error reporting completed managed job during shutdown; "
+                    "retaining result for retry."
+                )
+            if self.future is not None:
+                time.sleep(self.interval)
+
+    def _clear_running_job(self) -> None:
+        self._cleanup_aws_profile_workspace()
+        self.future = None
+        self.job_running = None
+        self.managed_job_id = None
+        self.next_heartbeat_at = None
+
+    def _cleanup_aws_profile_workspace(self) -> None:
+        if self._aws_profile_workspace is not None:
+            self._aws_profile_workspace.cleanup()
+            self._aws_profile_workspace = None
 
     def _reset_executor(self) -> None:
         """Tear down and recreate the process pool after it has entered a broken state."""
         try:
-            self.executor.shutdown(wait=False, cancel_futures=True)
+            self.executor.shutdown(wait=True, cancel_futures=True)
         except Exception:
             logger.exception("Error shutting down broken executor.")
-        self.executor = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=1)
+        self.executor = self._create_executor()
+
+    def _create_executor(self) -> ProcessPoolExecutor:
+        return ProcessPoolExecutor(
+            max_workers=1,
+            max_tasks_per_child=1,
+            mp_context=self._worker_context,
+            initializer=openhound_logging.configure_worker_logging,
+            initargs=(self._worker_logging.queue, logging.getLogger().level),
+        )
 
     def check_jobs(self) -> Job | None:
         """Checks BloodHound enterprise for available jobs. These can either be new jobs or jobs currently started and not finished/stopped.
@@ -170,6 +451,183 @@ class Service:
 
         return None
 
+    def check_managed_collector_jobs(self) -> CollectorJob | None:
+        """Return the first available job from the managed collector queue."""
+        logger.info("Checking for new managed collector jobs in BloodHound Enterprise.")
+        available_jobs = self.client.available_collector_jobs(self.collector_name)
+        for job in available_jobs.data.jobs:
+            if job.job_key == self.collector_name:
+                return job
+        return None
+
+    def _report_managed_credential_failure(self, job_id: str) -> None:
+        # Retain the unresolved ID if reporting exhausts its retries. On the next
+        # poll retry end, rather than claiming or retrieving another job.
+        self._pending_managed_failure = job_id
+        self.client.end_managed_job(
+            job_id,
+            ManagedJobOutcome.FAILED,
+            failure_message=self._pending_managed_failure_summary,
+        )
+        self._pending_managed_failure = None
+
+    def _load_managed_credentials(
+        self, job: CollectorJob
+    ) -> dict[str, Any] | AWSAccessKeyCredentials:
+        """Retrieve and validate credentials, exposing only a safe failure message."""
+        logger.debug(
+            "Retrieving managed collector credentials.",
+            extra={
+                "job_id": str(job.id),
+                "provider": "aws.secretsmanager",
+                "secret_count": 1,
+            },
+        )
+        try:
+            if job.job_key == "aws":
+                credentials = prepare_aws_credentials(
+                    job, self.secrets_manager.get_secret
+                )
+            else:
+                if job.secret_key_id is None or not job.secret_key_id.strip():
+                    raise CredentialValidationError(
+                        "Managed job has no credential secret identifier"
+                    )
+                credentials = self.secrets_manager.get_secret(job.secret_key_id)
+            if isinstance(credentials, AWSAccessKeyCredentials):
+                return credentials
+            if isinstance(credentials, dict):
+                _validate_document(credentials, allow_empty=True)
+                return credentials
+        except AWSAccessKeyError as error:
+            raise CredentialValidationError(
+                str(error), error.summary, **error.context
+            ) from None
+        except CredentialValidationError:
+            raise
+        except ManagedConfigurationError as error:
+            raise CredentialValidationError(str(error)) from None
+        except SecretRetrievalError as error:
+            raise CredentialValidationError(str(error), error.failure_summary) from None
+        except Exception as error:  # noqa: BLE001
+            # Unexpected readers can expose payloads.
+            raise CredentialValidationError(
+                f"Credential secret reader failed ({type(error).__name__})",
+                "Credential secret retrieval failed",
+            ) from None
+        raise CredentialValidationError("Credential document must be a JSON object")
+
+    def _validate_managed_claim(self, job: CollectorJob, job_id: str) -> None:
+        """Check the job identity and lease confirmed by BHE's claim response."""
+
+        # The authenticated claim endpoint confirms the holder. Reclaiming does
+        # not renew the lease, so an old response is not enough to permit work.
+        lease_expires_at = job.claim_expires_at
+        if (
+            str(job.id) != job_id
+            or job.job_key != self.collector_name
+            or job.status != "claimed"
+            or job.claimed_by is None
+            or job.claimed_at is None
+            or lease_expires_at is None
+            or lease_expires_at.utcoffset() is None
+            or lease_expires_at <= datetime.now(UTC)
+        ):
+            logger.error(
+                "Managed claim response does not confirm a usable claim.",
+                extra={"job_id": job_id},
+            )
+            raise ManagedJobProcessingError("Managed claim could not be reconciled")
+
+    def _claim_and_validate_managed_job(self, job_id: str) -> PreparedManagedJob | None:
+        """Claim a managed job and validate its credentials."""
+        # A timeout can happen after BHE commits the claim. Keep the ID until we
+        # reconcile it; discovery no longer lists jobs held by this collector.
+        self._pending_managed_claim = job_id
+        try:
+            job = self.client.claim_managed_job(job_id)
+        except BloodHoundHTTPError as error:
+            if error.code in (404, 409):
+                # An existing claimed job held by this client would return 200.
+                self._pending_managed_claim = None
+            if error.code == 409:
+                logger.debug(
+                    "Managed collector claim conflict.",
+                    extra={"job_id": job_id},
+                )
+                return None
+            raise
+
+        self._validate_managed_claim(job, job_id)
+        context = {"job_id": job_id}
+        logger.info("Job successfully picked up", extra=context)
+        try:
+            credentials = self._load_managed_credentials(job)
+        except CredentialValidationError as error:
+            logger.error(
+                "Cannot prepare managed job %s: %s. Reporting this job failed.",
+                job_id,
+                str(error).rstrip("."),
+                extra={
+                    **error.context,
+                    **context,
+                    **(
+                        {} if job.job_key == "aws" else {"secret_id": job.secret_key_id}
+                    ),
+                },
+            )
+            self._pending_managed_claim = None
+            self._pending_managed_failure_summary = error.summary
+            self._report_managed_credential_failure(str(job.id))
+            return None
+
+        # Secret retrieval may have consumed the remaining lease time.
+        self._validate_managed_claim(job, job_id)
+        logger.info("Credential retrieval valid", extra=context)
+        return PreparedManagedJob(job=job, credentials=credentials)
+
+    def _clear_pending_managed_start(self) -> None:
+        """Discard preparation state once start is confirmed or rejected."""
+        self._pending_managed_claim = None
+        self._pending_managed_start = None
+
+    def _require_managed_runtime(self) -> Callable[[PreparedManagedJob], None]:
+        if self.managed_job_runner is None:
+            raise ManagedRuntimeUnavailableError(
+                "Managed collection runtime is required for managed scheduling"
+            )
+        return self.managed_job_runner
+
+    def _run_prepared_managed_job(self, prepared: PreparedManagedJob) -> None:
+        self.run_claimed_job(prepared.job.id, prepared.job.params, prepared.credentials)
+
+    def _poll_managed_jobs(self) -> None:
+        runner = self._require_managed_runtime()
+        try:
+            if self._pending_managed_failure is not None:
+                self._report_managed_credential_failure(self._pending_managed_failure)
+                return
+            prepared = self._pending_managed_start
+            if prepared is None:
+                job_id = self._pending_managed_claim
+                if job_id is None:
+                    available_job = self.check_managed_collector_jobs()
+                    if available_job is None:
+                        return
+                    job_id = str(available_job.id)
+                prepared = self._claim_and_validate_managed_job(job_id)
+                # Keep validated inputs in memory across ambiguous start failures.
+                # Repeating BHE's idempotent start also reconciles a job that is
+                # already running remotely; re-claiming it would return 409.
+                self._pending_managed_start = prepared
+            if prepared is not None:
+                runner(prepared)
+                self._clear_pending_managed_start()
+        except Exception:  # noqa: BLE001 - redact managed runtime errors
+            raise ManagedJobProcessingError(
+                "Managed collector job processing failed"
+            ) from None
+
     def check_management(self) -> ManagementOperation | None:
         """Return the first pending support-bundle operation, if any."""
         logger.info("Checking for management operations in BloodHound Enterprise.")
@@ -180,6 +638,22 @@ class Service:
             ):
                 return operation
         return None
+
+    def _poll_management(self) -> bool:
+        """Return whether a support-bundle request was handled this poll."""
+        try:
+            operation = self.check_management()
+        except Exception:
+            logger.exception("Error checking management operations.")
+            return False
+
+        if operation is None:
+            return False
+        try:
+            self._send_support_bundle(operation)
+        except Exception:
+            logger.exception("Error executing management operation.")
+        return True
 
     def _send_support_bundle(self, operation: ManagementOperation) -> None:
         """Claim, upload, and complete a support-bundle operation."""
@@ -212,102 +686,325 @@ class Service:
                     )
 
     def _start_job(self, job: Job) -> None:
-        """Starts a BloodHound enterprise job by ID and runs the collection process in a subprocess. The results are then used to end the job in BHE with a complete status.
-        this function returns no value but updates the self.futures list with the future of the subprocess and sets the currently running job ID in self.job_running
+        """Start an unmanaged job using the shared worker lifecycle."""
+        self._launch_job(job.id)
 
-        Args:
-            job (Job): The job to start as a Job object.
-        """
+    def run_claimed_job(
+        self,
+        job_id: str | UUID,
+        params: dict[str, Any],
+        secrets: dict[str, Any] | AWSAccessKeyCredentials,
+    ) -> None:
+        """Start a validated managed job; the scheduler polls it until completion."""
+        # Normalize managed UUIDs once at the runtime boundary. Unmanaged IDs
+        # remain integers throughout the shared lifecycle.
+        self._launch_job(str(job_id), params=params, secrets=secrets, managed=True)
 
-        logger.info(f"Starting job {job.id} with collector '{self.collector_name}'")
-        self.client.start_job(job.id)
-        self.job_running = job.id
+    def _launch_job(
+        self,
+        job_id: int | str,
+        *,
+        params: dict[str, Any] | None = None,
+        secrets: dict[str, Any] | AWSAccessKeyCredentials | None = None,
+        managed: bool = False,
+    ) -> None:
+        """Notify BHE and submit one collector worker."""
+        if self.job_running is not None:
+            raise RuntimeError(f"Job {self.job_running} is already running")
+
+        if isinstance(secrets, AWSAccessKeyCredentials):
+            params = aws_profile_params(
+                {} if params is None else params, collector_name=self.collector_name
+            )
+        logger.info("Starting job %s with collector '%s'.", job_id, self.collector_name)
+        managed_job_id: str | None = None
+        if managed:
+            if not isinstance(job_id, str):
+                raise TypeError("Managed job IDs must be strings")
+            try:
+                self.client.start_collector_job(job_id)
+            except BloodHoundHTTPError as error:
+                if error.code in (404, 409):
+                    self._clear_pending_managed_start()
+                raise
+            managed_job_id = job_id
+            self._clear_pending_managed_start()
+        else:
+            if not isinstance(job_id, int):
+                raise TypeError("Unmanaged job IDs must be integers")
+            self.client.start_job(job_id)
+
+        if managed:
+            logger.info("Managed collector job %s started successfully.", job_id)
+        self.job_running = job_id
+        self.managed_job_id = managed_job_id
+        self.next_heartbeat_at = (
+            time.monotonic() + HEARTBEAT_INTERVAL if managed else None
+        )
         try:
+            if isinstance(secrets, AWSAccessKeyCredentials):
+                self._cleanup_aws_profile_workspace()
+                self._aws_profile_workspace = AWSProfileWorkspace()
             self.future = self.executor.submit(
-                _subprocess_collect, self.collector_name, job.id
+                _subprocess_collect,
+                self.collector_name,
+                job_id,
+                dict(params or {}) if managed else None,
+                (
+                    (
+                        secrets
+                        if isinstance(secrets, AWSAccessKeyCredentials)
+                        else dict(secrets or {})
+                    )
+                    if managed
+                    else None
+                ),
+                *((True,) if managed else ()),
+                *(
+                    (self._aws_profile_workspace.directory,)
+                    if self._aws_profile_workspace is not None
+                    else ()
+                ),
             )
         except BrokenProcessPool:
-            logger.exception(
-                f"Failed to submit job {job.id}: process pool is broken, resetting."
-            )
-            self.future = None
-            self.job_running = None
+            logger.exception("Failed to submit job %s: process pool is broken.", job_id)
             self._reset_executor()
-            self.client.end_job(
-                JobStatus.FAILED,
-                f"Failed to start collector '{self.collector_name}': worker pool was broken",
+            try:
+                self._end_job(
+                    JobStatus.FAILED,
+                    f"Failed to start collector '{self.collector_name}': worker pool was broken",
+                )
+            finally:
+                self._clear_running_job()
+        except Exception as error:
+            logger.error(
+                "Failed to submit job %s.",
+                job_id,
+                extra={"job_id": job_id, "error_type": type(error).__name__},
             )
+            try:
+                self._end_job(
+                    JobStatus.FAILED,
+                    f"Failed to start collector '{self.collector_name}'",
+                )
+            finally:
+                self._clear_running_job()
+            raise
+
+    def _end_job(self, status: JobStatus, message: str) -> None:
+        if self.managed_job_id is not None:
+            self.client.end_managed_job(
+                self.managed_job_id,
+                (
+                    ManagedJobOutcome.SUCCEEDED
+                    if status is JobStatus.COMPLETE
+                    else ManagedJobOutcome.FAILED
+                ),
+                failure_message=message if status is JobStatus.FAILED else None,
+            )
+        else:
+            self.client.end_job(status, message)
+
+    def _send_managed_heartbeat(self, job_id: str) -> None:
+        if _MANAGED_HEARTBEATS_DISABLED:
+            return
+
+        try:
+            self.client.heartbeat_collector_job(job_id)
+        except Exception as error:  # noqa: BLE001
+            # Transient heartbeat failures must not stop collection.
+            if isinstance(error, BloodHoundHTTPError) and error.code == 404:
+                self._abort_managed_job(job_id)
+                return
+            logger.info(
+                "Managed collector job %s heartbeat request failed.",
+                job_id,
+                extra={
+                    "job_id": job_id,
+                    "error_type": type(error).__name__,
+                    "status_code": (
+                        error.code if isinstance(error, BloodHoundHTTPError) else None
+                    ),
+                },
+            )
+        else:
+            logger.info("Managed collector job %s heartbeat succeeded.", job_id)
+
+    def _abort_managed_job(self, job_id: str) -> None:
+        """Stop local work without reporting an outcome for a claim we no longer own."""
+        logger.warning(
+            "Managed collector job %s claim lost; stopping collection.", job_id
+        )
+        future = self.future
+        processes = list((self.executor._processes or {}).values())
+        try:
+            for process in processes:
+                try:
+                    process.kill()
+                except OSError:
+                    logger.exception("Unable to kill worker process.")
+            self.executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            logger.exception("Error shutting down executor after claim loss.")
+        finally:
+            # Completed workers can leave staged output awaiting upload. Clean
+            # it before discarding the result, regardless of how claim loss arose.
+            if (
+                future is not None
+                and future.done()
+                and not future.cancelled()
+                and future.exception() is None
+            ):
+                self._remove_job_output(future.result())
+            self._clear_running_job()
+            self.executor = self._create_executor()
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
-        """Handles completion of a job and reports success or failure to BloodHound Enterprise
-
-        Args:
-            future (Future[Result]): Future containing the result of the collection subprocess, including the job ID.
-        """
+        """Report the completed worker's outcome through the active job API."""
+        # Erase credentials before uploads/end retries. This also runs when a
+        # killed worker could not execute its context manager's finally block.
+        self._cleanup_aws_profile_workspace()
+        result: Result | None = None
         try:
             result = future.result()
             logger.info(f"Job {result.job_id} completed successfully, notifying BHE.")
-            self.client.end_job(
-                JobStatus.COMPLETE,
-                f"Collector '{self.collector_name}' completed successfully",
-            )
-
         except ExtensionNotFoundError:
             logger.error(
                 f"Collector '{self.collector_name}' not found. Marking job as failed."
             )
-            self.client.end_job(
-                JobStatus.FAILED,
-                f"Collector '{self.collector_name}' not found",
+            status = JobStatus.FAILED
+            message = f"Collector '{self.collector_name}' not found"
+        except ManagedConfigurationError as error:
+            status = JobStatus.FAILED
+            message = str(error)
+            logger.error(
+                "Managed job %s configuration is invalid: %s",
+                self.job_running,
+                message,
+                extra={
+                    "job_id": self.job_running,
+                    "collector_extension": self.collector_name,
+                },
             )
-
         except BrokenProcessPool:
             logger.exception(
                 "Collection worker was terminated abruptly; resetting process pool."
             )
             self._reset_executor()
-            self.client.end_job(
-                JobStatus.FAILED,
-                f"Collection worker for '{self.collector_name}' was terminated abruptly",
+            status = JobStatus.FAILED
+            message = (
+                f"Collection worker for '{self.collector_name}' was terminated abruptly"
             )
-
-        except Exception:
-            logger.exception("Collection subprocess failed.")
-            self.client.end_job(
-                JobStatus.FAILED,
-                f"Unexpected error while running '{self.collector_name}' collector",
+        except Exception as error:  # noqa: BLE001 - any worker error must end the job
+            logger.error(
+                "Collection subprocess failed.",
+                extra={"error_type": type(error).__name__},
             )
+            status = JobStatus.FAILED
+            message = (
+                f"Unexpected error while running '{self.collector_name}' collector"
+            )
+        else:
+            if self.managed_job_id is not None and result.output_path is not None:
+                if result.job_id != self.job_running:
+                    raise ValueError(
+                        "Managed collection result does not match the running job"
+                    )
+                while result.upload_failure is None and result.uploaded_files < len(
+                    result.data_files
+                ):
+                    data_file = result.data_files[result.uploaded_files]
+                    try:
+                        data = data_file.open("rb")
+                    except FileNotFoundError:
+                        result.upload_failure = (
+                            "Collector data upload failed: staged file is missing"
+                        )
+                        break
+                    try:
+                        with data:
+                            self.client.upload_collector_job_data(
+                                self.managed_job_id, data
+                            )
+                    except BloodHoundHTTPError as error:
+                        if error.code in (404, 409):
+                            self._abort_managed_job(self.managed_job_id)
+                            return
+                        if error.code not in (400, 401, 403, 415):
+                            raise
+                        # Retain the failure across polls if reporting it fails.
+                        # Response bodies can contain sensitive collected data.
+                        result.upload_failure = (
+                            f"Collector data upload rejected (HTTP {error.code})"
+                        )
+                        break
+                    result.uploaded_files += 1
+            if result.upload_failure is not None:
+                status = JobStatus.FAILED
+                message = result.upload_failure
+            else:
+                status = JobStatus.COMPLETE
+                message = f"Collector '{self.collector_name}' completed successfully"
+        self._end_job(status, message)
+        if self.managed_job_id is not None and result is not None:
+            self._remove_job_output(result)
+        self._clear_running_job()
 
-        finally:
-            self.future = None
-            self.job_running = None
+    def _remove_job_output(self, result: Result) -> None:
+        if result.output_path is not None:
+            try:
+                shutil.rmtree(result.output_path)
+            except OSError:
+                logger.exception("Unable to remove output for job %s.", result.job_id)
+
+    def _poll_running_job(self) -> None:
+        if self.managed_job_id is not None:
+            if (
+                self.next_heartbeat_at is not None
+                and time.monotonic() >= self.next_heartbeat_at
+            ):
+                self._send_managed_heartbeat(self.managed_job_id)
+                if self.managed_job_id is not None:
+                    self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
+        else:
+            try:
+                _ = self.client.jobs_current
+            except Exception:
+                logger.exception("Error checking in-progress job.")
 
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
-        # If a job is currently running check if the future is done and handle completion
         try:
             if self.future is not None and self.future.done():
                 self._handle_completed_job(self.future)
         except Exception:
-            logger.exception("Unexpected error handling completed job.")
-            self.future = None
-            self.job_running = None
+            if self.managed:
+                logger.error(
+                    "Error reporting completed managed job; retaining result for retry."
+                )
+            else:
+                logger.exception(
+                    "Error reporting completed job; retaining result for retry."
+                )
 
-        # Management operations have priority over new collections while idle.
+        # Legacy support-bundle management is only available to unmanaged clients.
+        idle = (
+            self.job_running is None
+            and self._pending_managed_claim is None
+            and self._pending_managed_start is None
+            and self._pending_managed_failure is None
+        )
+        if not self.managed and idle and self._poll_management():
+            return
+
+        if self.managed:
+            if self.job_running is None:
+                self._poll_managed_jobs()
+            else:
+                self._poll_running_job()
+            return
+
         if self.job_running is None:
-            try:
-                operation = self.check_management()
-            except Exception:
-                logger.exception("Error checking management operations.")
-                operation = None
-
-            if operation is not None:
-                try:
-                    self._send_support_bundle(operation)
-                except Exception:
-                    logger.exception("Error executing management operation.")
-                return
-
             try:
                 available_job = self.check_jobs()
                 if available_job:
@@ -315,10 +1012,7 @@ class Service:
             except Exception:
                 logger.exception("Error checking for or starting jobs.")
         else:
-            try:
-                self.client.jobs_current
-            except Exception:
-                logger.exception("Error checking in-progress job.")
+            self._poll_running_job()
 
     def start(self) -> None:
         """Start method to initiate the process of checking for jobs and running them. This method will run indefinitely until an exit signal is received"""
@@ -327,15 +1021,29 @@ class Service:
         logger.info(
             f"Service started, monitoring {self.bhe_uri} every {self.interval} seconds."
         )
-        try:
-            self.client.update_client_metadata()
-
-        except Exception as err:
-            logger.exception(f"Unable to update client metadata: {err}")
+        # Managed identities have no client metadata endpoint.
+        if not self.managed:
+            try:
+                self.client.update_client_metadata()
+            except Exception:
+                logger.exception("Unable to update client metadata.")
 
         try:
             while not self.exit:
-                self._poll()
+                if self.managed:
+                    try:
+                        self._poll()
+                    except ManagedRuntimeUnavailableError:
+                        logger.error(
+                            "Managed collection runtime is unavailable; retrying next poll."
+                        )
+                    except ManagedJobProcessingError:
+                        logger.error(
+                            "Managed scheduler poll failed; retrying next poll in %s seconds.",
+                            self.interval,
+                        )
+                else:
+                    self._poll()
                 time.sleep(self.interval)
         finally:
             self._shutdown()
