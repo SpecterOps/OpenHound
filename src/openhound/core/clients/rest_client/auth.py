@@ -3,7 +3,7 @@ import math
 from base64 import b64encode
 from collections.abc import AsyncGenerator, Generator, Iterable
 from dataclasses import field
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, Self
 from urllib.parse import urlencode
 from weakref import WeakValueDictionary
 
@@ -179,6 +179,12 @@ class OAuth2ClientCredentials(OAuth2AuthBase):
         if self.session is None:
             self.session = _default_session
 
+    def copy(self) -> Self:
+        copied = super().copy()
+        copied._refresh_locks = WeakValueDictionary()
+        copied.token_expiry = self.token_expiry
+        return copied
+
     def sync_auth_flow(
         self, request: httpx2.Request
     ) -> Generator[httpx2.Request, httpx2.Response]:
@@ -209,9 +215,11 @@ class OAuth2ClientCredentials(OAuth2AuthBase):
         if response.status_code >= 400:
             response.raise_for_status()
         response_json = response.json()
-        self.parse_native_representation(self.parse_access_token(response_json))
+        token = self.parse_access_token(response_json)
         expires_in_seconds = self.parse_expiration_in_seconds(response_json)
-        self.token_expiry = pendulum.now().add(seconds=expires_in_seconds)
+        token_expiry = pendulum.now().add(seconds=expires_in_seconds)
+        self.parse_native_representation(token)
+        self.token_expiry = token_expiry
 
     def build_access_token_request(self) -> dict[str, Any]:
         return {
@@ -228,7 +236,10 @@ class OAuth2ClientCredentials(OAuth2AuthBase):
         return int(response_json.get("expires_in", self.default_token_expiration))
 
     def parse_access_token(self, response_json: Any) -> str:
-        return str(response_json.get("access_token"))
+        token = response_json.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise ValueError("OAuth access_token must be a non-empty string.")
+        return token
 
 
 @configspec
@@ -239,6 +250,7 @@ class OAuthJWTAuth(BearerTokenAuth):
     Private-key parsing and signing run in a worker thread.
     """
 
+    token: Annotated[TSecretStrValue | None, NotResolved()] = None  # type: ignore[assignment]
     format: Final[Literal["JWT"]] = field(  # noqa: PYI064 - Preserve DLT's config hint.
         default="JWT", init=False, repr=False, compare=False
     )
@@ -252,8 +264,8 @@ class OAuthJWTAuth(BearerTokenAuth):
     session: Annotated[AsyncSession, NotResolved()] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.scopes, str):
-            self.scopes = " ".join(self.scopes)  # type: ignore[arg-type]
+        if isinstance(self.scopes, list):
+            self.scopes = " ".join(self.scopes)
         self.token = None  # type: ignore[assignment]
         self.token_expiry: pendulum.DateTime | None = None
         self._refresh_locks: WeakValueDictionary[
@@ -261,6 +273,12 @@ class OAuthJWTAuth(BearerTokenAuth):
         ] = WeakValueDictionary()
         if self.session is None:
             self.session = _default_session
+
+    def copy(self) -> Self:
+        copied = super().copy()
+        copied._refresh_locks = WeakValueDictionary()
+        copied.token_expiry = self.token_expiry
+        return copied
 
     def sync_auth_flow(
         self, request: httpx2.Request
@@ -303,10 +321,15 @@ class OAuthJWTAuth(BearerTokenAuth):
         if response.status_code >= 400:
             response.raise_for_status()
         token_response = response.json()
-        self.token = token_response["access_token"]
-        self.token_expiry = pendulum.now().add(
-            seconds=token_response.get("expires_in", self.default_token_expiration)
+        token = token_response.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise ValueError("OAuth access_token must be a non-empty string.")
+        expires_in_seconds = int(
+            token_response.get("expires_in", self.default_token_expiration)
         )
+        token_expiry = pendulum.now().add(seconds=expires_in_seconds)
+        self.token = token
+        self.token_expiry = token_expiry
 
     def create_jwt_payload(self) -> dict[str, Any]:
         now = pendulum.now()

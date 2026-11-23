@@ -16,6 +16,7 @@ def create_app() -> FastAPI:
     app.state.release_request = asyncio.Event()
     app.state.retry_attempts = 0
     app.state.retry_exhaustion_attempts = 0
+    app.state.offset_requests = []
     items = [
         {"id": number, "name": f"Item {number}"} for number in range(1, BASE_ITEM_COUNT)
     ]
@@ -108,6 +109,7 @@ def create_app() -> FastAPI:
         offset: Annotated[int, Query(ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=100)] = 2,
     ) -> dict[str, Any]:
+        app.state.offset_requests.append((offset, limit))
         return {
             "data": {"items": items[offset : offset + limit]},
             "pagination": {"total_items": len(items)},
