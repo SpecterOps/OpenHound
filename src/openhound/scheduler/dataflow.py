@@ -127,6 +127,16 @@ def _saved_pipeline(
                     resources = convert(extension, output_path, run=run)
                 run.manifest.results[phase] = resources
                 run.save()
+                if phase == "collect":
+                    try:
+                        run.write_collection_inventory()
+                    except OSError as error:
+                        logger.warning(
+                            "Could not write collection inventory for saved run %s "
+                            "(%s); continuing without it",
+                            run.directory,
+                            type(error).__name__,
+                        )
         except Exception as error:
             run.manifest.status = "failed"
             run.manifest.error_type = type(error).__name__
