@@ -704,7 +704,7 @@ def test_end_managed_job_uses_bounded_timeouts(mock_service, monkeypatch):
     ids=["http-500", "connection-error", "timeout"],
 )
 def test_end_managed_job_retries_transient_errors(
-    mock_service, monkeypatch, caplog, transient_error
+        mock_service, monkeypatch, caplog, transient_error
 ):
     attempts = 0
     delays = []
@@ -1836,13 +1836,13 @@ def aws_managed_service(managed_service, mock_bloodhound_api):
     "binary_secret", [False, True], ids=["secret-string", "bhe-utf8-binary"]
 )
 def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_environment(
-    aws_managed_service,
-    mock_bloodhound_api,
-    failed,
-    binary_secret,
-    monkeypatch,
-    tmp_path,
-    caplog,
+        aws_managed_service,
+        mock_bloodhound_api,
+        failed,
+        binary_secret,
+        monkeypatch,
+        tmp_path,
+        caplog,
 ):
     monkeypatch.setenv("AWS_CREDENTIAL_EXPIRATION", "2000-01-01T00:00:00Z")
     scheduler = aws_managed_service
@@ -2023,7 +2023,7 @@ def test_invalid_raw_aws_payloads_are_not_trimmed_wrapped_or_treated_as_document
     ],
 )
 def test_raw_credential_jobs_forward_opaque_extension_settings(
-    aws_managed_service, mock_bloodhound_api, options, monkeypatch
+        aws_managed_service, mock_bloodhound_api, options, monkeypatch
 ):
     state = mock_bloodhound_api.app.state
     state.collector_job_claim_response["params"] = {"custom": options}
@@ -2312,7 +2312,7 @@ def test_workers_keep_generic_document_validation(collector_name):
     ],
 )
 def test_raw_credential_jobs_preserve_custom_configuration_layouts(
-    aws_managed_service, mock_bloodhound_api, params
+        aws_managed_service, mock_bloodhound_api, params
 ):
     state = mock_bloodhound_api.app.state
     state.collector_job_claim_response["params"] = params
@@ -2707,7 +2707,7 @@ def test_missing_managed_secret_reference_fails_without_local_fallback(
     ids=["aws-permission-error", "aws-missing-secret", "unexpected-reader-error"],
 )
 def test_secret_retrieval_failure_keeps_safe_diagnostics_and_reports_safe_summary(
-    managed_service, mock_bloodhound_api, caplog, error, summary
+        managed_service, mock_bloodhound_api, caplog, error, summary
 ):
     state = mock_bloodhound_api.app.state
 
@@ -2902,7 +2902,7 @@ def test_managed_poll_skips_nonmatching_queue_entries(
 
 
 def test_managed_runtime_dependency_fails_before_claim_or_legacy_work(
-    managed_service, mock_bloodhound_api
+        managed_service, mock_bloodhound_api
 ):
     managed_service.managed_job_runner = None
     with pytest.raises(
