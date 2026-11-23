@@ -4,7 +4,15 @@ from unittest.mock import Mock, call
 import pytest
 from dlt.common import jsonpath
 
-from openhound.core.clients.rest_client import JSONLinkPaginator
+from openhound.core.clients.rest_client import (
+    HeaderCursorPaginator,
+    HeaderLinkPaginator,
+    JSONLinkPaginator,
+    JSONResponseCursorPaginator,
+    OffsetPaginator,
+    PageNumberPaginator,
+    SinglePagePaginator,
+)
 
 from .api import BASE_ITEM_COUNT
 
@@ -35,6 +43,112 @@ async def test_pagination(rest_client):
     assert [item["id"] for page in pages for item in page] == list(
         range(1, BASE_ITEM_COUNT)
     )
+
+
+@pytest.mark.anyio
+async def test_page_number_pagination(rest_client):
+    pages = [
+        page
+        async for page in rest_client.paginate(
+            "/paginated/pages",
+            params={"page_size": 5},
+            data_selector="data.items",
+            paginator=PageNumberPaginator(
+                base_page=1, total_path="pagination.total_pages"
+            ),
+        )
+    ]
+
+    assert len(pages) == 4
+    assert [item["id"] for page in pages for item in page] == list(
+        range(1, BASE_ITEM_COUNT)
+    )
+
+
+@pytest.mark.anyio
+async def test_offset_pagination(rest_client):
+    pages = [
+        page
+        async for page in rest_client.paginate(
+            "/paginated/offset",
+            data_selector="data.items",
+            paginator=OffsetPaginator(limit=5, total_path="pagination.total_items"),
+        )
+    ]
+
+    assert len(pages) == 4
+    assert [item["id"] for page in pages for item in page] == list(
+        range(1, BASE_ITEM_COUNT)
+    )
+
+
+@pytest.mark.anyio
+async def test_json_cursor_pagination(rest_client):
+    pages = [
+        page
+        async for page in rest_client.paginate(
+            "/paginated/cursor",
+            params={"page_size": 5},
+            data_selector="data.items",
+            paginator=JSONResponseCursorPaginator(cursor_path="pagination.next_cursor"),
+        )
+    ]
+
+    assert len(pages) == 4
+    assert [item["id"] for page in pages for item in page] == list(
+        range(1, BASE_ITEM_COUNT)
+    )
+
+
+@pytest.mark.anyio
+async def test_header_link_pagination(rest_client):
+    pages = [
+        page
+        async for page in rest_client.paginate(
+            "/paginated/header-link",
+            params={"page_size": 5},
+            data_selector="data.items",
+            paginator=HeaderLinkPaginator(),
+        )
+    ]
+
+    assert len(pages) == 4
+    assert [item["id"] for page in pages for item in page] == list(
+        range(1, BASE_ITEM_COUNT)
+    )
+
+
+@pytest.mark.anyio
+async def test_header_cursor_pagination(rest_client):
+    pages = [
+        page
+        async for page in rest_client.paginate(
+            "/paginated/header-cursor",
+            params={"page_size": 5},
+            data_selector="data.items",
+            paginator=HeaderCursorPaginator(cursor_key="X-Next-Cursor"),
+        )
+    ]
+
+    assert len(pages) == 4
+    assert [item["id"] for page in pages for item in page] == list(
+        range(1, BASE_ITEM_COUNT)
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("path", "expected_ids"),
+    [("/object", [1]), ("/list", list(range(1, BASE_ITEM_COUNT)))],
+)
+async def test_single_page_pagination(rest_client, path, expected_ids):
+    pages = [
+        page
+        async for page in rest_client.paginate(path, paginator=SinglePagePaginator())
+    ]
+
+    assert len(pages) == 1
+    assert [item["id"] for item in pages[0]] == expected_ids
 
 
 @pytest.mark.anyio

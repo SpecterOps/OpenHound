@@ -1,7 +1,8 @@
 import asyncio
+from math import ceil
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, Response
 
 BASE_ITEM_COUNT = 20
 
@@ -51,5 +52,64 @@ def create_app() -> FastAPI:
             "data": {"items": items[start:end]},
             "pagination": {"next": next_url},
         }
+
+    @app.get("/paginated/pages")
+    async def paginated_pages(
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 2,
+    ) -> dict[str, Any]:
+        start = (page - 1) * page_size
+        return {
+            "data": {"items": items[start : start + page_size]},
+            "pagination": {"total_pages": ceil(len(items) / page_size)},
+        }
+
+    @app.get("/paginated/offset")
+    async def paginated_offset(
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=100)] = 2,
+    ) -> dict[str, Any]:
+        return {
+            "data": {"items": items[offset : offset + limit]},
+            "pagination": {"total_items": len(items)},
+        }
+
+    @app.get("/paginated/cursor")
+    async def paginated_cursor(
+        cursor: Annotated[int, Query(ge=0)] = 0,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 2,
+    ) -> dict[str, Any]:
+        end = cursor + page_size
+        return {
+            "data": {"items": items[cursor:end]},
+            "pagination": {"next_cursor": str(end) if end < len(items) else None},
+        }
+
+    @app.get("/paginated/header-link", name="header_link_items")
+    async def paginated_header_link(
+        request: Request,
+        response: Response,
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 2,
+    ) -> dict[str, Any]:
+        start = (page - 1) * page_size
+        end = start + page_size
+        if end < len(items):
+            next_url = request.url_for("header_link_items").include_query_params(
+                page=page + 1, page_size=page_size
+            )
+            response.headers["Link"] = f'<{next_url}>; rel="next"'
+        return {"data": {"items": items[start:end]}}
+
+    @app.get("/paginated/header-cursor")
+    async def paginated_header_cursor(
+        response: Response,
+        cursor: Annotated[int, Query(ge=0)] = 0,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 2,
+    ) -> dict[str, Any]:
+        end = cursor + page_size
+        if end < len(items):
+            response.headers["X-Next-Cursor"] = str(end)
+        return {"data": {"items": items[cursor:end]}}
 
     return app
