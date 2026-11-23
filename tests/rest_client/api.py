@@ -1,3 +1,4 @@
+import asyncio
 from typing import Annotated, Any
 
 from fastapi import FastAPI, Query, Request
@@ -7,7 +8,11 @@ BASE_ITEM_COUNT = 20
 
 def create_app() -> FastAPI:
     app = FastAPI(title="REST client test API")
-    items = [{"id": number, "name": f"Item {number}"} for number in range(1, BASE_ITEM_COUNT)]
+    app.state.request_started = asyncio.Event()
+    app.state.release_request = asyncio.Event()
+    items = [
+        {"id": number, "name": f"Item {number}"} for number in range(1, BASE_ITEM_COUNT)
+    ]
 
     @app.get("/object")
     async def get_object() -> dict[str, Any]:
@@ -21,11 +26,17 @@ def create_app() -> FastAPI:
     async def echo(payload: dict[str, Any] | list[Any]) -> dict[str, Any] | list[Any]:
         return payload
 
+    @app.get("/wait")
+    async def wait_for_release() -> dict[str, bool]:
+        app.state.request_started.set()
+        await app.state.release_request.wait()
+        return {"released": True}
+
     @app.get("/paginated/items", name="paginated_items")
     async def paginated_items(
-            request: Request,
-            page: Annotated[int, Query(ge=1)] = 1,
-            page_size: Annotated[int, Query(ge=1, le=100)] = 2,
+        request: Request,
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 2,
     ) -> dict[str, Any]:
         start = (page - 1) * page_size
         end = start + page_size
