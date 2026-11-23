@@ -85,3 +85,7 @@ jobs:
       - name: Run DLT Pydantic exception handling (override) test
         run: |
           .venv/bin/pytest tests/test_dlt_pydantic_override.py -v
+
+      - name: Run tests for our custom implemenation of AsyncRESTClient
+        run: |
+          .venv/bin/pytest tests/rest_client -v
