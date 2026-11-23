@@ -26,6 +26,7 @@ dependencies = [
     "setuptools>=84.2.1",
     "urllib3>=2.8.0",
     "httpx2[http2]>=2.16.2",
+    "uvicorn>=0.52.0",
 ]
 
 [project.optional-dependencies]
