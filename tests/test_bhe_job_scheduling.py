@@ -4,6 +4,8 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
+import sys
 import time
 import traceback
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -4507,8 +4509,8 @@ def test_managed_collection_stages_then_uploads_before_job_end(
     if saved_runs:
         workspace = result.output_path.parent
         assert (workspace / "run.json").is_file()
-        assert (workspace / "raw" / "faker").is_dir()
-        assert (workspace / "pipelines" / "faker_convert" / "state.json").is_file()
+        assert (workspace / "raw" / "sample").is_dir()
+        assert (workspace / "pipelines" / "sample_convert" / "state.json").is_file()
 
 
 def test_failed_managed_conversion_cleans_up_staged_files(monkeypatch, tmp_path):
