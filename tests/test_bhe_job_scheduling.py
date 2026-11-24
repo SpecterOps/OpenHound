@@ -7,7 +7,7 @@ import os
 import threading
 import time
 import traceback
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -3583,111 +3583,35 @@ def managed_completion(mock_service, mock_bloodhound_api, monkeypatch, tmp_path)
 
 
 @pytest.mark.parametrize("during_shutdown", [False, True])
-@pytest.mark.parametrize("lose_claim", [False, True])
-@pytest.mark.parametrize("request_started_at", [0, 280])
-def test_heartbeats_continue_during_slow_upload(
-    managed_completion,
-    monkeypatch,
-    during_shutdown,
-    lose_claim,
-    request_started_at,
+@pytest.mark.parametrize("heartbeat_status", [200, 404])
+def test_due_heartbeat_between_uploads(
+    managed_completion, monkeypatch, during_shutdown, heartbeat_status
 ):
     job = managed_completion
-    job.clock.now = request_started_at
-    entered = threading.Event()
-    release = threading.Event()
+    job.state.collector_job_heartbeat_statuses = [heartbeat_status]
+    scheduler_thread = threading.get_ident()
     original_request = requests.request
-    original_abort = job.service._abort_managed_job
-    original_wait = scheduler_service.wait
-    heartbeat_times = []
-    request_waits = []
-    slow_upload_started = False
-    refresh_threads = []
-
-    def refresh():
-        refresh_threads.append(threading.get_ident())
-        return BHECredentials(token_id="renewed-id", token_key="renewed-key")
-
-    job.service.client._credential_refresh = refresh
-    job.state.collector_job_heartbeat_statuses = [401, 200]
-
-    class ControlledExecutor(ThreadPoolExecutor):
-        def submit(self, function, *args, **kwargs):
-            entered.clear()
-            release.clear()
-            return super().submit(function, *args, **kwargs)
-
-    def wait_for_request(futures, *, timeout):
-        assert entered.wait(5), "HTTP attempt never started"
-        if not release.is_set():
-            request_waits.append(timeout)
-            job.clock.now += timeout
-            return set(), set(futures)
-        completed, pending = original_wait(futures, timeout=5)
-        assert not pending, "in-flight HTTP attempt did not finish"
-        return completed, pending
-
-    def abort(job_id):
-        original_abort(job_id)
-        assert not job.result.output_path.exists()
-        assert job.service.next_heartbeat_at is None
-        release.set()
+    events = []
 
     def request(method, url, **kwargs):
-        nonlocal slow_upload_started
-        path = urlsplit(url).path
-        if path.endswith("/heartbeat"):
-            assert (
-                datetime.fromisoformat(
-                    job.state.collector_job_claim_response["claim_expires_at"]
-                )
-                >= job.state.claim_clock()
-            )
-            if not heartbeat_times or heartbeat_times[-1] != job.clock.now:
-                heartbeat_times.append(job.clock.now)
-            if lose_claim and len(heartbeat_times) == 2:
-                job.state.collector_job_claim_response["status"] = "cancelled"
-            response = original_request(method, url, **kwargs)
-            if not lose_claim and len(heartbeat_times) == 4:
-                release.set()
-            return response
-        if path.endswith("/ingest"):
-            if not slow_upload_started:
-                assert kwargs["headers"]["Authorization"] == "bhesignature test-id"
-                slow_upload_started = True
-                entered.set()
-                assert release.wait(5), "scheduler never renewed the in-flight claim"
-                # The in-flight attempt owns its original credential snapshot.
-                assert kwargs["headers"]["Authorization"] == "bhesignature test-id"
-                assert not kwargs["data"].closed
-            else:
-                release.set()
-                entered.set()
-        response = original_request(method, url, **kwargs)
-        if lose_claim and path.endswith("/ingest"):
-            # The late response must not trigger credential refresh after claim loss.
-            response.status_code = 401
-        return response
+        events.append(urlsplit(url).path.rsplit("/", 1)[-1])
+        if events == ["ingest"]:
+            assert threading.get_ident() == scheduler_thread
+            job.clock.sleep(scheduler_service.HEARTBEAT_INTERVAL)
+        return original_request(method, url, **kwargs)
 
-    monkeypatch.setattr(scheduler_service, "ThreadPoolExecutor", ControlledExecutor)
-    monkeypatch.setattr(scheduler_service, "wait", wait_for_request)
-    monkeypatch.setattr(job.service, "_abort_managed_job", abort)
     monkeypatch.setattr(requests, "request", request)
     if during_shutdown:
         job.service._shutdown()
     else:
         job.service._poll()
 
-    assert heartbeat_times == ([300, 600] if lose_claim else [300, 600, 900, 1200])
-    heartbeat_count = 2 if lose_claim else 4
-    assert request_waits == [300 - request_started_at] + [300] * (heartbeat_count - 1)
-    assert refresh_threads == [threading.get_ident()]
-    assert job.service.client.token_id == "renewed-id"
+    expected = ["ingest", "heartbeat"]
+    if heartbeat_status == 200:
+        expected += ["ingest", "end"]
+    assert events == expected
     assert job.service.future is job.service.managed_job_id is None
     assert not job.result.output_path.exists()
-    # An attempt already in flight may finish, but no later file or /end is sent.
-    assert len(job.state.managed_ingest_requests) == (0 if lose_claim else 2)
-    assert len(job.state.collector_job_end_requests) == (0 if lose_claim else 1)
 
 
 def test_no_heartbeat_during_end_request(managed_completion, monkeypatch):

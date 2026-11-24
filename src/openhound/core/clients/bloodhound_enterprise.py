@@ -7,9 +7,7 @@ import math
 import socket
 import time
 from collections.abc import Callable
-from copy import copy
 from enum import Enum
-from functools import partial
 from pathlib import Path
 from typing import Any, BinaryIO, TypeVar
 from urllib.parse import quote
@@ -62,7 +60,6 @@ MANAGED_JOB_CLAIM_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS = 20
 
 T = TypeVar("T")
-ManagedRequestRunner = Callable[[Callable[[], requests.Response]], requests.Response]
 
 
 class ManagedJobDiscarded(RuntimeError):
@@ -89,7 +86,6 @@ class BloodHoundEnterprise(BloodHound):
         super().__init__(token_key=token_key, token_id=token_id, bhe_uri=bhe_uri)
         self._credential_refresh = credential_refresh
         self.before_managed_completion_attempt: Callable[[], None] | None = None
-        self.managed_upload_runner: ManagedRequestRunner | None = None
 
     def request(
         self,
@@ -100,33 +96,26 @@ class BloodHoundEnterprise(BloodHound):
         timeout: tuple[float, float] | None = None,
         *,
         before_attempt: Callable[[], None] | None = None,
-        request_runner: ManagedRequestRunner | None = None,
     ):
         """Send an API request, refreshing credentials once after a 401.
 
-        ``before_attempt`` runs before signing each attempt. For managed
-        uploads, ``request_runner`` keeps heartbeats going during the upload.
+        ``before_attempt`` runs before signing each attempt, including retries.
         """
         position = (
             body.tell() if body is not None and not isinstance(body, bytes) else None
         )
+        request = super().request
 
         def send_attempt() -> requests.Response:
             if before_attempt is not None:
                 before_attempt()
-            # A heartbeat can refresh credentials while an upload is
-            # signing its body. Give that attempt a stable token key/ID pair.
-            client = copy(self) if request_runner is not None else self
-            send = partial(
-                BloodHound.request,
-                client,
+            return request(
                 method=method,
                 path=path,
                 body=body,
                 extra_headers=extra_headers,
                 timeout=timeout,
             )
-            return request_runner(send) if request_runner is not None else send()
 
         try:
             return send_attempt()
@@ -403,7 +392,6 @@ class BloodHoundEnterprise(BloodHound):
             extra_headers=headers,
             timeout=(10, 120),
             before_attempt=self.before_managed_completion_attempt,
-            request_runner=self.managed_upload_runner,
         )
 
     @property
