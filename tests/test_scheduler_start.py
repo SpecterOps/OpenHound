@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import scheduler
 from openhound.config import ManagedBHEConfig
 from openhound.core.clients.bhe_credentials import BHECredentials
@@ -6,12 +8,14 @@ from openhound.core.clients.bhe_credentials import BHECredentials
 def test_managed_scheduler_loads_aws_secret_before_starting_service(monkeypatch):
     constructed = []
     started = []
+    snapshots = []
 
     class FakeCredentials:
         def __init__(self, secret_name):
             constructed.append(secret_name)
 
-        def poll_until_available(self, interval):
+        def poll_until_available(self, interval, *, wait_for_shutdown):
+            assert not wait_for_shutdown(0)
             assert interval == 45
             return BHECredentials(token_id="aws-id", token_key="aws-key")
 
@@ -25,6 +29,11 @@ def test_managed_scheduler_loads_aws_secret_before_starting_service(monkeypatch)
         def start(self):
             started.append("started")
 
+    def serve_status(status):
+        snapshots.append(status.snapshot())
+        return nullcontext()
+
+    monkeypatch.setattr(scheduler, "serve_status", serve_status)
     monkeypatch.setattr(scheduler.config, "is_managed", lambda: True)
     monkeypatch.setattr(
         scheduler.config,
@@ -44,6 +53,8 @@ def test_managed_scheduler_loads_aws_secret_before_starting_service(monkeypatch)
 
     scheduler.start()
 
+    assert snapshots[0]["state"] == "initializing"
+    assert snapshots[0]["available_slots"] == 0
     assert constructed == ["production/bhe"]
     assert started[0]["bhe_uri"] == "https://bhe.example"
     assert started[0]["token_key"] == "aws-key"

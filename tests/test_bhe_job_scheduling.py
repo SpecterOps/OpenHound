@@ -3055,6 +3055,12 @@ def test_managed_401_refresh_failure_is_visible_without_debug_logging(
 
     def next_poll(seconds):
         assert seconds == managed_service.interval
+        if stage == "end":
+            assert managed_service._pending_managed_failure is not None
+            # Let shutdown reconcile the retained report after the logged failure.
+            monkeypatch.setattr(
+                managed_service.client, "end_managed_job", lambda *args, **kwargs: None
+            )
         managed_service.exit = True
 
     monkeypatch.setattr(bloodhound.BloodHound, "request", unauthorized)
@@ -3082,8 +3088,7 @@ def test_managed_401_refresh_failure_is_visible_without_debug_logging(
     assert managed_service.handoffs == []
     assert mock_bloodhound_api.app.state.collector_job_end_requests == []
     assert f"retrying next poll in {managed_service.interval} seconds" in caplog.text
-    if stage == "end":
-        assert managed_service._pending_managed_failure is not None
+    assert managed_service._pending_managed_failure is None
 
 
 @pytest.fixture
@@ -3097,6 +3102,96 @@ def stateful_managed_service(managed_service, mock_bloodhound_api):
         bloodhound_enterprise.MANAGED_JOB_CLAIM_MAX_ATTEMPTS
     )
     return managed_service
+
+
+@pytest.mark.parametrize("pending", ["claim", "start", "failure"])
+def test_managed_scheduler_reconciles_reserved_job_while_draining(
+    stateful_managed_service, mock_bloodhound_api, monkeypatch, pending
+):
+    service = stateful_managed_service
+    state = mock_bloodhound_api.app.state
+    state.collector_job_lost_claim_responses = 0
+    job_id = state.collector_job_claim_response["id"]
+    service.status = scheduler_service.SchedulerStatus()
+    service.managed_job_runner = service._run_prepared_managed_job
+    completed = Future()
+    completed.set_result(Result({}, job_id))
+    monkeypatch.setattr(service.executor, "submit", lambda *args: completed)
+
+    method = {
+        "claim": "claim_managed_job",
+        "start": "start_collector_job",
+        "failure": "end_managed_job",
+    }[pending]
+    if pending == "failure":
+        state.collector_job_claim_response["secret_key_id"] = None
+    original = getattr(service.client, method)
+    attempts = []
+
+    def flaky_request(*args, **kwargs):
+        attempts.append(service.status.snapshot()["state"])
+        if pending == "start":
+            # Simulate BHE accepting start before the client loses the response.
+            original(*args, **kwargs)
+        if len(attempts) <= 2:
+            raise requests.Timeout("Temporary response loss")
+        if pending != "start":
+            return original(*args, **kwargs)
+
+    def begin_shutdown(seconds):
+        assert seconds == service.interval
+        service._exit_handler(scheduler_service.signal.SIGTERM, None)
+        return True
+
+    def wait_for_retry(seconds):
+        assert seconds == service.interval
+        assert attempts == ["busy", "draining"]
+        assert service.status.snapshot()["occupied_slots"] == 1
+
+    monkeypatch.setattr(service.client, method, flaky_request)
+    monkeypatch.setattr(service.status, "wait_for_shutdown", begin_shutdown)
+    monkeypatch.setattr(scheduler_service.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(scheduler_service.time, "sleep", wait_for_retry)
+
+    service.start()
+
+    assert attempts == ["busy", "draining", "draining"]
+    assert len(state.collector_job_queue_requests) == 1
+    assert state.collector_job_end_requests[0]["body"]["outcome"] == (
+        "failed" if pending == "failure" else "succeeded"
+    )
+    assert len(state.collector_job_end_requests) == 1
+    assert service.future is None
+    assert service._pending_managed_claim is None
+    assert service._pending_managed_start is None
+    assert service._pending_managed_failure is None
+    assert service.status.snapshot()["jobs"] == {}
+    assert service.status.snapshot()["state"] == "draining"
+
+
+def test_managed_scheduler_does_not_claim_discovered_job_after_shutdown(
+    managed_service, mock_bloodhound_api, monkeypatch
+):
+    service = managed_service
+    service.status = scheduler_service.SchedulerStatus()
+    discover = service.check_managed_collector_jobs
+
+    def discover_while_stopping():
+        job = discover()
+        service._exit_handler(scheduler_service.signal.SIGTERM, None)
+        return job
+
+    monkeypatch.setattr(
+        service, "check_managed_collector_jobs", discover_while_stopping
+    )
+    monkeypatch.setattr(scheduler_service.signal, "signal", lambda *args: None)
+
+    service.start()
+
+    state = mock_bloodhound_api.app.state
+    assert len(state.collector_job_queue_requests) == 1
+    assert state.collector_job_claim_requests == []
+    assert service.status.snapshot()["jobs"] == {}
 
 
 def test_committed_claim_with_lost_responses_is_reconciled_before_discovery(
@@ -4236,6 +4331,10 @@ def test_managed_completion_retries_remaining_uploads_before_ending(
     mock_service.job_running = job_id
     mock_service.managed_job_id = job_id
     mock_service.future = future
+    status = scheduler_service.SchedulerStatus()
+    status.start()
+    status.reserve(job_id, "awaiting_upload")
+    mock_service.status = status
     calls = []
 
     def upload(job, data):
@@ -4256,6 +4355,7 @@ def test_managed_completion_retries_remaining_uploads_before_ending(
     assert mock_service.future is future
     assert mock_service.job_running == job_id
     assert output.exists()
+    assert status.snapshot()["jobs"][job_id]["state"] == "uploading"
 
     mock_service._handle_completed_job(future)
     assert calls == [
@@ -4267,6 +4367,7 @@ def test_managed_completion_retries_remaining_uploads_before_ending(
     assert mock_service.future is None
     assert mock_service.job_running is None
     assert not output.exists()
+    assert status.snapshot()["available_slots"] == 1
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 415])
@@ -4342,6 +4443,10 @@ def test_upload_for_missing_or_stopped_job_aborts_without_reporting_outcome(
     mock_service.managed = True
     mock_service.job_running = mock_service.managed_job_id = job_id
     mock_service.future = future
+    scheduler_status = scheduler_service.SchedulerStatus()
+    scheduler_status.start()
+    scheduler_status.reserve(job_id, "awaiting_upload")
+    mock_service.status = scheduler_status
 
     def upload(job, data):
         raise BloodHoundHTTPError("sensitive-response-body", status)
@@ -4357,6 +4462,8 @@ def test_upload_for_missing_or_stopped_job_aborts_without_reporting_outcome(
     assert mock_service.job_running is None
     assert mock_service.managed_job_id is None
     assert mock_service.next_heartbeat_at is None
+    assert scheduler_status.snapshot()["jobs"] == {}
+    assert scheduler_status.snapshot()["available_slots"] == 1
     assert not output.exists()
     assert "sensitive-response-body" not in caplog.text
 
@@ -4378,6 +4485,10 @@ def test_managed_end_retry_does_not_upload_accepted_files_again(
     mock_service.job_running = job_id
     mock_service.managed_job_id = job_id
     mock_service.future = future
+    status = scheduler_service.SchedulerStatus()
+    status.start()
+    status.reserve(job_id, "awaiting_upload")
+    mock_service.status = status
     uploads = []
     ends = []
     monkeypatch.setattr(
@@ -4386,7 +4497,10 @@ def test_managed_end_retry_does_not_upload_accepted_files_again(
         lambda job, data: uploads.append(data.read()),
     )
 
+    snapshots = []
+
     def end(job, outcome, **kwargs):
+        snapshots.append(status.snapshot())
         ends.append((job, outcome))
         if len(ends) == 1:
             raise BloodHoundHTTPError("temporary error", 500)
@@ -4399,6 +4513,9 @@ def test_managed_end_retry_does_not_upload_accepted_files_again(
     mock_service._handle_completed_job(future)
     assert uploads == [b"graph"]
     assert ends == [(str(job_id), ManagedJobOutcome.SUCCEEDED)] * 2
+    assert snapshots[0] == snapshots[1]
+    assert snapshots[0]["jobs"][job_id]["state"] == "finalizing"
+    assert status.snapshot()["available_slots"] == 1
     assert not output.exists()
 
 

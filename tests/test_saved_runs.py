@@ -172,9 +172,19 @@ def test_workspace_paths_override_global_and_scoped_configuration(
     providers = Container()[PluggableRunContext].providers
     previous = providers.providers
     calls = []
-    dataflow.pipeline(_extension(calls), run.graph, saved_run=run)
+    dataflow.pipeline(
+        _extension(calls), run.graph, saved_run=run, on_phase=calls.append
+    )
 
-    assert calls == ["collect", "preprocess", "convert", "graph_extract"]
+    assert calls == [
+        "collecting",
+        "collect",
+        "preprocessing",
+        "preprocess",
+        "converting",
+        "convert",
+        "graph_extract",
+    ]
     assert (run.directory / "pipelines" / "example_collect" / "state.json").is_file()
     assert (run.directory / "pipelines" / "example_preproc" / "state.json").is_file()
     assert not (tmp_path / "wrong").exists()

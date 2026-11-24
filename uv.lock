@@ -1372,6 +1372,7 @@ dependencies = [
     { name = "typer" },
     { name = "types-requests" },
     { name = "urllib3" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -1436,6 +1437,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.25.1" },
     { name = "types-requests", specifier = "==2.33.0.20260503" },
     { name = "urllib3", specifier = ">=2.8.0" },
+    { name = "uvicorn", specifier = ">=0.52.0" },
 ]
 provides-extras = ["all", "github", "jamf", "okta"]
 
