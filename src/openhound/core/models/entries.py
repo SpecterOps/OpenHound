@@ -4,7 +4,14 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, computed_field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializeAsAny,
+    computed_field,
+    field_validator,
+)
 
 
 class NodeProperties(BaseModel):
@@ -78,7 +85,13 @@ class EdgeProperties(BaseModel):
 
     model_config = ConfigDict(extra="allow")
     composed: bool = False
-    traversable: bool = False
+    traversable: bool | None = None
+
+    @field_validator("traversable")
+    @classmethod
+    def discard_traversable(cls, value: bool | None) -> None:
+        """Accept but discard legacy traversable properties"""
+        return None  # noqa: RET501 - Pydantic validators return the normalized value.
 
 
 class Edge(BaseModel):
