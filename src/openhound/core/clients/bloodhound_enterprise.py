@@ -64,16 +64,15 @@ MANAGED_JOB_CLAIM_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS = 20
 
 T = TypeVar("T")
+ManagedRequestRunner = Callable[[Callable[[], requests.Response]], requests.Response]
 
 
-class ManagedJobClaimLost(RuntimeError):
-    """Raised when BHE reports that this collector no longer owns the job."""
+class ManagedJobDiscarded(RuntimeError):
+    """The scheduler has discarded this job; do not retry its requests."""
 
 
 def _safe_managed_request_error(error: Exception) -> Exception:
     """Preserve actionable status/type without exposing provider response content."""
-    if isinstance(error, ManagedJobClaimLost):
-        return error
     if isinstance(error, BloodHoundHTTPError):
         return BloodHoundHTTPError("Managed collector request failed", error.code)
     if isinstance(error, requests.RequestException):
@@ -91,9 +90,8 @@ class BloodHoundEnterprise(BloodHound):
     ) -> None:
         super().__init__(token_key=token_key, token_id=token_id, bhe_uri=bhe_uri)
         self._credential_refresh = credential_refresh
-        self.completion_request_runner: (
-            Callable[[Callable[[], requests.Response]], requests.Response] | None
-        ) = None
+        self.managed_upload_runner: ManagedRequestRunner | None = None
+        self.managed_end_runner: ManagedRequestRunner | None = None
 
     def request(
         self,
@@ -103,9 +101,7 @@ class BloodHoundEnterprise(BloodHound):
         extra_headers: dict[str, str] | None = None,
         timeout: tuple[float, float] | None = None,
         *,
-        request_runner: (
-            Callable[[Callable[[], requests.Response]], requests.Response] | None
-        ) = None,
+        request_runner: ManagedRequestRunner | None = None,
     ):
         """Send an API request, refreshing credentials once after a 401.
 
@@ -323,8 +319,10 @@ class BloodHoundEnterprise(BloodHound):
                         MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS,
                         MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
                     ),
-                    request_runner=self.completion_request_runner,
+                    request_runner=self.managed_end_runner,
                 )
+            except ManagedJobDiscarded:
+                raise
             except Exception as error:  # noqa: BLE001 - redact provider errors
                 if isinstance(error, BloodHoundHTTPError) and error.code == 404:
                     logger.info(
@@ -403,7 +401,7 @@ class BloodHoundEnterprise(BloodHound):
             body=data,
             extra_headers=headers,
             timeout=(10, 120),
-            request_runner=self.completion_request_runner,
+            request_runner=self.managed_upload_runner,
         )
 
     @property

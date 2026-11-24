@@ -3651,8 +3651,8 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
         assert not pending, "in-flight HTTP attempt did not finish"
         return completed, pending
 
-    def abort(job_id):
-        original_abort(job_id)
+    def abort(job_id, **kwargs):
+        original_abort(job_id, **kwargs)
         assert not job.result.output_path.exists()
         assert job.service.next_heartbeat_at is None
         release.set()
@@ -3671,7 +3671,10 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
             if lose_claim and len(heartbeat_times) == 2:
                 job.state.collector_job_claim_response["status"] = "cancelled"
             response = original_request(method, url, **kwargs)
-            if not lose_claim and len(heartbeat_times) == 4:
+            if phase == "end" and response.status_code == 404:
+                # On a 404, the scheduler waits for an already-started /end.
+                release.set()
+            elif not lose_claim and len(heartbeat_times) == 4:
                 release.set()
             return response
         if path.endswith(("/ingest", "/end")):
@@ -3717,6 +3720,55 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
     assert len(job.state.collector_job_end_requests) == (
         0 if lose_claim and phase == "ingest" else 1
     )
+
+
+@pytest.mark.parametrize("response_received", [True, False], ids=["200", "timeout"])
+def test_heartbeat_404_after_end_commit(
+    managed_completion, monkeypatch, caplog, response_received
+):
+    job = managed_completion
+    job.result.uploaded_files = len(job.result.data_files)
+    executor = job.service.executor
+    end_committed = threading.Event()
+    release_end_response = threading.Event()
+    original_request = requests.request
+
+    def request(method, url, **kwargs):
+        response = original_request(method, url, **kwargs)
+        path = urlsplit(url).path
+        if path.endswith("/end"):
+            assert response.status_code == 200
+            end_committed.set()
+            # The job has ended in Enterprise, but its reply hasn't arrived.
+            assert release_end_response.wait(5), "heartbeat never saw the ended job"
+            if not response_received:
+                raise requests.Timeout("end response lost")
+        elif path.endswith("/heartbeat"):
+            assert response.status_code == 404
+            release_end_response.set()
+        return response
+
+    def reach_heartbeat_deadline(futures, *, timeout):
+        assert end_committed.wait(5), "Enterprise never committed /end"
+        job.clock.now += timeout
+        return set(), set(futures)
+
+    monkeypatch.setattr(requests, "request", request)
+    monkeypatch.setattr(scheduler_service, "wait", reach_heartbeat_deadline)
+    with caplog.at_level(logging.INFO):
+        job.service._poll()
+
+    assert job.state.managed_events == ["end", "heartbeat"]
+    assert job.service.future is job.service.managed_job_id is None
+    assert not job.result.output_path.exists()
+    assert "claim lost" not in caplog.text
+    assert "retaining result for retry" not in caplog.text
+    if response_received:
+        assert "ended successfully" in caplog.text
+        assert job.service.executor is executor
+    else:
+        assert "/end outcome could not be confirmed" in caplog.text
+        assert "ended successfully" not in caplog.text
 
 
 @pytest.mark.parametrize(
