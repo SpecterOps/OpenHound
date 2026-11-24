@@ -46,9 +46,9 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_aws_secrets_manager.py -v
 
-      - name: Run managed configuration and AWS profile adapter tests
+      - name: Run managed configuration and credential handoff tests
         run: |
-          .venv/bin/pytest tests/test_managed_configuration.py tests/test_aws_profile_adapter.py -v
+          .venv/bin/pytest tests/test_managed_configuration.py tests/test_managed_credentials.py -v
 
       - name: Run log handling tests
         run: |
@@ -78,9 +78,17 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_preproc.py -v
 
+      - name: Run pipeline retry and recovery tests
+        run: |
+          .venv/bin/pytest tests/test_pipeline_retry.py tests/test_pipeline_recovery.py tests/test_saved_runs.py tests/test_upload_package.py -v
+
       - name: Run DuckDB lookup exception handling tests
         run: |
           .venv/bin/pytest tests/test_lookup.py -v
+
+      - name: Run collection inventory tests
+        run: |
+          .venv/bin/pytest tests/test_collection_inventory.py -v
 
       - name: Run DLT Pydantic exception handling (override) test
         run: |
@@ -89,3 +97,13 @@ jobs:
       - name: Run tests for our custom implemenation of AsyncRESTClient
         run: |
           .venv/bin/pytest tests/rest_client -v
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.0.0
+
+      - name: Validate Helm persistence configuration
+        run: |
+          helm lint deployments/helm/openhound -f deployments/helm/values.example.yaml --strict
+          .venv/bin/pytest tests/test_helm_persistence.py -v

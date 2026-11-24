@@ -19,6 +19,7 @@ ENV UV_NO_DEV=1
 ENV UV_PYTHON_DOWNLOADS=0
 
 WORKDIR /app
+RUN mkdir -p -m 0700 /var/lib/openhound/runs
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --extra all --frozen
@@ -29,9 +30,11 @@ FROM gcr.io/distroless/python3:nonroot AS base
 # Set the python path + additional Python runtime config
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH="/app/src:/app/.venv/lib/python3.13/site-packages"
+    PYTHONPATH="/app/src:/app/.venv/lib/python3.13/site-packages" \
+    OPENHOUND_DEFAULT_RUNS_DIRECTORY=/var/lib/openhound/runs
 
 COPY --from=builder --chown=nonroot:nonroot /app /app
+COPY --from=builder --chown=nonroot:nonroot /var/lib/openhound /var/lib/openhound
 WORKDIR /app
 
 # Create an image that exposes the CLI as default
