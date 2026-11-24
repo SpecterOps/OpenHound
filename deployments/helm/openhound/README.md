@@ -81,6 +81,72 @@ kubectl create secret generic openhound-jamf-secrets \
 For a list of required and optional configuration settings for each collector refer to the OpenHound documentation
 on https://bloodhound.specterops.io/openhound/overview.
 
+### Persistent saved runs
+
+Kubernetes supports persistent storage independently of a pod's lifetime. Without
+a mounted persistent volume, saved runs in the container's writable filesystem
+can be lost when Kubernetes replaces the container or pod, including during a
+Helm upgrade. Persistence is disabled by default in this chart.
+
+To retain saved runs, create a PersistentVolumeClaim (PVC) in the same namespace
+as the Helm release, then reference it in your values. For example, with a default
+StorageClass available in the cluster:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openhound-jamf-runs
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+```
+
+Choose storage capacity and a StorageClass appropriate to your cluster. Use a
+separate claim for each collector release.
+
+```yaml
+persistence:
+  enabled: true
+  existingClaim: openhound-jamf-runs
+  mountPath: /var/lib/openhound/runs
+```
+
+The chart mounts the claim read-write and sets `OPENHOUND_DEFAULT_RUNS_DIRECTORY`
+to `mountPath`, unless you supplied that fallback in `env` or `collector.env`.
+Use an image with saved-run support. Explicit TOML `openhound.runs_directory` and
+`OPENHOUND__RUNS_DIRECTORY` settings retain their existing precedence; ensure
+they point inside the mounted directory. Only files written under the mount
+persist. This includes the complete run workspace and any upload packages you
+choose to write there.
+
+With persistence enabled, upgrades use the `Recreate` deployment strategy: the
+old pod stops before its replacement starts, avoiding overlapping scheduler pods
+and concurrent volume attachment during rollout. This causes collector downtime;
+schedule upgrades between active jobs when possible.
+
+The default pod user/group and `fsGroup` are `65532`. Ensure the storage driver
+supports these permissions and that existing data is writable by that user.
+Kubernetes volumes do not copy the image directory's contents into the volume.
+Enabling persistence hides any files previously at the mount path and does not
+migrate runs from an old pod; export needed idle workspaces before upgrading.
+
+The chart references the existing PVC without creating or deleting it. Reusing
+the same claim preserves its data across upgrades and Helm uninstall/reinstall.
+Deleting the claim or backing volume can destroy that data according to the
+cluster's storage policy. Persistent storage does not replace backups or run
+retention planning.
+
+To validate chart changes locally, with Helm installed:
+
+```sh
+helm lint deployments/helm/openhound -f deployments/helm/values.example.yaml --strict
+.venv/bin/pytest tests/test_helm_persistence.py -v
+```
+
 ### Additional secret files
 
 Collectors may require extra secret files, such as a GitHub app PEM or an Okta JSON credential file.

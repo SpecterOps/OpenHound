@@ -7,6 +7,7 @@ from openhound.cli.create import create_app
 from openhound.cli.override import TyperOverride
 from openhound.cli.preproc import preprocess
 from openhound.cli.privilege_zone import privilege_zone
+from openhound.cli.runs import runs
 from openhound.cli.saved_search import saved_searches
 
 BASE_SOUCE_PATH = Path(__file__).parent / "sources"
@@ -19,6 +20,7 @@ app.add_typer(preprocess, name="preprocess")
 app.add_typer(create_app, name="create")
 app.add_typer(saved_searches, name="searches")
 app.add_typer(privilege_zone, name="rules")
+app.add_typer(runs, name="runs")
 
 if __name__ == "__main__":
     app()
