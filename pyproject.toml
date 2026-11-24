@@ -86,5 +86,4 @@ dev = [
     "mypy>=1.19.1",
     "types-pyyaml>=6.0.12.20250915",
     "types-requests>=2.33.0.20260408",
-    "httpx>=0.28.1",
 ]
