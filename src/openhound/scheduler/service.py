@@ -11,7 +11,6 @@ from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -337,10 +336,8 @@ class Service:
         self.job_running: int | str | None = None
         self.managed_job_id: str | None = None
         self.next_heartbeat_at: float | None = None
-        self.client.managed_upload_runner = self._request_with_managed_heartbeats
-        self.client.managed_end_runner = partial(
-            self._request_with_managed_heartbeats, is_end_request=True
-        )
+        self.client.before_managed_completion_attempt = self._check_managed_claim
+        self.client.managed_upload_runner = self._upload_with_managed_heartbeats
 
         # Futures/results from the subprocess executor
         self.future: Future[Result] | None = None
@@ -413,16 +410,18 @@ class Service:
             return self.interval
         return min(self.interval, heartbeat_delay)
 
-    def _request_with_managed_heartbeats(
-        self, send: Callable[[], Response], *, is_end_request: bool = False
-    ) -> Response:
-        """Keep renewing the claim while an upload or /end request is in flight."""
+    def _check_managed_claim(self) -> None:
+        """Before an HTTP attempt, send a due heartbeat or discard an unowned job."""
+        job_id = self.managed_job_id
+        if job_id is not None and self._heartbeat_reports_claim_unavailable(job_id):
+            self._abort_managed_job(job_id)
+            raise ManagedJobDiscarded("Managed collector claim lost")
+
+    def _upload_with_managed_heartbeats(self, send: Callable[[], Response]) -> Response:
+        """Keep renewing the claim while an upload is in flight."""
         job_id = self.managed_job_id
         if job_id is None:
             return send()
-        if self._heartbeat_reports_claim_unavailable(job_id):
-            self._abort_managed_job(job_id)
-            raise ManagedJobDiscarded("Managed collector claim lost")
 
         # Leaving the executor waits for in-flight I/O before its stream is closed,
         # including when an upload's response is no longer needed.
@@ -434,30 +433,11 @@ class Service:
                 wait([request_result], timeout=self._time_until_next_heartbeat())
                 if request_result.done():
                     break
-                if not self._heartbeat_reports_claim_unavailable(job_id):
-                    continue
-
-                cancelled_before_start = request_result.cancel()
-                if is_end_request and not cancelled_before_start:
-                    return self._resolve_end_after_heartbeat_404(job_id, request_result)
-                self._abort_managed_job(job_id)
-                raise ManagedJobDiscarded("Managed collector claim lost")
+                if self._heartbeat_reports_claim_unavailable(job_id):
+                    request_result.cancel()
+                    self._abort_managed_job(job_id)
+                    raise ManagedJobDiscarded("Managed collector claim lost")
             return request_result.result()
-
-    def _resolve_end_after_heartbeat_404(
-        self, job_id: str, request_result: Future[Response]
-    ) -> Response:
-        """Check the pending /end without sending any more requests."""
-        # Enterprise can remove the claim before its successful /end reply arrives.
-        # The HTTP client raises if the pending attempt did not succeed.
-        try:
-            return request_result.result()
-        except Exception:  # noqa: BLE001 - don't log provider errors or retry
-            self._abort_managed_job(
-                job_id,
-                reason="is no longer actionable; /end outcome could not be confirmed",
-            )
-            raise ManagedJobDiscarded("End outcome unconfirmed") from None
 
     def _clear_running_job(self) -> None:
         self.future = None
@@ -868,11 +848,11 @@ class Service:
         self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
         return False
 
-    def _abort_managed_job(
-        self, job_id: str, *, reason: str = "claim lost; stopping collection"
-    ) -> None:
+    def _abort_managed_job(self, job_id: str) -> None:
         """Stop local work and discard the job without sending another report."""
-        logger.warning("Managed collector job %s %s.", job_id, reason)
+        logger.warning(
+            "Managed collector job %s claim lost; stopping collection.", job_id
+        )
         future = self.future
         processes = list((self.executor._processes or {}).values())
         try:
@@ -901,10 +881,6 @@ class Service:
 
     def _handle_completed_job(self, future: Future[Result]) -> None:
         """Report the completed worker's outcome through the active job API."""
-        if self.managed_job_id is not None:
-            self._poll_running_job()
-            if self.managed_job_id is None:
-                return
         result: Result | None = None
         try:
             result = future.result()
@@ -954,9 +930,6 @@ class Service:
                 while result.upload_failure is None and result.uploaded_files < len(
                     result.data_files
                 ):
-                    self._poll_running_job()
-                    if self.managed_job_id is None:
-                        return
                     data_file = result.data_files[result.uploaded_files]
                     try:
                         data = data_file.open("rb")
@@ -991,10 +964,6 @@ class Service:
             else:
                 status = JobStatus.COMPLETE
                 message = f"Collector '{self.collector_name}' completed successfully"
-        if self.managed_job_id is not None:
-            self._poll_running_job()
-            if self.managed_job_id is None:
-                return
         try:
             self._end_job(status, message)
         except ManagedJobDiscarded:

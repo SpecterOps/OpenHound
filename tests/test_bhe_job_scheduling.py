@@ -699,9 +699,7 @@ def test_start_and_heartbeat_collector_job_use_bodyless_requests(
     ]
 
 
-def test_start_and_heartbeat_collector_job_use_bounded_timeouts(
-    mock_service, monkeypatch
-):
+def test_managed_job_lifecycle_requests_use_short_timeouts(mock_service, monkeypatch):
     requests_sent = []
     monkeypatch.setattr(
         mock_service.client,
@@ -711,31 +709,11 @@ def test_start_and_heartbeat_collector_job_use_bounded_timeouts(
 
     mock_service.client.start_collector_job("collector-job-123")
     mock_service.client.heartbeat_collector_job("collector-job-123")
-
-    assert [request["timeout"] for request in requests_sent] == [
-        (
-            bloodhound_enterprise.MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
-            bloodhound_enterprise.MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
-        )
-    ] * 2
-
-
-def test_end_managed_job_uses_bounded_timeouts(mock_service, monkeypatch):
-    captured = {}
-
-    def capture_request(*args, **kwargs):
-        captured.update(kwargs)
-
-    monkeypatch.setattr(mock_service.client, "request", capture_request)
-
     mock_service.client.end_managed_job(
         "collector-job-123", ManagedJobOutcome.SUCCEEDED
     )
 
-    assert captured["timeout"] == (
-        bloodhound_enterprise.MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS,
-        bloodhound_enterprise.MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
-    )
+    assert [request["timeout"] for request in requests_sent] == [(10, 20)] * 3
 
 
 @pytest.mark.parametrize(
@@ -3604,14 +3582,12 @@ def managed_completion(mock_service, mock_bloodhound_api, monkeypatch, tmp_path)
     )
 
 
-@pytest.mark.parametrize("phase", ["ingest", "end"])
 @pytest.mark.parametrize("during_shutdown", [False, True])
 @pytest.mark.parametrize("lose_claim", [False, True])
 @pytest.mark.parametrize("request_started_at", [0, 280])
-def test_heartbeats_continue_inside_slow_completion_http_requests(
+def test_heartbeats_continue_during_slow_upload(
     managed_completion,
     monkeypatch,
-    phase,
     during_shutdown,
     lose_claim,
     request_started_at,
@@ -3625,7 +3601,7 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
     original_wait = scheduler_service.wait
     heartbeat_times = []
     request_waits = []
-    slow_requests = []
+    slow_upload_started = False
     refresh_threads = []
 
     def refresh():
@@ -3651,13 +3627,14 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
         assert not pending, "in-flight HTTP attempt did not finish"
         return completed, pending
 
-    def abort(job_id, **kwargs):
-        original_abort(job_id, **kwargs)
+    def abort(job_id):
+        original_abort(job_id)
         assert not job.result.output_path.exists()
         assert job.service.next_heartbeat_at is None
         release.set()
 
     def request(method, url, **kwargs):
+        nonlocal slow_upload_started
         path = urlsplit(url).path
         if path.endswith("/heartbeat"):
             assert (
@@ -3671,30 +3648,25 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
             if lose_claim and len(heartbeat_times) == 2:
                 job.state.collector_job_claim_response["status"] = "cancelled"
             response = original_request(method, url, **kwargs)
-            if phase == "end" and response.status_code == 404:
-                # On a 404, the scheduler waits for an already-started /end.
-                release.set()
-            elif not lose_claim and len(heartbeat_times) == 4:
+            if not lose_claim and len(heartbeat_times) == 4:
                 release.set()
             return response
-        if path.endswith(("/ingest", "/end")):
-            if path.endswith(f"/{phase}") and not slow_requests:
+        if path.endswith("/ingest"):
+            if not slow_upload_started:
                 assert kwargs["headers"]["Authorization"] == "bhesignature test-id"
-                slow_requests.append(path)
+                slow_upload_started = True
                 entered.set()
                 assert release.wait(5), "scheduler never renewed the in-flight claim"
                 # The in-flight attempt owns its original credential snapshot.
                 assert kwargs["headers"]["Authorization"] == "bhesignature test-id"
-                if phase == "ingest":
-                    assert not kwargs["data"].closed
+                assert not kwargs["data"].closed
             else:
                 release.set()
                 entered.set()
         response = original_request(method, url, **kwargs)
-        if lose_claim and path.endswith(f"/{phase}"):
-            # A late response must not trigger credential refresh or /end retries
-            # after the concurrent heartbeat has already revoked ownership.
-            response.status_code = 401 if phase == "ingest" else 500
+        if lose_claim and path.endswith("/ingest"):
+            # The late response must not trigger credential refresh after claim loss.
+            response.status_code = 401
         return response
 
     monkeypatch.setattr(scheduler_service, "ThreadPoolExecutor", ControlledExecutor)
@@ -3714,61 +3686,27 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
     assert job.service.future is job.service.managed_job_id is None
     assert not job.result.output_path.exists()
     # An attempt already in flight may finish, but no later file or /end is sent.
-    assert len(job.state.managed_ingest_requests) == (
-        0 if lose_claim and phase == "ingest" else 2
-    )
-    assert len(job.state.collector_job_end_requests) == (
-        0 if lose_claim and phase == "ingest" else 1
-    )
+    assert len(job.state.managed_ingest_requests) == (0 if lose_claim else 2)
+    assert len(job.state.collector_job_end_requests) == (0 if lose_claim else 1)
 
 
-@pytest.mark.parametrize("response_received", [True, False], ids=["200", "timeout"])
-def test_heartbeat_404_after_end_commit(
-    managed_completion, monkeypatch, caplog, response_received
-):
+def test_no_heartbeat_during_end_request(managed_completion, monkeypatch):
     job = managed_completion
     job.result.uploaded_files = len(job.result.data_files)
-    executor = job.service.executor
-    end_committed = threading.Event()
-    release_end_response = threading.Event()
+    scheduler_thread = threading.get_ident()
     original_request = requests.request
 
-    def request(method, url, **kwargs):
-        response = original_request(method, url, **kwargs)
-        path = urlsplit(url).path
-        if path.endswith("/end"):
-            assert response.status_code == 200
-            end_committed.set()
-            # The job has ended in Enterprise, but its reply hasn't arrived.
-            assert release_end_response.wait(5), "heartbeat never saw the ended job"
-            if not response_received:
-                raise requests.Timeout("end response lost")
-        elif path.endswith("/heartbeat"):
-            assert response.status_code == 404
-            release_end_response.set()
-        return response
+    def slow_end(method, url, **kwargs):
+        if urlsplit(url).path.endswith("/end"):
+            assert threading.get_ident() == scheduler_thread
+            job.clock.sleep(scheduler_service.HEARTBEAT_INTERVAL)
+        return original_request(method, url, **kwargs)
 
-    def reach_heartbeat_deadline(futures, *, timeout):
-        assert end_committed.wait(5), "Enterprise never committed /end"
-        job.clock.now += timeout
-        return set(), set(futures)
+    monkeypatch.setattr(requests, "request", slow_end)
+    job.service._poll()
 
-    monkeypatch.setattr(requests, "request", request)
-    monkeypatch.setattr(scheduler_service, "wait", reach_heartbeat_deadline)
-    with caplog.at_level(logging.INFO):
-        job.service._poll()
-
-    assert job.state.managed_events == ["end", "heartbeat"]
+    assert job.state.managed_events == ["end"]
     assert job.service.future is job.service.managed_job_id is None
-    assert not job.result.output_path.exists()
-    assert "claim lost" not in caplog.text
-    assert "retaining result for retry" not in caplog.text
-    if response_received:
-        assert "ended successfully" in caplog.text
-        assert job.service.executor is executor
-    else:
-        assert "/end outcome could not be confirmed" in caplog.text
-        assert "ended successfully" not in caplog.text
 
 
 @pytest.mark.parametrize(

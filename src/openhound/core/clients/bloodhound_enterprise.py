@@ -47,8 +47,6 @@ class ManagedJobOutcome(str, Enum):
 
 MANAGED_JOB_END_MAX_ATTEMPTS = 4
 MANAGED_JOB_END_RETRY_DELAY_SECONDS = 2
-MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS = 10
-MANAGED_JOB_END_READ_TIMEOUT_SECONDS = 120
 MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS = 20
 SUPPORT_BUNDLE_PART_SIZE = 8 * 1024 * 1024  # 8 MiB
@@ -90,8 +88,8 @@ class BloodHoundEnterprise(BloodHound):
     ) -> None:
         super().__init__(token_key=token_key, token_id=token_id, bhe_uri=bhe_uri)
         self._credential_refresh = credential_refresh
+        self.before_managed_completion_attempt: Callable[[], None] | None = None
         self.managed_upload_runner: ManagedRequestRunner | None = None
-        self.managed_end_runner: ManagedRequestRunner | None = None
 
     def request(
         self,
@@ -101,20 +99,22 @@ class BloodHoundEnterprise(BloodHound):
         extra_headers: dict[str, str] | None = None,
         timeout: tuple[float, float] | None = None,
         *,
+        before_attempt: Callable[[], None] | None = None,
         request_runner: ManagedRequestRunner | None = None,
     ):
         """Send an API request, refreshing credentials once after a 401.
 
-        For managed uploads and outcome reports, ``request_runner`` lets the
-        scheduler send the request in a background thread and keep sending job
-        heartbeats while it waits for the response.
+        ``before_attempt`` runs before signing each attempt. For managed
+        uploads, ``request_runner`` keeps heartbeats going during the upload.
         """
         position = (
             body.tell() if body is not None and not isinstance(body, bytes) else None
         )
 
         def send_attempt() -> requests.Response:
-            # A heartbeat can refresh credentials while a completion request is
+            if before_attempt is not None:
+                before_attempt()
+            # A heartbeat can refresh credentials while an upload is
             # signing its body. Give that attempt a stable token key/ID pair.
             client = copy(self) if request_runner is not None else self
             send = partial(
@@ -316,10 +316,11 @@ class BloodHoundEnterprise(BloodHound):
                     path=path,
                     body=body,
                     timeout=(
-                        MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS,
-                        MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
+                        MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
+                        MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
                     ),
-                    request_runner=self.managed_end_runner,
+                    # Check before sending; /end can remove the claim while in flight.
+                    before_attempt=self.before_managed_completion_attempt,
                 )
             except ManagedJobDiscarded:
                 raise
@@ -401,6 +402,7 @@ class BloodHoundEnterprise(BloodHound):
             body=data,
             extra_headers=headers,
             timeout=(10, 120),
+            before_attempt=self.before_managed_completion_attempt,
             request_runner=self.managed_upload_runner,
         )
 
