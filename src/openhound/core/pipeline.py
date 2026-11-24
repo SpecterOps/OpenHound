@@ -3,6 +3,7 @@ import logging
 import sys
 import time
 from abc import ABC, abstractmethod
+from typing import cast
 
 from dlt.common.configuration.exceptions import ConfigFieldMissingException
 from dlt.common.pipeline import LoadInfo
@@ -11,6 +12,7 @@ from dlt.pipeline.exceptions import PipelineStepFailed
 from dlt.pipeline.pipeline import Pipeline
 
 from openhound.core.exceptions import ConfigException, ParseException
+from openhound.core.recovery import can_retry_normalization, resume_pending_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,8 @@ def _transient_filesystem_cause(err: BaseException) -> OSError | None:
 
 
 class BasePipeline(ABC):
+    _retry_normalization_worker_failure: bool = False
+
     @property
     @abstractmethod
     def pipeline(self) -> "Pipeline": ...
@@ -47,6 +51,22 @@ class BasePipeline(ABC):
             try:
                 return self.pipeline.run(source, **kwargs)
             except PipelineStepFailed as err:
+                if self._retry_normalization_worker_failure and can_retry_normalization(
+                    err
+                ):
+                    logger.warning(
+                        "Normalization worker failed pipeline=%s step=%s package=%s; "
+                        "attempting one fallback with normalize_workers=1",
+                        err.pipeline.pipeline_name,
+                        err.step,
+                        err.load_id,
+                    )
+                    # Resume the failed instance, not a new pipeline/source run.
+                    # Exceptions from this single fallback propagate to the caller.
+                    return resume_pending_pipeline(
+                        cast(Pipeline, err.pipeline), normalize_workers=1
+                    )
+
                 if isinstance(err.exception, ConfigFieldMissingException):
                     config_cause: ConfigFieldMissingException = err.exception
                     raise ConfigException(

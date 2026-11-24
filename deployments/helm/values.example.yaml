@@ -15,6 +15,12 @@ config:
   existingConfigMap: openhound-jamf-config
   existingSecret: openhound-jamf-secrets
 
+# Optional: preserve saved runs across pod replacement using a pre-created PVC.
+# persistence:
+#   enabled: true
+#   existingClaim: openhound-jamf-runs
+#   mountPath: /var/lib/openhound/runs
+
 # Which collector to run and any additional secret-backed files to mount for that collector.
 # eg. a private key PEM for a GitHub app or a JSON credential file for Okta.
 collector:

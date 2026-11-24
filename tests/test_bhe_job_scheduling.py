@@ -120,6 +120,7 @@ def mock_bloodhound_api():
     app.state.uploaded_parts = []
     app.state.artifact_completed = False
     app.state.ingested_nodes = 0
+    app.state.ingested_edge_properties = []
     app.state.managed_ingest_requests = []
     app.state.managed_ingested_nodes = 0
     app.state.managed_ingested_edges = 0
@@ -266,6 +267,9 @@ def mock_bloodhound_api():
     async def ingest(request: Request):
         body = await request.body()
         decompressed = gzip.decompress(body)
+        app.state.ingested_edge_properties.extend(
+            edge["properties"] for edge in json.loads(decompressed)["graph"]["edges"]
+        )
         validate_graph = Graph.model_validate_json(decompressed)
         app.state.ingested_nodes += len(validate_graph.graph.nodes)
         app.state.ingested_edges += len(validate_graph.graph.edges)
@@ -347,7 +351,7 @@ def mock_bloodhound_api():
 
     @app.post("/api/v2/clients/management/artifacts/{artifact_id}/parts/{part_number}")
     async def upload_artifact_part(
-        artifact_id: str, part_number: int, request: Request
+            artifact_id: str, part_number: int, request: Request
     ):
         content = await request.body()
         checksum = base64.b64encode(hashlib.sha256(content).digest()).decode("ascii")
@@ -604,7 +608,7 @@ def test_available_collector_jobs_uses_bounded_timeouts(mock_service, monkeypatc
 
 
 def test_client_update_uses_unknown_when_hostname_lookup_fails(
-    mock_service, mock_bloodhound_api, monkeypatch
+        mock_service, mock_bloodhound_api, monkeypatch
 ):
     def raise_error():
         raise OSError("hostname unavailable")
@@ -621,7 +625,7 @@ def test_client_update_uses_unknown_when_hostname_lookup_fails(
 
 
 def test_client_update_uses_unknown_when_ip_lookup_fails(
-    mock_service, mock_bloodhound_api, monkeypatch
+        mock_service, mock_bloodhound_api, monkeypatch
 ):
     monkeypatch.setattr(
         bloodhound_enterprise.socket, "gethostname", lambda: "test-host"
@@ -1149,7 +1153,7 @@ def test_poll_recovers_from_broken_process_pool(mock_service, mock_bloodhound_ap
 
 
 def test_start_job_recovers_when_submit_raises_broken_pool(
-    mock_service, mock_bloodhound_api, monkeypatch
+        mock_service, mock_bloodhound_api, monkeypatch
 ):
     """If executor.submit raises BrokenProcessPool after the BHE job was started, the job should be ended FAILED, state cleared, and the executor rebuilt."""
 
@@ -1252,6 +1256,10 @@ def test_scheduler_ingest_opengraph(
     assert result.job_id == 123
     assert mock_bloodhound_api.app.state.ingested_nodes == 1000
     assert mock_bloodhound_api.app.state.ingested_edges == 10000
+    assert all(
+        "traversable" not in properties
+        for properties in mock_bloodhound_api.app.state.ingested_edge_properties
+    )
     assert result.output_path is None
     assert result.data_files == []
 
@@ -1273,7 +1281,7 @@ def _support_bundle_operation() -> dict:
 
 
 def test_check_management_returns_support_bundle_operation(
-    mock_service, mock_bloodhound_api
+        mock_service, mock_bloodhound_api
 ):
     mock_bloodhound_api.app.state.management_operations = [_support_bundle_operation()]
 
@@ -1284,7 +1292,7 @@ def test_check_management_returns_support_bundle_operation(
 
 
 def test_check_management_ignores_non_queued_operations(
-    mock_service, mock_bloodhound_api
+        mock_service, mock_bloodhound_api
 ):
     operation = _support_bundle_operation()
     operation["status"] = ManagementOperationStatus.RUNNING.value
@@ -1294,7 +1302,7 @@ def test_check_management_ignores_non_queued_operations(
 
 
 def test_poll_prioritizes_management_over_a_new_job(
-    mock_service, mock_bloodhound_api, monkeypatch
+        mock_service, mock_bloodhound_api, monkeypatch
 ):
     mock_bloodhound_api.app.state.management_operations = [_support_bundle_operation()]
     sent = []
@@ -1308,7 +1316,7 @@ def test_poll_prioritizes_management_over_a_new_job(
 
 
 def test_poll_starts_job_when_no_management_work(
-    mock_service, mock_bloodhound_api, monkeypatch
+        mock_service, mock_bloodhound_api, monkeypatch
 ):
     submitted = Future()
     monkeypatch.setattr(mock_service.executor, "submit", lambda *args: submitted)
@@ -1343,7 +1351,7 @@ def test_poll_still_checks_jobs_when_management_endpoint_fails(
 
 
 def test_poll_does_not_start_a_job_when_management_work_fails(
-    mock_service, mock_bloodhound_api, monkeypatch
+        mock_service, mock_bloodhound_api, monkeypatch
 ):
     mock_bloodhound_api.app.state.management_operations = [_support_bundle_operation()]
 
@@ -1359,7 +1367,7 @@ def test_poll_does_not_start_a_job_when_management_work_fails(
 
 
 def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
-    mock_service, mock_bloodhound_api, tmp_path, monkeypatch
+        mock_service, mock_bloodhound_api, tmp_path, monkeypatch
 ):
     log = tmp_path / "openhound.log"
     log.write_text("support log")
@@ -1384,8 +1392,8 @@ def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
         "operation_id": operation.id
     }
     assert (
-        mock_bloodhound_api.app.state.artifact_create_payload["operation_id"]
-        == operation.id
+            mock_bloodhound_api.app.state.artifact_create_payload["operation_id"]
+            == operation.id
     )
     assert mock_bloodhound_api.app.state.uploaded_parts
     assert mock_bloodhound_api.app.state.artifact_completed is True
@@ -1399,7 +1407,7 @@ def test_send_support_bundle_claims_uploads_completes_and_cleans_up(
 
 
 def test_create_artifact_upload_preserves_entire_create_response(
-    mock_service, tmp_path
+        mock_service, tmp_path
 ):
     bundle = tmp_path / "support-bundle.zip"
     bundle.write_bytes(b"support bundle")
@@ -1426,7 +1434,7 @@ def test_create_artifact_upload_preserves_entire_create_response(
     ],
 )
 def test_send_support_bundle_marks_operation_failed_for_each_lifecycle_failure(
-    mock_service, mock_bloodhound_api, monkeypatch, caplog, failure_point
+        mock_service, mock_bloodhound_api, monkeypatch, caplog, failure_point
 ):
     operation = ManagementOperation.model_validate(_support_bundle_operation())
 
@@ -4745,11 +4753,14 @@ def test_managed_collection_failure_ends_failed_without_upload(
     assert mock_service.job_running is None
 
 
+@pytest.mark.parametrize("saved_runs", [False, True])
 def test_managed_collection_stages_then_uploads_before_job_end(
-    mock_service, mock_bloodhound_api, monkeypatch, tmp_path
+    mock_service, mock_bloodhound_api, monkeypatch, tmp_path, saved_runs
 ):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / ".dlt"))
+    if saved_runs:
+        monkeypatch.setenv("OPENHOUND__RUNS_DIRECTORY", str(tmp_path / "runs"))
     monkeypatch.setattr(
         scheduler_service.dataflow,
         "Path",
@@ -4779,6 +4790,11 @@ def test_managed_collection_stages_then_uploads_before_job_end(
     ]
     assert state.job_ended is False
     assert not result.output_path.exists()
+    if saved_runs:
+        workspace = result.output_path.parent
+        assert (workspace / "run.json").is_file()
+        assert (workspace / "raw" / "faker").is_dir()
+        assert (workspace / "pipelines" / "faker_convert" / "state.json").is_file()
 
 
 def test_failed_managed_conversion_cleans_up_staged_files(monkeypatch, tmp_path):

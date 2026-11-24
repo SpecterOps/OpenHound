@@ -21,3 +21,24 @@ relevant repository's implementation or mock for the agreed behavior and
 coordinate any contract changes with that work. Update existing OpenHound API
 specifications or endpoint documentation when present; do not invent a new
 specification if the repository has none.
+
+## Extension version updates
+
+When updating pinned `openhound-*` collector versions:
+
+- Compare `extension/schema.json` (version and contents) between the old and new
+  collector releases.
+- If the schema changed, verify that the matching Enterprise schema in
+  `SpecterOps/bhe-extensions` includes those changes and has been published.
+  Its source is `extensions/<name>/enterprise-schema/bhe-<name>-schema.json`.
+- Flag any required `*_EXTENSION_VERSION` updates in both BHE files:
+  - `dockerfiles/bhe-deployment.Dockerfile`
+  - `tools/docker-compose/api.Dockerfile`
+
+BHE pins must match the published Enterprise artifact's `schema.version`, not
+the Python collector version. Community and Enterprise schema versions may
+differ; enrichment does not automatically increment the version.
+
+These embedded schema pins are BHE-specific; no corresponding pin update is
+needed in the `bhce` submodule. Standalone Community Edition users install the
+matching Community schemas separately.
