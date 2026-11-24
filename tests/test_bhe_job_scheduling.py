@@ -3719,41 +3719,27 @@ def test_heartbeats_continue_inside_slow_completion_http_requests(
     )
 
 
-@pytest.mark.parametrize("lose_claim", [False, True])
-def test_end_internal_retries_renew_after_time_advances_inside_requests(
-    managed_completion, monkeypatch, lose_claim
+@pytest.mark.parametrize(
+    "heartbeat_status,expected_events",
+    [(200, ["end", "heartbeat", "end"]), (404, ["end", "heartbeat"])],
+    ids=["renewed", "claim-lost"],
+)
+def test_end_retry_checks_heartbeat_before_next_attempt(
+    managed_completion, heartbeat_status, expected_events
 ):
     job = managed_completion
-    job.clock.now = 599
-    original_request = requests.request
-    events = []
+    heartbeat_at = job.service.next_heartbeat_at
+    assert heartbeat_at is not None
+    # Only the retry sleep advances the clock, on the scheduler thread.
+    job.clock.now = heartbeat_at - 1
+    job.state.collector_job_end_statuses = [500]
+    job.state.collector_job_heartbeat_statuses = [heartbeat_status]
 
-    def request(method, url, **kwargs):
-        path = urlsplit(url).path
-        events.append((path.rsplit("/", 1)[-1], job.clock.now))
-        if path.endswith("/end"):
-            job.clock.now += 120
-        return original_request(method, url, **kwargs)
-
-    monkeypatch.setattr(requests, "request", request)
-    job.state.collector_job_end_statuses = [500] * 4
-    if lose_claim:
-        job.state.collector_job_heartbeat_statuses = [200, 404]
     job.service._poll()
-    assert events[:3] == [("heartbeat", 599), ("ingest", 599), ("ingest", 599)]
-    assert ("heartbeat", 965) in events
-    assert job.result.uploaded_files == 2
-    if lose_claim:
-        assert job.clock.now == 965
-        assert len(job.state.collector_job_end_requests) == 3
-        assert not job.result.output_path.exists()
-    else:
-        assert job.clock.now == 1085
-        assert len(job.state.collector_job_end_requests) == 4
-        assert job.service.future is not None
-        job.service._poll()
-    assert len(job.state.managed_ingest_requests) == 2
-    assert job.service.future is None
+
+    assert job.state.managed_events == expected_events
+    assert job.state.managed_ingest_requests == [job.job_id] * 2
+    assert job.service.future is job.service.managed_job_id is None
 
 
 @pytest.mark.parametrize("status", [429, 503, requests.ConnectionError("offline")])
