@@ -530,14 +530,14 @@ wheels = [
 
 [[package]]
 name = "faker"
-version = "40.36.0"
+version = "40.54.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/98/d2/026af1e002bbc6df534d1f8262b18ec79a974f928e9290bfbfdfe7c7b2af/faker-40.36.0.tar.gz", hash = "sha256:754048c76c03afa7de83eee8f4bcee3cf668cbb7d995f54a4e9678db7f110308", size = 2025903, upload-time = "2026-07-24T21:11:33.088Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d9/64/eace8e5941eaf51b62d56a54e3ab8380934b0ab2deef2c640ed1153ea47f/faker-40.54.0.tar.gz", hash = "sha256:38fba73e32699a9f1071724d67e5a66a84bf057987cffb27c9d0c979fda3f135", size = 2037669, upload-time = "2026-11-10T22:05:54.089Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/50/9a/b947ed175ce9a0dcb070ccf3607f0ce8720cfb5ed1a36166a150b2acd5af/faker-40.36.0-py3-none-any.whl", hash = "sha256:82b9497d9cfe017048075bcf969298a74b1b6e39f5e4dad1211085d1133f7b62", size = 2062829, upload-time = "2026-07-24T21:11:31.37Z" },
+    { url = "https://files.pythonhosted.org/packages/85/2d/031405437c6ccdc5fb24fc8cc715fbe5fbf9af492749ad070d9cc85f69dc/faker-40.54.0-py3-none-any.whl", hash = "sha256:2dd88ee8cb63a9149e19ef48bdd73879bc3854d8ba2d6c1535e902a762e603f7", size = 2071041, upload-time = "2026-11-10T22:05:51.787Z" },
 ]
 
 [[package]]
@@ -1397,7 +1397,7 @@ dev = [
     { name = "ipython" },
     { name = "marimo" },
     { name = "mypy" },
-    { name = "openhound-faker" },
+    { name = "openhound-sample" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "ruff" },
@@ -1446,7 +1446,7 @@ dev = [
     { name = "ipython", specifier = ">=9.13.0" },
     { name = "marimo", specifier = ">=0.23.5" },
     { name = "mypy", specifier = ">=1.19.1" },
-    { name = "openhound-faker", specifier = "==0.0.6" },
+    { name = "openhound-sample", specifier = ">=0.0.2" },
     { name = "pre-commit", specifier = ">=4.5.1" },
     { name = "pytest", specifier = ">=9.0.1" },
     { name = "ruff", specifier = ">=0.15.4" },
@@ -1454,18 +1454,6 @@ dev = [
     { name = "types-requests", specifier = ">=2.33.0.20260408" },
     { name = "virtualenv", specifier = ">=21.15.1" },
     { name = "zensical", specifier = ">=0.0.40" },
-]
-
-[[package]]
-name = "openhound-faker"
-version = "0.0.6"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "faker" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ee/de/d4418dec77e65413b3c8dce681a7ff4f6279711511b09540a91be58255a2/openhound_faker-0.0.6.tar.gz", hash = "sha256:2cd4bda6774702dbca3653a4cfa47e3250fb85e831ed30086bf6bda82c385b8b", size = 10269, upload-time = "2026-04-30T22:38:56.97Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/54/23/e472dfc10ba0f2e6ea4f1aefcd1309c1ff23009528f6a28f4be84a4ade63/openhound_faker-0.0.6-py3-none-any.whl", hash = "sha256:5d3aa2b955c9564e1fff761430b0befa710d13f2176e492d8f91b86d03cb88ec", size = 10102, upload-time = "2026-04-30T22:38:56.16Z" },
 ]
 
 [[package]]
@@ -1503,6 +1491,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f5/3f/2a10b437e8f86ccaed43166cd93b60ee4acab34925d06280f4ab62e3a13c/openhound_okta-0.15.0.tar.gz", hash = "sha256:1d8a8036dfee243a69e39b10520760034232202369c0a056a353d90c8d136849", size = 757387, upload-time = "2026-10-29T14:37:09.839Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/cd/bd37a8b88db1098e48ec17c3752af43add1074ec4cb0977cadf01f0bf121/openhound_okta-0.15.0-py3-none-any.whl", hash = "sha256:8d68f44410bd8947c55789536f923924ab6090b5231d4e99160ac9162ce00201", size = 160476, upload-time = "2026-10-29T14:37:08.685Z" },
+]
+
+[[package]]
+name = "openhound-sample"
+version = "0.0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "faker" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a9/aa/6690569d8237061e2fff240c234c2de5000b73739ed02d0231a7584483cc/openhound_sample-0.0.2.tar.gz", hash = "sha256:daca936925027a02b7b56e1a4851677ac865ef5e5e660c008c75908fae796377", size = 3460936, upload-time = "2026-11-17T12:33:21.737Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/90/b8/88a4e702c00a9b068b82600c4cf2b4b8a8bd6f6c50b5b0380c8c156240f1/openhound_sample-0.0.2-py3-none-any.whl", hash = "sha256:06cef4a7a5e0c5a57242583430c9b75e8d26d4419ee64565d349168d93ff60eb", size = 10745, upload-time = "2026-11-17T12:33:19.92Z" },
 ]
 
 [[package]]

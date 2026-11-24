@@ -94,6 +94,10 @@ jobs:
         run: |
           .venv/bin/pytest tests/test_dlt_pydantic_override.py -v
 
+      - name: Run tests for filtering (collected) resources via config.toml/cli
+        run: |
+          .venv/bin/pytest tests/test_collect_resources.py -v
+
       - name: Run tests for our custom implemenation of AsyncRESTClient
         run: |
           .venv/bin/pytest tests/rest_client -v
