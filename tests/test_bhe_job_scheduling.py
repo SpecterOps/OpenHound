@@ -115,6 +115,7 @@ def mock_bloodhound_api():
     app.state.uploaded_parts = []
     app.state.artifact_completed = False
     app.state.ingested_nodes = 0
+    app.state.ingested_edge_properties = []
     app.state.managed_ingest_requests = []
     app.state.managed_ingested_nodes = 0
     app.state.managed_ingested_edges = 0
@@ -235,6 +236,9 @@ def mock_bloodhound_api():
     async def ingest(request: Request):
         body = await request.body()
         decompressed = gzip.decompress(body)
+        app.state.ingested_edge_properties.extend(
+            edge["properties"] for edge in json.loads(decompressed)["graph"]["edges"]
+        )
         validate_graph = Graph.model_validate_json(decompressed)
         app.state.ingested_nodes += len(validate_graph.graph.nodes)
         app.state.ingested_edges += len(validate_graph.graph.edges)
