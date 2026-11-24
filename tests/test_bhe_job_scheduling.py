@@ -1218,6 +1218,10 @@ def test_scheduler_ingest_opengraph(
     assert result.job_id == 123
     assert mock_bloodhound_api.app.state.ingested_nodes == 13
     assert mock_bloodhound_api.app.state.ingested_edges == 15
+    assert all(
+        "traversable" not in properties
+        for properties in mock_bloodhound_api.app.state.ingested_edge_properties
+    )
     assert result.output_path is None
     assert result.data_files == []
 
@@ -1230,8 +1234,6 @@ def test_scheduler_ingest_opengraph(
     assert mock_bloodhound_api.app.state.job_ended is True
     assert mock_bloodhound_api.app.state.managed_ingest_requests == []
     assert mock_bloodhound_api.app.state.collector_job_end_requests == []
-    assert mock_bloodhound_api.app.state.ingested_nodes == 13
-    assert mock_bloodhound_api.app.state.ingested_edges == 15
 
 
 def _support_bundle_operation() -> dict:
@@ -4465,7 +4467,7 @@ def test_managed_collection_failure_ends_failed_without_upload(
 
 @pytest.mark.parametrize("saved_runs", [False, True])
 def test_managed_collection_stages_then_uploads_before_job_end(
-    mock_service, mock_bloodhound_api, monkeypatch, tmp_path, saved_runs
+        mock_service, mock_bloodhound_api, monkeypatch, tmp_path, saved_runs
 ):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / ".dlt"))
