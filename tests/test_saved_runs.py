@@ -323,6 +323,49 @@ def test_scheduler_opt_in_persists_failed_run(monkeypatch, tmp_path):
     assert run.lookup.is_file()
 
 
+def test_temporary_managed_run_does_not_resume_previous_jobs_packages(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OPENHOUND__RUNS_DIRECTORY", "")
+    extension = _extension([])
+    monkeypatch.setattr(
+        service.CollectorManager,
+        "from_entrypoint",
+        lambda: SimpleNamespace(collectors=[extension]),
+    )
+    convert = extension.converter
+
+    def interrupt_conversion(output_path, **kwargs):
+        pipeline = dlt.pipeline(
+            pipeline_name="example_convert",
+            destination=opengraph_file(output_path=str(output_path)),
+            dataset_name="example",
+        )
+        pipeline.extract(
+            [{"graph": {"entity_type": "node", "content": {"id": "cancelled-node"}}}],
+            table_name="nodes",
+        )
+        raise RuntimeError("conversion interrupted")
+
+    first_workspace = tmp_path / "first"
+    extension.converter = interrupt_conversion
+    with pytest.raises(RuntimeError, match="conversion interrupted"):
+        service._collect_in_worker("example", 42, True, first_workspace)
+    (first_run,) = first_workspace.iterdir()
+    assert SavedRun(first_run).inspect()["packages"]["pipelines/example_convert"][
+        "extracted"
+    ]
+
+    extension.converter = convert
+    result = service._collect_in_worker("example", 43, True, tmp_path / "second")
+    assert [
+        node["id"]
+        for path in result.data_files
+        for node in json.loads(path.read_text())["graph"]["nodes"]
+    ] == ["saved-node"]
+
+
+@pytest.mark.parametrize("managed", [False, True])
 @pytest.mark.parametrize(
     ("toml", "environment", "image_default", "expected"),
     [
@@ -338,7 +381,7 @@ def test_scheduler_opt_in_persists_failed_run(monkeypatch, tmp_path):
     ],
 )
 def test_scheduler_runs_directory_precedence(
-    monkeypatch, tmp_path, toml, environment, image_default, expected
+    monkeypatch, tmp_path, toml, environment, image_default, expected, managed
 ):
     """Image defaults must preserve explicit DLT settings and local opt-in."""
 
@@ -373,14 +416,19 @@ def test_scheduler_runs_directory_precedence(
         service.dataflow, "pipeline", lambda **kwargs: calls.append(kwargs) or {}
     )
 
-    service._collect_in_worker("example", 42, managed=True)
+    workspace = tmp_path / "temporary" if managed else None
+    service._collect_in_worker("example", 42, managed, workspace)
 
-    run = calls[0].get("saved_run")
-    if expected is None:
-        assert run is None
+    (call,) = calls
+    run = call.get("saved_run")
+    if expected is None and not managed:
+        assert call.keys() == {"extension"}
     else:
-        assert run.directory.parent == Path(directory(expected))
+        assert run.directory.parent == (
+            Path(directory(expected)) if expected else workspace
+        )
         assert (run.directory / "run.json").is_file()
+        assert call["output_path"] == (run.graph if managed else None)
 
 
 def test_cli_resume_recovers_locally_without_collection(monkeypatch, tmp_path):

@@ -117,6 +117,7 @@ def _subprocess_collect(
     secrets: dict[str, Any] | None = None,
     managed: bool = False,
     environment: JobEnvironment | None = None,
+    workspace: Path | None = None,
 ) -> Result:
     """A subprocess which runs the DLT pipeline for the specified collector.
 
@@ -126,6 +127,7 @@ def _subprocess_collect(
         collector_name: The name of the extension to run.
         job_id: The Job ID as returned by BHE.
         managed: Stage OpenGraph files for upload after collection completes.
+        workspace: Scheduler-owned fallback when managed runs aren't persisted.
 
     Returns:
         Result: The result of the collection, including the collected data and the job ID.
@@ -144,7 +146,7 @@ def _subprocess_collect(
     ):
         try:
             return _configured_worker_collect(
-                collector_name, job_id, params, secrets, managed
+                collector_name, job_id, params, secrets, managed, workspace
             )
         except ManagedConfigurationError:
             # AWS failures were diagnosed inside the SDK logging controls;
@@ -180,6 +182,7 @@ def _configured_worker_collect(
     params: dict[str, Any] | None,
     secrets: dict[str, Any] | None,
     managed: bool,
+    workspace: Path | None,
 ) -> Result:
     configured = params is not None or secrets is not None
     # Retain SDK logging and source-credential isolation; authentication belongs
@@ -197,10 +200,15 @@ def _configured_worker_collect(
     # Install configuration before importing collectors or constructing pipelines:
     # both can resolve DLT settings. Always remove it, including on worker failure.
     with configuration:
-        return _collect_in_worker(collector_name, job_id, managed)
+        return _collect_in_worker(collector_name, job_id, managed, workspace)
 
 
-def _collect_in_worker(collector_name: str, job_id: int | str, managed: bool) -> Result:
+def _collect_in_worker(
+    collector_name: str,
+    job_id: int | str,
+    managed: bool,
+    workspace: Path | None = None,
+) -> Result:
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
@@ -228,46 +236,39 @@ def _collect_in_worker(collector_name: str, job_id: int | str, managed: bool) ->
             if runs_directory is None:
                 # Image defaults must not override explicit TOML or environment settings.
                 runs_directory = os.environ.get("OPENHOUND_DEFAULT_RUNS_DIRECTORY")
+            # A managed job needs isolated pipeline state even without persistence.
+            run_root = Path(runs_directory) if runs_directory else None
+            if managed and run_root is None:
+                run_root = workspace
+                if run_root is None:
+                    raise RuntimeError(
+                        "Managed collection requires an isolated workspace"
+                    )
             saved_run = (
                 SavedRun.create(
-                    Path(runs_directory),
+                    run_root,
                     collector=collector.name,
                     collector_version=getattr(collector, "package_version", None),
                     job_id=job_id,
                     mode="write" if managed else "ingest",
                     bhe_url=dlt.config.get("destination.bloodhoundenterprise.url", str),
                 )
-                if runs_directory
+                if run_root is not None
                 else None
             )
-            output_path = None
-            if managed:
-                output_path = (
-                    saved_run.graph
-                    if saved_run
-                    else Path(tempfile.mkdtemp(prefix="openhound-job-"))
-                )
-            if saved_run:
+            output_path = saved_run.graph if managed and saved_run else None
+            if saved_run and runs_directory:
                 logger.info(
                     "Persisting job %s in saved run %s", job_id, saved_run.directory
                 )
-            try:
-                if saved_run:
-                    results = dataflow.pipeline(
-                        extension=collector, output_path=output_path, saved_run=saved_run
-                    )
-                else:
-                    results = (
-                        dataflow.pipeline(extension=collector)
-                        if output_path is None
-                        else dataflow.pipeline(
-                            extension=collector, output_path=output_path
-                        )
-                    )
-            except BaseException:
-                if output_path is not None and saved_run is None:
-                    shutil.rmtree(output_path)
-                raise
+            if saved_run:
+                results = dataflow.pipeline(
+                    extension=collector,
+                    output_path=output_path,
+                    saved_run=saved_run,
+                )
+            else:
+                results = dataflow.pipeline(extension=collector)
             logger.info(
                 "Collection for job %s completed successfully.",
                 job_id,
@@ -334,6 +335,7 @@ class Service:
         # MVP runs one job at a time.
         self.job_running: int | str | None = None
         self.managed_job_id: str | None = None
+        self._managed_workspace: Path | None = None
         self.next_heartbeat_at: float | None = None
         self.client.before_managed_completion_attempt = self._renew_managed_claim_if_due
 
@@ -409,6 +411,16 @@ class Service:
         return min(self.interval, heartbeat_delay)
 
     def _clear_running_job(self) -> None:
+        if self._managed_workspace is not None:
+            try:
+                shutil.rmtree(self._managed_workspace)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception(
+                    "Unable to remove temporary workspace for job %s.", self.job_running
+                )
+            self._managed_workspace = None
         self.future = None
         self.job_running = None
         self.managed_job_id = None
@@ -742,14 +754,26 @@ class Service:
             time.monotonic() + HEARTBEAT_INTERVAL if managed else None
         )
         try:
+            worker_args: tuple[Any, ...]
+            if managed:
+                # The parent can remove the fallback even when it kills the worker.
+                self._managed_workspace = Path(
+                    tempfile.mkdtemp(prefix="openhound-job-")
+                )
+                worker_args = (
+                    dict(params or {}),
+                    dict(secrets or {}),
+                    True,
+                    dict(environment) if environment else None,
+                    self._managed_workspace,
+                )
+            else:
+                worker_args = (None, None)
             self.future = self.executor.submit(
                 _subprocess_collect,
                 self.collector_name,
                 job_id,
-                dict(params or {}) if managed else None,
-                dict(secrets or {}) if managed else None,
-                *((True,) if managed else ()),
-                *((dict(environment),) if managed and environment else ()),
+                *worker_args,
             )
         except BrokenProcessPool:
             logger.exception("Failed to submit job %s: process pool is broken.", job_id)

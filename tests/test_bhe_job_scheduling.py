@@ -434,13 +434,15 @@ def mock_service(mock_bloodhound_api, monkeypatch):
         lambda context: SimpleNamespace(queue=None, close=lambda: None),
     )
 
-    return Service(
+    service = Service(
         bhe_uri="http://localhost:8000",
         token_key="test-key",
         token_id="test-id",
         collector_name="openhound-faker",
         managed=False,
     )
+    yield service
+    service._clear_running_job()
 
 
 def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeypatch):
@@ -1791,7 +1793,7 @@ def test_managed_job_retrieves_full_hierarchy_secret_before_dlt_resolution(
     )
     resolved = {}
 
-    def collect(extension, output_path):
+    def collect(extension, output_path, saved_run):
         resolved.update(
             secret_value=dlt.secrets.get(
                 "sources.source.example.credentials.secret_value", str
@@ -1916,12 +1918,13 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_environment(
         scheduler_service.CollectorManager, "from_entrypoint", load_collectors
     )
 
-    def collect(extension, output_path):
+    def collect(extension, output_path, saved_run):
         if failed:
             logging.getLogger("example_extension.auth").error(
                 "Provider failure: %s", AWS_SECRET_KEY
             )
             raise RuntimeError(AWS_SECRET_KEY)
+        output_path.mkdir()
         (output_path / "graph.json").write_text(Graph(graph={}).model_dump_json())
         return {"collect": ["account"], "convert": ["graph"]}
 
@@ -2428,6 +2431,7 @@ def test_managed_poll_starts_claimed_job_and_tracks_worker(
     service._poll()
 
     job_id = state.collector_job_claim_response["id"]
+    assert service._managed_workspace.is_dir()
     assert state.managed_events == ["claim", "retrieve"]
     assert submitted == [
         (
@@ -2437,6 +2441,8 @@ def test_managed_poll_starts_claimed_job_and_tracks_worker(
             CLAIMED_PARAMS,
             COLLECTOR_SECRETS,
             True,
+            None,
+            service._managed_workspace,
         )
     ]
     assert service.job_running == service.managed_job_id == job_id
@@ -2536,6 +2542,8 @@ def test_managed_start_failure_retries_prepared_job_before_discovery(
         CLAIMED_PARAMS,
         COLLECTOR_SECRETS,
         True,
+        None,
+        service._managed_workspace,
     )
     assert service.future is future
     for forbidden in ("raw-provider-secret", "private-credential-value"):
@@ -3829,13 +3837,15 @@ def test_managed_job_uses_shared_poll_loop_without_polling_for_new_jobs(
         monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
         mock_service._poll()
 
-    assert submitted[0][1:] == (
+    assert submitted[0][1:6] == (
         "openhound-faker",
         "collector-job-123",
         {"node_count": 4},
         {"token": "secret-value"},
         True,
     )
+    assert submitted[0][6] is None
+    assert not submitted[0][7].exists()
     assert mock_bloodhound_api.app.state.collector_job_start_requests == [
         ("collector-job-123", b"")
     ]
@@ -4005,6 +4015,11 @@ def test_managed_heartbeat_claim_loss_stops_worker_without_reporting_outcome(
     assert mock_bloodhound_api.app.state.job_ended is False
 
 
+def _stage_file_and_wait(workspace):
+    (workspace / "partial.json").write_text("{}")
+    time.sleep(60)
+
+
 def test_managed_heartbeat_claim_loss_kills_a_real_running_process(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
@@ -4012,16 +4027,20 @@ def test_managed_heartbeat_claim_loss_kills_a_real_running_process(
     original_submit = executor.submit
     mock_service.executor = executor
     monkeypatch.setattr(
-        executor, "submit", lambda *args: original_submit(time.sleep, 60)
+        executor, "submit", lambda *args: original_submit(_stage_file_and_wait, args[-1])
     )
 
     mock_bloodhound_api.app.state.collector_job_heartbeat_statuses = [404]
     try:
         mock_service.run_claimed_job("collector-job-123", {}, {})
+        workspace = mock_service._managed_workspace
+        assert workspace.is_dir()
+        staged_file = workspace / "partial.json"
         future = mock_service.future
         deadline = time.monotonic() + 10
-        while not future.running() and time.monotonic() < deadline:
+        while not staged_file.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
+        assert staged_file.is_file()
         assert future.running()
         workers = list(executor._processes.values())
         assert workers and all(worker.is_alive() for worker in workers)
@@ -4033,6 +4052,7 @@ def test_managed_heartbeat_claim_loss_kills_a_real_running_process(
         assert future.done()
         assert mock_service.future is None
         assert mock_service.executor is not executor
+        assert not workspace.exists()
         assert mock_bloodhound_api.app.state.collector_job_end_requests == []
     finally:
         for worker in list((executor._processes or {}).values()):
@@ -4050,8 +4070,11 @@ def test_managed_worker_failure_ends_job_failed(
     monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
 
     mock_service.run_claimed_job("collector-job-123", {}, {})
+    workspace = mock_service._managed_workspace
+    assert workspace.is_dir()
     mock_service._poll()
 
+    assert not workspace.exists()
     assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == []
     assert mock_bloodhound_api.app.state.collector_job_end_requests == [
         {
@@ -4661,13 +4684,10 @@ def test_managed_collection_stages_then_uploads_before_job_end(
     monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / ".dlt"))
     if saved_runs:
         monkeypatch.setenv("OPENHOUND__RUNS_DIRECTORY", str(tmp_path / "runs"))
-    monkeypatch.setattr(
-        scheduler_service.dataflow,
-        "Path",
-        lambda value: tmp_path if value == "/tmp/openhound" else Path(value),
-    )
     job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
-    result = _subprocess_collect("faker", job_id, managed=True)
+    workspace = tmp_path / "temporary"
+    mock_service._managed_workspace = workspace
+    result = _subprocess_collect("faker", job_id, managed=True, workspace=workspace)
     assert result.data_files
     assert mock_bloodhound_api.app.state.managed_ingest_requests == []
     assert mock_bloodhound_api.app.state.ingested_nodes == 0
@@ -4690,36 +4710,12 @@ def test_managed_collection_stages_then_uploads_before_job_end(
     ]
     assert state.job_ended is False
     assert not result.output_path.exists()
+    assert not workspace.exists()
     if saved_runs:
         workspace = result.output_path.parent
         assert (workspace / "run.json").is_file()
         assert (workspace / "raw" / "faker").is_dir()
         assert (workspace / "pipelines" / "faker_convert" / "state.json").is_file()
-
-
-def test_failed_managed_conversion_cleans_up_staged_files(monkeypatch, tmp_path):
-    output = tmp_path / "output"
-    output.mkdir()
-    monkeypatch.setattr(
-        scheduler_service.tempfile, "mkdtemp", lambda **kwargs: str(output)
-    )
-    collector = SimpleNamespace(name="example", package_version="1", metadata=None)
-    monkeypatch.setattr(
-        scheduler_service.CollectorManager,
-        "from_entrypoint",
-        lambda: SimpleNamespace(collectors=[collector]),
-    )
-
-    def fail(extension, output_path):
-        (output_path / "partial.json").write_text("partial")
-        raise RuntimeError("conversion failed")
-
-    monkeypatch.setattr(scheduler_service.dataflow, "pipeline", fail)
-    with pytest.raises(ManagedConfigurationError, match="check worker logs"):
-        _subprocess_collect(
-            "example", "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d", managed=True
-        )
-    assert not output.exists()
 
 
 def test_managed_completion_streams_graph_to_api_before_ending(

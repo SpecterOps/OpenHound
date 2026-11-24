@@ -533,7 +533,7 @@ WORKER_SECRET = "worker-example-secret-key"
 
 
 def _spawned_log_collection(
-    collector, job_id, params, credentials, managed, environment
+    collector, job_id, params, credentials, managed, environment, workspace
 ):
     """Run the real job/configuration bridge; replace only collection/network IO."""
     from dlt.common import logger as dlt_logger
@@ -591,7 +591,7 @@ def _spawned_log_collection(
 
     service._collect_in_worker = collect
     return service._subprocess_collect(
-        collector, job_id, params, credentials, managed, environment
+        collector, job_id, params, credentials, managed, environment, workspace
     )
 
 
