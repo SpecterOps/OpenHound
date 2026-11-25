@@ -3592,32 +3592,62 @@ def managed_completion(mock_service, mock_bloodhound_api, monkeypatch, tmp_path)
 
 @pytest.mark.parametrize("during_shutdown", [False, True])
 @pytest.mark.parametrize("heartbeat_status", [200, 404])
-def test_due_heartbeat_between_uploads(
+def test_due_heartbeats_during_upload(
     managed_completion, monkeypatch, during_shutdown, heartbeat_status
 ):
     job = managed_completion
-    job.state.collector_job_heartbeat_statuses = [heartbeat_status]
+    job.state.collector_job_heartbeat_statuses = [200, heartbeat_status]
     scheduler_thread = threading.get_ident()
     original_request = requests.request
+    original_wait = scheduler_service.wait
+    upload_started = threading.Event()
+    release_upload = threading.Event()
     events = []
+    refreshes = []
+    job.service.client._credential_refresh = lambda: refreshes.append("unexpected")
+
+    def wait_for_deadline(futures, *, timeout):
+        if release_upload.is_set():
+            done, pending = original_wait(futures, timeout=5)
+            assert not pending, "upload did not finish after release"
+            return done, pending
+        assert upload_started.wait(5)
+        job.clock.sleep(timeout)
 
     def request(method, url, **kwargs):
-        events.append(urlsplit(url).path.rsplit("/", 1)[-1])
-        if events == ["ingest"]:
+        operation = urlsplit(url).path.rsplit("/", 1)[-1]
+        events.append(operation)
+        if operation == "heartbeat":
             assert threading.get_ident() == scheduler_thread
-            job.clock.sleep(scheduler_service.HEARTBEAT_INTERVAL)
+            response = original_request(method, url, **kwargs)
+            if events.count("heartbeat") == 2:
+                release_upload.set()
+            return response
+        if events == ["ingest"]:
+            assert threading.get_ident() != scheduler_thread
+            upload_started.set()
+            assert release_upload.wait(5), "upload was not heartbeated"
+            assert not kwargs["data"].closed
+            if heartbeat_status == 404:
+                # A late 401 must not trigger credential refresh or another upload.
+                response = requests.Response()
+                response.status_code = 401
+                response._content = b""
+                return response
         return original_request(method, url, **kwargs)
 
+    monkeypatch.setattr(scheduler_service, "wait", wait_for_deadline)
     monkeypatch.setattr(requests, "request", request)
     if during_shutdown:
         job.service._shutdown()
     else:
         job.service._poll()
 
-    expected = ["ingest", "heartbeat"]
+    expected = ["ingest", "heartbeat", "heartbeat"]
     if heartbeat_status == 200:
         expected += ["ingest", "end"]
     assert events == expected
+    assert refreshes == []
     assert job.service.future is job.service.managed_job_id is None
     assert not job.result.output_path.exists()
 

@@ -86,6 +86,9 @@ class BloodHoundEnterprise(BloodHound):
         super().__init__(token_key=token_key, token_id=token_id, bhe_uri=bhe_uri)
         self._credential_refresh = credential_refresh
         self.before_managed_completion_attempt: Callable[[], None] | None = None
+        self.send_managed_upload: (
+            Callable[[Callable[[], requests.Response]], requests.Response] | None
+        ) = None
 
     def request(
         self,
@@ -101,14 +104,9 @@ class BloodHoundEnterprise(BloodHound):
 
         ``before_attempt`` runs before signing each attempt, including retries.
         """
-        position = (
-            body.tell() if body is not None and not isinstance(body, bytes) else None
-        )
         request = super().request
 
         def send_attempt() -> requests.Response:
-            if before_attempt is not None:
-                before_attempt()
             return request(
                 method=method,
                 path=path,
@@ -116,6 +114,23 @@ class BloodHoundEnterprise(BloodHound):
                 extra_headers=extra_headers,
                 timeout=timeout,
             )
+
+        return self._send_with_credential_refresh(send_attempt, body, before_attempt)
+
+    def _send_with_credential_refresh(
+        self,
+        send: Callable[[], requests.Response],
+        body: bytes | BinaryIO | None,
+        before_attempt: Callable[[], None] | None,
+    ) -> requests.Response:
+        position = (
+            body.tell() if body is not None and not isinstance(body, bytes) else None
+        )
+
+        def send_attempt() -> requests.Response:
+            if before_attempt is not None:
+                before_attempt()
+            return send()
 
         try:
             return send_attempt()
@@ -385,13 +400,27 @@ class BloodHoundEnterprise(BloodHound):
         headers = {"Content-Type": content_type}
         if content_encoding is not None:
             headers["Content-Encoding"] = content_encoding
-        self.request(
-            method="POST",
-            path=f"/api/v2/collie-job-queue/{job_id}/ingest",
-            body=data,
-            extra_headers=headers,
-            timeout=(10, 120),
-            before_attempt=self.before_managed_completion_attempt,
+        path = f"/api/v2/collie-job-queue/{job_id}/ingest"
+        send_upload = self.send_managed_upload
+        request = super().request
+
+        def send_attempt() -> requests.Response:
+            if send_upload is None:
+                return request("POST", path, data, headers, timeout=(10, 120))
+
+            # Heartbeats can refresh the main client's credentials during signing.
+            # Transfer this attempt with its own fixed key and ID.
+            upload_client = BloodHound(self.token_key, self.token_id, self.base_uri)
+
+            def transfer() -> requests.Response:
+                return upload_client.request(
+                    "POST", path, data, headers, timeout=(10, 120)
+                )
+
+            return send_upload(transfer)
+
+        self._send_with_credential_refresh(
+            send_attempt, data, self.before_managed_completion_attempt
         )
 
     @property

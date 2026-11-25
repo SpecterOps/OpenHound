@@ -6,7 +6,7 @@ import signal
 import tempfile
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -16,6 +16,7 @@ from typing import Any
 from uuid import UUID
 
 import dlt
+from requests import Response
 
 import openhound
 import openhound.core.logging as openhound_logging
@@ -338,6 +339,7 @@ class Service:
         self._managed_workspace: Path | None = None
         self.next_heartbeat_at: float | None = None
         self.client.before_managed_completion_attempt = self._renew_managed_claim_if_due
+        self.client.send_managed_upload = self._send_upload_with_heartbeats
 
         # Futures/results from the subprocess executor
         self.future: Future[Result] | None = None
@@ -817,16 +819,21 @@ class Service:
     def _renew_managed_claim_if_due(self) -> None:
         """Send a due heartbeat, or discard the job if Enterprise returns 404."""
         job_id = self.managed_job_id
+        if job_id is not None and self._heartbeat_reports_claim_loss(job_id):
+            self._abort_managed_job(job_id)
+            raise ManagedJobDiscarded("Managed collector claim lost")
+
+    def _heartbeat_reports_claim_loss(self, job_id: str) -> bool:
+        """Send a due heartbeat and report a 404 without touching local files."""
         deadline = self.next_heartbeat_at
-        if job_id is None or deadline is None or time.monotonic() < deadline:
-            return
+        if deadline is None or time.monotonic() < deadline:
+            return False
         try:
             self.client.heartbeat_collector_job(job_id)
         except Exception as error:  # noqa: BLE001
             # Transient heartbeat failures must not stop collection.
             if isinstance(error, BloodHoundHTTPError) and error.code == 404:
-                self._abort_managed_job(job_id)
-                raise ManagedJobDiscarded("Managed collector claim lost") from None
+                return True
             logger.info(
                 "Managed collector job %s heartbeat request failed.",
                 job_id,
@@ -841,6 +848,26 @@ class Service:
         else:
             logger.info("Managed collector job %s heartbeat succeeded.", job_id)
         self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
+        return False
+
+    def _send_upload_with_heartbeats(
+        self, transfer: Callable[[], Response]
+    ) -> Response:
+        job_id = self.managed_job_id
+        if job_id is None:
+            return transfer()
+        # Wait for an in-flight transfer to stop using the stream before closing
+        # it or deleting the workspace. Never act on its response after claim loss.
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="managed-upload"
+        ) as pool:
+            upload = pool.submit(transfer)
+            while not upload.done():
+                wait([upload], timeout=self._time_until_next_heartbeat())
+                if not upload.done() and self._heartbeat_reports_claim_loss(job_id):
+                    upload.cancel()
+                    raise ManagedJobDiscarded("Managed collector claim lost")
+            return upload.result()
 
     def _abort_managed_job(self, job_id: str) -> None:
         """Stop local work and discard the job without sending another report."""
@@ -938,6 +965,8 @@ class Service:
                                 self.managed_job_id, data
                             )
                     except ManagedJobDiscarded:
+                        if self.managed_job_id is not None:
+                            self._abort_managed_job(self.managed_job_id)
                         return
                     except BloodHoundHTTPError as error:
                         if error.code in (404, 409):
