@@ -41,7 +41,9 @@ The equivalent environment variable is `OPENHOUND__RUNS_DIRECTORY`. For persiste
 across container replacement, mount this directory on persistent storage and make
 it writable by the container user.
 Configuring a directory alone does not make a container's filesystem persistent.
-Without this setting, a local Python scheduler keeps its existing storage paths.
+Without saved runs enabled, unmanaged jobs keep their existing storage paths.
+Managed jobs use a temporary workspace so an interrupted job's files and
+pending pipeline packages cannot carry over to the next job.
 Docker images enable saved runs at `/var/lib/openhound/runs` by default, using the
 container filesystem. This image default applies only when `runs_directory` is
 unset; explicit TOML settings and `OPENHOUND__RUNS_DIRECTORY` take precedence.
@@ -133,4 +135,3 @@ Saved workspaces are retained without automatic pruning, including successful
 runs. Plan disk capacity and remove runs only after their data is no longer
 needed and no process owns them. This feature does not import data collected
 before saved runs were enabled.
-

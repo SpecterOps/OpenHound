@@ -45,8 +45,6 @@ class ManagedJobOutcome(str, Enum):
 
 MANAGED_JOB_END_MAX_ATTEMPTS = 4
 MANAGED_JOB_END_RETRY_DELAY_SECONDS = 2
-MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS = 10
-MANAGED_JOB_END_READ_TIMEOUT_SECONDS = 120
 MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS = 20
 SUPPORT_BUNDLE_PART_SIZE = 8 * 1024 * 1024  # 8 MiB
@@ -62,6 +60,10 @@ MANAGED_JOB_CLAIM_CONNECT_TIMEOUT_SECONDS = 10
 MANAGED_JOB_CLAIM_READ_TIMEOUT_SECONDS = 20
 
 T = TypeVar("T")
+
+
+class ManagedJobDiscarded(RuntimeError):
+    """The scheduler has discarded this job; do not retry its requests."""
 
 
 def _safe_managed_request_error(error: Exception) -> Exception:
@@ -83,6 +85,10 @@ class BloodHoundEnterprise(BloodHound):
     ) -> None:
         super().__init__(token_key=token_key, token_id=token_id, bhe_uri=bhe_uri)
         self._credential_refresh = credential_refresh
+        self.before_managed_completion_attempt: Callable[[], None] | None = None
+        self.send_managed_upload: (
+            Callable[[Callable[[], requests.Response]], requests.Response] | None
+        ) = None
 
     def request(
         self,
@@ -91,19 +97,43 @@ class BloodHoundEnterprise(BloodHound):
         body: bytes | BinaryIO | None = None,
         extra_headers: dict[str, str] | None = None,
         timeout: tuple[float, float] | None = None,
+        *,
+        before_attempt: Callable[[], None] | None = None,
     ):
-        """Make a BHE request, refreshing managed credentials once after a 401."""
-        position = (
-            body.tell() if body is not None and not isinstance(body, bytes) else None
-        )
-        try:
-            return super().request(
+        """Send an API request, refreshing credentials once after a 401.
+
+        ``before_attempt`` runs before signing each attempt, including retries.
+        """
+        request = super().request
+
+        def send_attempt() -> requests.Response:
+            return request(
                 method=method,
                 path=path,
                 body=body,
                 extra_headers=extra_headers,
                 timeout=timeout,
             )
+
+        return self._send_with_credential_refresh(send_attempt, body, before_attempt)
+
+    def _send_with_credential_refresh(
+        self,
+        send: Callable[[], requests.Response],
+        body: bytes | BinaryIO | None,
+        before_attempt: Callable[[], None] | None,
+    ) -> requests.Response:
+        position = (
+            body.tell() if body is not None and not isinstance(body, bytes) else None
+        )
+
+        def send_attempt() -> requests.Response:
+            if before_attempt is not None:
+                before_attempt()
+            return send()
+
+        try:
+            return send_attempt()
         except BloodHoundHTTPError as error:
             if error.code != 401 or self._credential_refresh is None:
                 raise
@@ -114,13 +144,7 @@ class BloodHoundEnterprise(BloodHound):
         credentials = self._credential_refresh()
         self.token_key = credentials.token_key
         self.token_id = credentials.token_id
-        return super().request(
-            method=method,
-            path=path,
-            body=body,
-            extra_headers=extra_headers,
-            timeout=timeout,
-        )
+        return send_attempt()
 
     @property
     def jobs_available(self) -> JobsAvailable:
@@ -296,10 +320,14 @@ class BloodHoundEnterprise(BloodHound):
                     path=path,
                     body=body,
                     timeout=(
-                        MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS,
-                        MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
+                        MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
+                        MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
                     ),
+                    # Check before sending; /end can remove the claim while in flight.
+                    before_attempt=self.before_managed_completion_attempt,
                 )
+            except ManagedJobDiscarded:
+                raise
             except Exception as error:  # noqa: BLE001 - redact provider errors
                 if isinstance(error, BloodHoundHTTPError) and error.code == 404:
                     logger.info(
@@ -372,12 +400,27 @@ class BloodHoundEnterprise(BloodHound):
         headers = {"Content-Type": content_type}
         if content_encoding is not None:
             headers["Content-Encoding"] = content_encoding
-        self.request(
-            method="POST",
-            path=f"/api/v2/collie-job-queue/{job_id}/ingest",
-            body=data,
-            extra_headers=headers,
-            timeout=(10, 120),
+        path = f"/api/v2/collie-job-queue/{job_id}/ingest"
+        send_upload = self.send_managed_upload
+        request = super().request
+
+        def send_attempt() -> requests.Response:
+            if send_upload is None:
+                return request("POST", path, data, headers, timeout=(10, 120))
+
+            # Heartbeats can refresh the main client's credentials during signing.
+            # Transfer this attempt with its own fixed key and ID.
+            upload_client = BloodHound(self.token_key, self.token_id, self.base_uri)
+
+            def transfer() -> requests.Response:
+                return upload_client.request(
+                    "POST", path, data, headers, timeout=(10, 120)
+                )
+
+            return send_upload(transfer)
+
+        self._send_with_credential_refresh(
+            send_attempt, data, self.before_managed_completion_attempt
         )
 
     @property

@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import traceback
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -94,6 +95,9 @@ def mock_bloodhound_api():
     app.state.collector_job_start_requests = []
     app.state.collector_job_start_statuses = []
     app.state.collector_job_heartbeat_requests = []
+    app.state.collector_job_heartbeat_statuses = []
+    app.state.claim_clock = lambda: datetime.now(UTC)
+    app.state.claim_ttl = timedelta(minutes=15)
     app.state.start_payload = None
     app.state.jobs_available_requests = 0
     app.state.jobs_current_requests = 0
@@ -200,6 +204,14 @@ def mock_bloodhound_api():
             if app.state.collector_job_end_statuses
             else 200
         )
+        if app.state.collector_job_stateful_claims and status == 200:
+            job = app.state.collector_job_claim_response
+            if app.state.collector_job_active_id != job_id or job["status"] not in (
+                "claimed",
+                "running",
+            ):
+                return Response(status_code=404)
+            job["status"] = body["outcome"]
         return Response(
             "raw-provider-secret" if status != 200 else "", status_code=status
         )
@@ -228,9 +240,27 @@ def mock_bloodhound_api():
 
     @app.post("/api/v2/collie-job-queue/{job_id}/heartbeat")
     async def heartbeat_collector_job(job_id: str, request: Request):
+        app.state.managed_events.append("heartbeat")
         app.state.collector_job_heartbeat_requests.append(
             (job_id, await request.body())
         )
+        if app.state.collector_job_heartbeat_statuses:
+            status = app.state.collector_job_heartbeat_statuses.pop(0)
+            if isinstance(status, Exception):
+                raise status
+            if status != 200:
+                return Response("raw-provider-secret", status_code=status)
+        if app.state.collector_job_stateful_claims:
+            job = app.state.collector_job_claim_response
+            if app.state.collector_job_active_id != job_id or job["status"] not in (
+                "claimed",
+                "running",
+            ):
+                return Response(status_code=404)
+            # An expired timestamp alone does not revoke active ownership.
+            job["claim_expires_at"] = (
+                app.state.claim_clock() + app.state.claim_ttl
+            ).isoformat()
         return Response(status_code=200)
 
     @app.post("/api/v2/ingest")
@@ -250,6 +280,15 @@ def mock_bloodhound_api():
         assert not app.state.collector_job_end_requests
         assert request.headers["content-type"] == "application/json"
         graph = Graph.model_validate_json(await request.body())
+        if app.state.collector_job_stateful_claims:
+            job = app.state.collector_job_claim_response
+            if app.state.collector_job_active_id != job_id:
+                return Response(status_code=404)
+            if job["status"] != "running":
+                return Response(status_code=409)
+            job["claim_expires_at"] = (
+                app.state.claim_clock() + app.state.claim_ttl
+            ).isoformat()
         app.state.managed_ingest_requests.append(job_id)
         app.state.managed_ingested_nodes += len(graph.graph.nodes)
         app.state.managed_ingested_edges += len(graph.graph.edges)
@@ -395,13 +434,15 @@ def mock_service(mock_bloodhound_api, monkeypatch):
         lambda context: SimpleNamespace(queue=None, close=lambda: None),
     )
 
-    return Service(
+    service = Service(
         bhe_uri="http://localhost:8000",
         token_key="test-key",
         token_id="test-id",
         collector_name="openhound-faker",
         managed=False,
     )
+    yield service
+    service._clear_running_job()
 
 
 def test_client_update_sends_metadata(mock_service, mock_bloodhound_api, monkeypatch):
@@ -660,9 +701,7 @@ def test_start_and_heartbeat_collector_job_use_bodyless_requests(
     ]
 
 
-def test_start_and_heartbeat_collector_job_use_bounded_timeouts(
-    mock_service, monkeypatch
-):
+def test_managed_job_lifecycle_requests_use_short_timeouts(mock_service, monkeypatch):
     requests_sent = []
     monkeypatch.setattr(
         mock_service.client,
@@ -672,31 +711,11 @@ def test_start_and_heartbeat_collector_job_use_bounded_timeouts(
 
     mock_service.client.start_collector_job("collector-job-123")
     mock_service.client.heartbeat_collector_job("collector-job-123")
-
-    assert [request["timeout"] for request in requests_sent] == [
-        (
-            bloodhound_enterprise.MANAGED_JOB_LIFECYCLE_CONNECT_TIMEOUT_SECONDS,
-            bloodhound_enterprise.MANAGED_JOB_LIFECYCLE_READ_TIMEOUT_SECONDS,
-        )
-    ] * 2
-
-
-def test_end_managed_job_uses_bounded_timeouts(mock_service, monkeypatch):
-    captured = {}
-
-    def capture_request(*args, **kwargs):
-        captured.update(kwargs)
-
-    monkeypatch.setattr(mock_service.client, "request", capture_request)
-
     mock_service.client.end_managed_job(
         "collector-job-123", ManagedJobOutcome.SUCCEEDED
     )
 
-    assert captured["timeout"] == (
-        bloodhound_enterprise.MANAGED_JOB_END_CONNECT_TIMEOUT_SECONDS,
-        bloodhound_enterprise.MANAGED_JOB_END_READ_TIMEOUT_SECONDS,
-    )
+    assert [request["timeout"] for request in requests_sent] == [(10, 20)] * 3
 
 
 @pytest.mark.parametrize(
@@ -1774,7 +1793,7 @@ def test_managed_job_retrieves_full_hierarchy_secret_before_dlt_resolution(
     )
     resolved = {}
 
-    def collect(extension, output_path):
+    def collect(extension, output_path, saved_run):
         resolved.update(
             secret_value=dlt.secrets.get(
                 "sources.source.example.credentials.secret_value", str
@@ -1899,12 +1918,13 @@ def test_active_aws_poll_uses_claimed_key_and_raw_secret_in_worker_environment(
         scheduler_service.CollectorManager, "from_entrypoint", load_collectors
     )
 
-    def collect(extension, output_path):
+    def collect(extension, output_path, saved_run):
         if failed:
             logging.getLogger("example_extension.auth").error(
                 "Provider failure: %s", AWS_SECRET_KEY
             )
             raise RuntimeError(AWS_SECRET_KEY)
+        output_path.mkdir()
         (output_path / "graph.json").write_text(Graph(graph={}).model_dump_json())
         return {"collect": ["account"], "convert": ["graph"]}
 
@@ -2411,6 +2431,7 @@ def test_managed_poll_starts_claimed_job_and_tracks_worker(
     service._poll()
 
     job_id = state.collector_job_claim_response["id"]
+    assert service._managed_workspace.is_dir()
     assert state.managed_events == ["claim", "retrieve"]
     assert submitted == [
         (
@@ -2420,6 +2441,8 @@ def test_managed_poll_starts_claimed_job_and_tracks_worker(
             CLAIMED_PARAMS,
             COLLECTOR_SECRETS,
             True,
+            None,
+            service._managed_workspace,
         )
     ]
     assert service.job_running == service.managed_job_id == job_id
@@ -2429,7 +2452,7 @@ def test_managed_poll_starts_claimed_job_and_tracks_worker(
     service._poll()
     assert len(state.collector_job_claim_requests) == 1
     assert len(state.collector_job_queue_requests) == 1
-    assert state.collector_job_heartbeat_requests == []
+    assert state.collector_job_heartbeat_requests == [(job_id, b"")]
 
     state.collector_job_queue_response = load_json(
         "collector_jobs_available_empty.json"
@@ -2519,6 +2542,8 @@ def test_managed_start_failure_retries_prepared_job_before_discovery(
         CLAIMED_PARAMS,
         COLLECTOR_SECRETS,
         True,
+        None,
+        service._managed_workspace,
     )
     assert service.future is future
     for forbidden in ("raw-provider-secret", "private-credential-value"):
@@ -3534,12 +3559,260 @@ class FakeClock:
 
 
 @pytest.fixture
-def enabled_managed_heartbeats(monkeypatch):
-    """Keep the deferred heartbeat implementation covered until BHE supports it."""
-    monkeypatch.setattr(scheduler_service, "_MANAGED_HEARTBEATS_DISABLED", False)
+def managed_completion(mock_service, mock_bloodhound_api, monkeypatch, tmp_path):
+    """A real managed HTTP client with staged output and a controlled lease."""
+    clock = FakeClock()
+    monkeypatch.setattr(scheduler_service, "time", clock)
+    monkeypatch.setattr(bloodhound_enterprise, "time", clock)
+    monkeypatch.setattr(mock_service, "_poll_managed_jobs", lambda: None)
+    mock_service.managed = True
+    job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
+    mock_service.run_claimed_job(job_id, {}, {})
+    output = tmp_path / "output"
+    output.mkdir()
+    files = [output / f"part-{index}.json" for index in range(2)]
+    for path in files:
+        path.write_text('{"graph": {"nodes": [], "edges": []}}')
+    result = Result(results={}, job_id=job_id, output_path=output, data_files=files)
+    mock_service.future.set_result(result)
+    state = mock_bloodhound_api.app.state
+    state.collector_job_stateful_claims = True
+    state.collector_job_active_id = job_id
+    state.collector_job_claim_response["status"] = "running"
+    state.claim_clock = lambda: (
+        datetime(2026, 11, 5, tzinfo=UTC) + timedelta(seconds=clock.now)
+    )
+    state.collector_job_claim_response["claim_expires_at"] = (
+        state.claim_clock() + state.claim_ttl
+    ).isoformat()
+    return SimpleNamespace(
+        service=mock_service, state=state, clock=clock, result=result, job_id=job_id
+    )
 
 
-@pytest.mark.usefixtures("enabled_managed_heartbeats")
+@pytest.mark.parametrize("during_shutdown", [False, True])
+@pytest.mark.parametrize("heartbeat_status", [200, 404])
+def test_due_heartbeats_during_upload(
+    managed_completion, monkeypatch, during_shutdown, heartbeat_status
+):
+    job = managed_completion
+    job.state.collector_job_heartbeat_statuses = [200, heartbeat_status]
+    scheduler_thread = threading.get_ident()
+    original_request = requests.request
+    original_wait = scheduler_service.wait
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+    events = []
+    refreshes = []
+    job.service.client._credential_refresh = lambda: refreshes.append("unexpected")
+
+    def wait_for_deadline(futures, *, timeout):
+        if release_upload.is_set():
+            done, pending = original_wait(futures, timeout=5)
+            assert not pending, "upload did not finish after release"
+            return done, pending
+        assert upload_started.wait(5)
+        job.clock.sleep(timeout)
+
+    def request(method, url, **kwargs):
+        operation = urlsplit(url).path.rsplit("/", 1)[-1]
+        events.append(operation)
+        if operation == "heartbeat":
+            assert threading.get_ident() == scheduler_thread
+            response = original_request(method, url, **kwargs)
+            if events.count("heartbeat") == 2:
+                release_upload.set()
+            return response
+        if events == ["ingest"]:
+            assert threading.get_ident() != scheduler_thread
+            upload_started.set()
+            assert release_upload.wait(5), "upload was not heartbeated"
+            assert not kwargs["data"].closed
+            if heartbeat_status == 404:
+                # A late 401 must not trigger credential refresh or another upload.
+                response = requests.Response()
+                response.status_code = 401
+                response._content = b""
+                return response
+        return original_request(method, url, **kwargs)
+
+    monkeypatch.setattr(scheduler_service, "wait", wait_for_deadline)
+    monkeypatch.setattr(requests, "request", request)
+    if during_shutdown:
+        job.service._shutdown()
+    else:
+        job.service._poll()
+
+    expected = ["ingest", "heartbeat", "heartbeat"]
+    if heartbeat_status == 200:
+        expected += ["ingest", "end"]
+    assert events == expected
+    assert refreshes == []
+    assert job.service.future is job.service.managed_job_id is None
+    assert not job.result.output_path.exists()
+
+
+def test_no_heartbeat_during_end_request(managed_completion, monkeypatch):
+    job = managed_completion
+    job.result.uploaded_files = len(job.result.data_files)
+    scheduler_thread = threading.get_ident()
+    original_request = requests.request
+
+    def slow_end(method, url, **kwargs):
+        if urlsplit(url).path.endswith("/end"):
+            assert threading.get_ident() == scheduler_thread
+            job.clock.sleep(scheduler_service.HEARTBEAT_INTERVAL)
+        return original_request(method, url, **kwargs)
+
+    monkeypatch.setattr(requests, "request", slow_end)
+    job.service._poll()
+
+    assert job.state.managed_events == ["end"]
+    assert job.service.future is job.service.managed_job_id is None
+
+
+@pytest.mark.parametrize(
+    "heartbeat_status,expected_events",
+    [(200, ["end", "heartbeat", "end"]), (404, ["end", "heartbeat"])],
+    ids=["renewed", "claim-lost"],
+)
+def test_end_retry_checks_heartbeat_before_next_attempt(
+    managed_completion, heartbeat_status, expected_events
+):
+    job = managed_completion
+    heartbeat_at = job.service.next_heartbeat_at
+    assert heartbeat_at is not None
+    # Only the retry sleep advances the clock, on the scheduler thread.
+    job.clock.now = heartbeat_at - 1
+    job.state.collector_job_end_statuses = [500]
+    job.state.collector_job_heartbeat_statuses = [heartbeat_status]
+
+    job.service._poll()
+
+    assert job.state.managed_events == expected_events
+    assert job.state.managed_ingest_requests == [job.job_id] * 2
+    assert job.service.future is job.service.managed_job_id is None
+
+
+@pytest.mark.parametrize("status", [429, 503, requests.ConnectionError("offline")])
+def test_temporary_heartbeat_http_failures_preserve_work_and_retry(
+    managed_completion, status
+):
+    job = managed_completion
+    job.state.collector_job_heartbeat_statuses = [status, 200]
+    future = job.service.future
+    job.clock.now = 300
+    job.service._poll_running_job()
+    assert job.service.future is future
+    assert job.result.output_path.exists()
+    job.clock.now = 600
+    job.service._poll_running_job()
+    assert len(job.state.collector_job_heartbeat_requests) == 2
+    assert job.service.future is future
+    assert job.state.collector_job_end_requests == []
+
+
+def test_heartbeat_401_refreshes_once_through_shared_http_path(managed_completion):
+    job = managed_completion
+    refresh_threads = []
+
+    def refresh():
+        refresh_threads.append(threading.get_ident())
+        return BHECredentials(token_id="new-id", token_key="new-key")
+
+    job.service.client._credential_refresh = refresh
+    job.state.collector_job_heartbeat_statuses = [401, 200]
+    job.clock.now = 300
+    job.service._poll_running_job()
+    assert refresh_threads == [threading.get_ident()]
+    assert len(job.state.collector_job_heartbeat_requests) == 2
+    assert job.service.client.token_id == "new-id"
+    job.state.collector_job_heartbeat_statuses = [401, 401]
+    job.clock.now = 600
+    job.service._poll_running_job()
+    assert len(refresh_threads) == 2
+    assert len(job.state.collector_job_heartbeat_requests) == 4
+    assert job.service.future is not None
+
+
+def test_heartbeat_renews_expired_but_owned_claim_using_job_type_ttl(
+    managed_completion,
+):
+    job = managed_completion
+    job.state.claim_ttl = timedelta(minutes=17)
+    job.state.collector_job_claim_response["claim_expires_at"] = (
+        job.state.claim_clock() - timedelta(hours=1)
+    ).isoformat()
+    job.clock.now = 300
+    job.service._poll_running_job()
+    assert datetime.fromisoformat(
+        job.state.collector_job_claim_response["claim_expires_at"]
+    ) == job.state.claim_clock() + timedelta(minutes=17)
+    assert job.service.future is not None
+
+
+@pytest.mark.parametrize("loss", ["missing", "inactive", "other-owner"])
+def test_http_heartbeat_claim_loss_cleans_staged_output(managed_completion, loss):
+    job = managed_completion
+    if loss == "inactive":
+        job.state.collector_job_claim_response["status"] = "cancelled"
+    else:
+        job.state.collector_job_active_id = None if loss == "missing" else "other-job"
+    job.clock.now = 300
+    job.service._poll()
+    assert not job.result.output_path.exists()
+    assert job.service.future is job.service.managed_job_id is None
+    assert job.service.next_heartbeat_at is None
+    assert job.state.managed_ingest_requests == []
+    assert job.state.collector_job_end_requests == []
+    job.state.collector_job_stateful_claims = False
+    job.clock.now = 1000
+    job.service.run_claimed_job("next-job", {}, {})
+    assert job.service.next_heartbeat_at == 1300
+
+
+@pytest.mark.parametrize("interval", [30, 1000])
+def test_active_scheduler_sleep_respects_heartbeat_deadline(
+    mock_service, mock_bloodhound_api, monkeypatch, interval
+):
+    clock = FakeClock()
+    mock_service.managed = True
+    mock_service.interval = interval
+    monkeypatch.setattr(scheduler_service, "time", clock)
+    mock_service.run_claimed_job("collector-job-123", {}, {})
+
+    def stop_after_two_renewals(now):
+        if now >= 600:
+            mock_service.exit = True
+
+    clock.on_sleep = stop_after_two_renewals
+    monkeypatch.setattr(mock_service, "_shutdown", lambda: None)
+    mock_service.start()
+    # The second deadline has just woken the loop; shutdown normally handles it.
+    mock_service._poll_running_job()
+    assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == [
+        ("collector-job-123", b""),
+        ("collector-job-123", b""),
+    ]
+    assert clock.now == 600
+
+
+def test_short_job_needs_no_heartbeat_and_next_job_gets_fresh_deadline(
+    managed_completion,
+):
+    job = managed_completion
+    job.clock.now = 10
+    job.service._poll()
+    assert job.state.collector_job_heartbeat_requests == []
+    assert job.service.next_heartbeat_at is None
+    job.state.collector_job_stateful_claims = False
+    job.clock.now = 1000
+    job.service.run_claimed_job("next-job", {}, {})
+    assert job.service.next_heartbeat_at == 1300
+    job.service._poll_running_job()
+    assert job.state.collector_job_heartbeat_requests == []
+
+
 def test_managed_job_uses_shared_poll_loop_without_polling_for_new_jobs(
     mock_service, mock_bloodhound_api, monkeypatch, caplog
 ):
@@ -3594,13 +3867,15 @@ def test_managed_job_uses_shared_poll_loop_without_polling_for_new_jobs(
         monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
         mock_service._poll()
 
-    assert submitted[0][1:] == (
+    assert submitted[0][1:6] == (
         "openhound-faker",
         "collector-job-123",
         {"node_count": 4},
         {"token": "secret-value"},
         True,
     )
+    assert submitted[0][6] is None
+    assert not submitted[0][7].exists()
     assert mock_bloodhound_api.app.state.collector_job_start_requests == [
         ("collector-job-123", b"")
     ]
@@ -3686,7 +3961,6 @@ def test_claimed_job_cannot_start_while_another_job_runs(
     assert mock_service.job_running == 123
 
 
-@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_transient_managed_heartbeat_failures_keep_collection_running(
     mock_service, mock_bloodhound_api, monkeypatch, caplog
 ):
@@ -3725,7 +3999,6 @@ def test_transient_managed_heartbeat_failures_keep_collection_running(
 
 
 @pytest.mark.parametrize("during_shutdown", [False, True], ids=["poll", "shutdown"])
-@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_heartbeat_claim_loss_stops_worker_without_reporting_outcome(
     mock_service, mock_bloodhound_api, monkeypatch, during_shutdown
 ):
@@ -3751,10 +4024,7 @@ def test_managed_heartbeat_claim_loss_stops_worker_without_reporting_outcome(
     clock = FakeClock()
     monkeypatch.setattr(scheduler_service, "time", clock)
 
-    def lose_claim(job_id):
-        raise BloodHoundHTTPError("claim lost", 404)
-
-    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
+    mock_bloodhound_api.app.state.collector_job_heartbeat_statuses = [404]
     mock_service.run_claimed_job("collector-job-123", {}, {})
     clock.now = 300
     if during_shutdown:
@@ -3775,7 +4045,11 @@ def test_managed_heartbeat_claim_loss_stops_worker_without_reporting_outcome(
     assert mock_bloodhound_api.app.state.job_ended is False
 
 
-@pytest.mark.usefixtures("enabled_managed_heartbeats")
+def _stage_file_and_wait(workspace):
+    (workspace / "partial.json").write_text("{}")
+    time.sleep(60)
+
+
 def test_managed_heartbeat_claim_loss_kills_a_real_running_process(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
@@ -3783,19 +4057,20 @@ def test_managed_heartbeat_claim_loss_kills_a_real_running_process(
     original_submit = executor.submit
     mock_service.executor = executor
     monkeypatch.setattr(
-        executor, "submit", lambda *args: original_submit(time.sleep, 60)
+        executor, "submit", lambda *args: original_submit(_stage_file_and_wait, args[-1])
     )
 
-    def lose_claim(job_id):
-        raise BloodHoundHTTPError("claim lost", 404)
-
-    monkeypatch.setattr(mock_service.client, "heartbeat_collector_job", lose_claim)
+    mock_bloodhound_api.app.state.collector_job_heartbeat_statuses = [404]
     try:
         mock_service.run_claimed_job("collector-job-123", {}, {})
+        workspace = mock_service._managed_workspace
+        assert workspace.is_dir()
+        staged_file = workspace / "partial.json"
         future = mock_service.future
         deadline = time.monotonic() + 10
-        while not future.running() and time.monotonic() < deadline:
+        while not staged_file.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
+        assert staged_file.is_file()
         assert future.running()
         workers = list(executor._processes.values())
         assert workers and all(worker.is_alive() for worker in workers)
@@ -3807,6 +4082,7 @@ def test_managed_heartbeat_claim_loss_kills_a_real_running_process(
         assert future.done()
         assert mock_service.future is None
         assert mock_service.executor is not executor
+        assert not workspace.exists()
         assert mock_bloodhound_api.app.state.collector_job_end_requests == []
     finally:
         for worker in list((executor._processes or {}).values()):
@@ -3824,8 +4100,11 @@ def test_managed_worker_failure_ends_job_failed(
     monkeypatch.setattr(mock_service, "check_jobs", lambda: None)
 
     mock_service.run_claimed_job("collector-job-123", {}, {})
+    workspace = mock_service._managed_workspace
+    assert workspace.is_dir()
     mock_service._poll()
 
+    assert not workspace.exists()
     assert mock_bloodhound_api.app.state.collector_job_heartbeat_requests == []
     assert mock_bloodhound_api.app.state.collector_job_end_requests == [
         {
@@ -3838,7 +4117,6 @@ def test_managed_worker_failure_ends_job_failed(
     ]
 
 
-@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_shutdown_keeps_heartbeating_until_managed_worker_finishes(
     mock_service, mock_bloodhound_api, monkeypatch
 ):
@@ -3868,7 +4146,6 @@ def test_shutdown_keeps_heartbeating_until_managed_worker_finishes(
 @pytest.mark.parametrize(
     "failure_phase", ["upload", "success_report", "failure_report"]
 )
-@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_shutdown_retries_completion_and_renews_claim(
     mock_service, mock_bloodhound_api, monkeypatch, tmp_path, caplog, failure_phase
 ):
@@ -3995,7 +4272,6 @@ def test_managed_completion_fails_job_when_remaining_staged_file_disappears(
     assert not output.exists()
 
 
-@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_poll_cleans_partial_upload_output_after_heartbeat_claim_loss(
     mock_service, monkeypatch, tmp_path
 ):
@@ -4043,8 +4319,8 @@ def test_managed_poll_cleans_partial_upload_output_after_heartbeat_claim_loss(
     mock_service._poll()
     mock_service._poll()
 
-    assert events == [b"file-0", b"file-1", "heartbeat"]
-    assert result.uploaded_files == 1
+    assert events == ["heartbeat"]
+    assert result.uploaded_files == 0
     assert ends == []
     assert mock_service.future is None
     assert mock_service.job_running is None
@@ -4055,7 +4331,6 @@ def test_managed_poll_cleans_partial_upload_output_after_heartbeat_claim_loss(
     )
 
 
-@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_shutdown_retries_upload_across_multiple_heartbeat_intervals(
     mock_service, mock_bloodhound_api, monkeypatch, tmp_path
 ):
@@ -4119,7 +4394,6 @@ def test_managed_shutdown_retries_upload_across_multiple_heartbeat_intervals(
     assert not output.exists()
 
 
-@pytest.mark.usefixtures("enabled_managed_heartbeats")
 def test_managed_shutdown_cleans_staged_output_when_heartbeat_loses_claim(
     mock_service, mock_bloodhound_api, monkeypatch, tmp_path
 ):
@@ -4440,13 +4714,10 @@ def test_managed_collection_stages_then_uploads_before_job_end(
     monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / ".dlt"))
     if saved_runs:
         monkeypatch.setenv("OPENHOUND__RUNS_DIRECTORY", str(tmp_path / "runs"))
-    monkeypatch.setattr(
-        scheduler_service.dataflow,
-        "Path",
-        lambda value: tmp_path if value == "/tmp/openhound" else Path(value),
-    )
     job_id = "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d"
-    result = _subprocess_collect("faker", job_id, managed=True)
+    workspace = tmp_path / "temporary"
+    mock_service._managed_workspace = workspace
+    result = _subprocess_collect("faker", job_id, managed=True, workspace=workspace)
     assert result.data_files
     assert mock_bloodhound_api.app.state.managed_ingest_requests == []
     assert mock_bloodhound_api.app.state.ingested_nodes == 0
@@ -4469,36 +4740,12 @@ def test_managed_collection_stages_then_uploads_before_job_end(
     ]
     assert state.job_ended is False
     assert not result.output_path.exists()
+    assert not workspace.exists()
     if saved_runs:
         workspace = result.output_path.parent
         assert (workspace / "run.json").is_file()
         assert (workspace / "raw" / "faker").is_dir()
         assert (workspace / "pipelines" / "faker_convert" / "state.json").is_file()
-
-
-def test_failed_managed_conversion_cleans_up_staged_files(monkeypatch, tmp_path):
-    output = tmp_path / "output"
-    output.mkdir()
-    monkeypatch.setattr(
-        scheduler_service.tempfile, "mkdtemp", lambda **kwargs: str(output)
-    )
-    collector = SimpleNamespace(name="example", package_version="1", metadata=None)
-    monkeypatch.setattr(
-        scheduler_service.CollectorManager,
-        "from_entrypoint",
-        lambda: SimpleNamespace(collectors=[collector]),
-    )
-
-    def fail(extension, output_path):
-        (output_path / "partial.json").write_text("partial")
-        raise RuntimeError("conversion failed")
-
-    monkeypatch.setattr(scheduler_service.dataflow, "pipeline", fail)
-    with pytest.raises(ManagedConfigurationError, match="check worker logs"):
-        _subprocess_collect(
-            "example", "6bc0857e-9d9b-48c6-bbd8-77a31c5d351d", managed=True
-        )
-    assert not output.exists()
 
 
 def test_managed_completion_streams_graph_to_api_before_ending(

@@ -6,7 +6,7 @@ import signal
 import tempfile
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -16,6 +16,7 @@ from typing import Any
 from uuid import UUID
 
 import dlt
+from requests import Response
 
 import openhound
 import openhound.core.logging as openhound_logging
@@ -28,6 +29,7 @@ from openhound.core.clients.bloodhound import BloodHoundHTTPError
 from openhound.core.clients.bloodhound_enterprise import (
     BloodHoundEnterprise,
     JobStatus,
+    ManagedJobDiscarded,
     ManagedJobOutcome,
 )
 from openhound.core.clients.models.jobs import (
@@ -56,12 +58,9 @@ from openhound.scheduler.credentials import (
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = 30  # seconds; fixed poll/check-in cadence, must remain below BHE's 600s client-checkin timeout
-HEARTBEAT_INTERVAL = (
-    300  # seconds; BHE expires managed jobs after 15 minutes without a heartbeat
-)
-# TODO: Remove this constant and the guard in _send_managed_heartbeat once BHE
-# supports managed collector heartbeats. This is deliberately not configurable.
-_MANAGED_HEARTBEATS_DISABLED = True
+# BHE renews using each job type's claim_ttl. Renew every five minutes, leaving
+# headroom for transient failures with the deployed job types' TTLs.
+HEARTBEAT_INTERVAL = 300  # seconds
 
 
 class ExtensionNotFoundError(Exception):
@@ -119,6 +118,7 @@ def _subprocess_collect(
     secrets: dict[str, Any] | None = None,
     managed: bool = False,
     environment: JobEnvironment | None = None,
+    workspace: Path | None = None,
 ) -> Result:
     """A subprocess which runs the DLT pipeline for the specified collector.
 
@@ -128,6 +128,7 @@ def _subprocess_collect(
         collector_name: The name of the extension to run.
         job_id: The Job ID as returned by BHE.
         managed: Stage OpenGraph files for upload after collection completes.
+        workspace: Scheduler-owned fallback when managed runs aren't persisted.
 
     Returns:
         Result: The result of the collection, including the collected data and the job ID.
@@ -146,7 +147,7 @@ def _subprocess_collect(
     ):
         try:
             return _configured_worker_collect(
-                collector_name, job_id, params, secrets, managed
+                collector_name, job_id, params, secrets, managed, workspace
             )
         except ManagedConfigurationError:
             # AWS failures were diagnosed inside the SDK logging controls;
@@ -182,6 +183,7 @@ def _configured_worker_collect(
     params: dict[str, Any] | None,
     secrets: dict[str, Any] | None,
     managed: bool,
+    workspace: Path | None,
 ) -> Result:
     configured = params is not None or secrets is not None
     # Retain SDK logging and source-credential isolation; authentication belongs
@@ -199,10 +201,15 @@ def _configured_worker_collect(
     # Install configuration before importing collectors or constructing pipelines:
     # both can resolve DLT settings. Always remove it, including on worker failure.
     with configuration:
-        return _collect_in_worker(collector_name, job_id, managed)
+        return _collect_in_worker(collector_name, job_id, managed, workspace)
 
 
-def _collect_in_worker(collector_name: str, job_id: int | str, managed: bool) -> Result:
+def _collect_in_worker(
+    collector_name: str,
+    job_id: int | str,
+    managed: bool,
+    workspace: Path | None = None,
+) -> Result:
     available_collectors = CollectorManager.from_entrypoint()
 
     for collector in available_collectors.collectors:
@@ -230,46 +237,39 @@ def _collect_in_worker(collector_name: str, job_id: int | str, managed: bool) ->
             if runs_directory is None:
                 # Image defaults must not override explicit TOML or environment settings.
                 runs_directory = os.environ.get("OPENHOUND_DEFAULT_RUNS_DIRECTORY")
+            # A managed job needs isolated pipeline state even without persistence.
+            run_root = Path(runs_directory) if runs_directory else None
+            if managed and run_root is None:
+                run_root = workspace
+                if run_root is None:
+                    raise RuntimeError(
+                        "Managed collection requires an isolated workspace"
+                    )
             saved_run = (
                 SavedRun.create(
-                    Path(runs_directory),
+                    run_root,
                     collector=collector.name,
                     collector_version=getattr(collector, "package_version", None),
                     job_id=job_id,
                     mode="write" if managed else "ingest",
                     bhe_url=dlt.config.get("destination.bloodhoundenterprise.url", str),
                 )
-                if runs_directory
+                if run_root is not None
                 else None
             )
-            output_path = None
-            if managed:
-                output_path = (
-                    saved_run.graph
-                    if saved_run
-                    else Path(tempfile.mkdtemp(prefix="openhound-job-"))
-                )
-            if saved_run:
+            output_path = saved_run.graph if managed and saved_run else None
+            if saved_run and runs_directory:
                 logger.info(
                     "Persisting job %s in saved run %s", job_id, saved_run.directory
                 )
-            try:
-                if saved_run:
-                    results = dataflow.pipeline(
-                        extension=collector, output_path=output_path, saved_run=saved_run
-                    )
-                else:
-                    results = (
-                        dataflow.pipeline(extension=collector)
-                        if output_path is None
-                        else dataflow.pipeline(
-                            extension=collector, output_path=output_path
-                        )
-                    )
-            except BaseException:
-                if output_path is not None and saved_run is None:
-                    shutil.rmtree(output_path)
-                raise
+            if saved_run:
+                results = dataflow.pipeline(
+                    extension=collector,
+                    output_path=output_path,
+                    saved_run=saved_run,
+                )
+            else:
+                results = dataflow.pipeline(extension=collector)
             logger.info(
                 "Collection for job %s completed successfully.",
                 job_id,
@@ -336,7 +336,10 @@ class Service:
         # MVP runs one job at a time.
         self.job_running: int | str | None = None
         self.managed_job_id: str | None = None
+        self._managed_workspace: Path | None = None
         self.next_heartbeat_at: float | None = None
+        self.client.before_managed_completion_attempt = self._renew_managed_claim_if_due
+        self.client.send_managed_upload = self._send_upload_with_heartbeats
 
         # Futures/results from the subprocess executor
         self.future: Future[Result] | None = None
@@ -362,7 +365,7 @@ class Service:
         while self.future is not None and not self.future.done():
             self._poll_running_job()
             if self.future is not None:
-                time.sleep(self.interval)
+                time.sleep(self._next_poll_delay())
         if self.managed_job_id is not None:
             self._finish_managed_job_on_shutdown()
         elif self.future is not None:
@@ -394,9 +397,32 @@ class Service:
                     "retaining result for retry."
                 )
             if self.future is not None:
-                time.sleep(self.interval)
+                time.sleep(self._next_poll_delay())
+
+    def _time_until_next_heartbeat(self) -> float | None:
+        if self.next_heartbeat_at is None:
+            return None
+        remaining_seconds = self.next_heartbeat_at - time.monotonic()
+        return max(0, remaining_seconds)
+
+    def _next_poll_delay(self) -> float:
+        """Return the time to wait before the next poll or heartbeat."""
+        heartbeat_delay = self._time_until_next_heartbeat()
+        if self.managed_job_id is None or heartbeat_delay is None:
+            return self.interval
+        return min(self.interval, heartbeat_delay)
 
     def _clear_running_job(self) -> None:
+        if self._managed_workspace is not None:
+            try:
+                shutil.rmtree(self._managed_workspace)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception(
+                    "Unable to remove temporary workspace for job %s.", self.job_running
+                )
+            self._managed_workspace = None
         self.future = None
         self.job_running = None
         self.managed_job_id = None
@@ -730,14 +756,26 @@ class Service:
             time.monotonic() + HEARTBEAT_INTERVAL if managed else None
         )
         try:
+            worker_args: tuple[Any, ...]
+            if managed:
+                # The parent can remove the fallback even when it kills the worker.
+                self._managed_workspace = Path(
+                    tempfile.mkdtemp(prefix="openhound-job-")
+                )
+                worker_args = (
+                    dict(params or {}),
+                    dict(secrets or {}),
+                    True,
+                    dict(environment) if environment else None,
+                    self._managed_workspace,
+                )
+            else:
+                worker_args = (None, None)
             self.future = self.executor.submit(
                 _subprocess_collect,
                 self.collector_name,
                 job_id,
-                dict(params or {}) if managed else None,
-                dict(secrets or {}) if managed else None,
-                *((True,) if managed else ()),
-                *((dict(environment),) if managed and environment else ()),
+                *worker_args,
             )
         except BrokenProcessPool:
             logger.exception("Failed to submit job %s: process pool is broken.", job_id)
@@ -778,17 +816,24 @@ class Service:
         else:
             self.client.end_job(status, message)
 
-    def _send_managed_heartbeat(self, job_id: str) -> None:
-        if _MANAGED_HEARTBEATS_DISABLED:
-            return
+    def _renew_managed_claim_if_due(self) -> None:
+        """Send a due heartbeat, or discard the job if Enterprise returns 404."""
+        job_id = self.managed_job_id
+        if job_id is not None and self._heartbeat_reports_claim_loss(job_id):
+            self._abort_managed_job(job_id)
+            raise ManagedJobDiscarded("Managed collector claim lost")
 
+    def _heartbeat_reports_claim_loss(self, job_id: str) -> bool:
+        """Send a due heartbeat and report a 404 without touching local files."""
+        deadline = self.next_heartbeat_at
+        if deadline is None or time.monotonic() < deadline:
+            return False
         try:
             self.client.heartbeat_collector_job(job_id)
         except Exception as error:  # noqa: BLE001
             # Transient heartbeat failures must not stop collection.
             if isinstance(error, BloodHoundHTTPError) and error.code == 404:
-                self._abort_managed_job(job_id)
-                return
+                return True
             logger.info(
                 "Managed collector job %s heartbeat request failed.",
                 job_id,
@@ -802,9 +847,30 @@ class Service:
             )
         else:
             logger.info("Managed collector job %s heartbeat succeeded.", job_id)
+        self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
+        return False
+
+    def _send_upload_with_heartbeats(
+        self, transfer: Callable[[], Response]
+    ) -> Response:
+        job_id = self.managed_job_id
+        if job_id is None:
+            return transfer()
+        # Wait for an in-flight transfer to stop using the stream before closing
+        # it or deleting the workspace. Never act on its response after claim loss.
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="managed-upload"
+        ) as pool:
+            upload = pool.submit(transfer)
+            while not upload.done():
+                wait([upload], timeout=self._time_until_next_heartbeat())
+                if not upload.done() and self._heartbeat_reports_claim_loss(job_id):
+                    upload.cancel()
+                    raise ManagedJobDiscarded("Managed collector claim lost")
+            return upload.result()
 
     def _abort_managed_job(self, job_id: str) -> None:
-        """Stop local work without reporting an outcome for a claim we no longer own."""
+        """Stop local work and discard the job without sending another report."""
         logger.warning(
             "Managed collector job %s claim lost; stopping collection.", job_id
         )
@@ -818,7 +884,9 @@ class Service:
                     logger.exception("Unable to kill worker process.")
             self.executor.shutdown(wait=True, cancel_futures=True)
         except Exception:
-            logger.exception("Error shutting down executor after claim loss.")
+            logger.exception(
+                "Error shutting down executor while discarding job %s.", job_id
+            )
         finally:
             # Completed workers can leave staged output awaiting upload. Clean
             # it before discarding the result, regardless of how claim loss arose.
@@ -896,6 +964,10 @@ class Service:
                             self.client.upload_collector_job_data(
                                 self.managed_job_id, data
                             )
+                    except ManagedJobDiscarded:
+                        if self.managed_job_id is not None:
+                            self._abort_managed_job(self.managed_job_id)
+                        return
                     except BloodHoundHTTPError as error:
                         if error.code in (404, 409):
                             self._abort_managed_job(self.managed_job_id)
@@ -915,7 +987,11 @@ class Service:
             else:
                 status = JobStatus.COMPLETE
                 message = f"Collector '{self.collector_name}' completed successfully"
-        self._end_job(status, message)
+        try:
+            self._end_job(status, message)
+        except ManagedJobDiscarded:
+            # The heartbeat path already discarded the job.
+            return
         if self.managed_job_id is not None and result is not None:
             self._remove_job_output(result)
         self._clear_running_job()
@@ -929,13 +1005,10 @@ class Service:
 
     def _poll_running_job(self) -> None:
         if self.managed_job_id is not None:
-            if (
-                self.next_heartbeat_at is not None
-                and time.monotonic() >= self.next_heartbeat_at
-            ):
-                self._send_managed_heartbeat(self.managed_job_id)
-                if self.managed_job_id is not None:
-                    self.next_heartbeat_at = time.monotonic() + HEARTBEAT_INTERVAL
+            try:
+                self._renew_managed_claim_if_due()
+            except ManagedJobDiscarded:
+                return
         else:
             try:
                 _ = self.client.jobs_current
@@ -945,6 +1018,10 @@ class Service:
     def _poll(self) -> None:
         """Checks if jobs are completed and if a job should be run."""
         try:
+            if self.managed_job_id is not None:
+                self._poll_running_job()
+                if self.managed_job_id is None:
+                    return
             if self.future is not None and self.future.done():
                 self._handle_completed_job(self.future)
         except Exception:
@@ -1014,6 +1091,6 @@ class Service:
                         )
                 else:
                     self._poll()
-                time.sleep(self.interval)
+                time.sleep(self._next_poll_delay())
         finally:
             self._shutdown()
